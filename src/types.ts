@@ -1,4 +1,10 @@
-export type ToolId = "startup" | "search" | "prompts" | "clipboard";
+export type ToolId =
+  | "startup"
+  | "search"
+  | "prompts"
+  | "clipboard"
+  | "automation"
+  | "folders";
 export type NavId = "overview" | ToolId | "settings";
 
 export interface ToolState {
@@ -14,6 +20,33 @@ export interface StartupItem {
   delaySeconds: number;
   enabled: boolean;
   order: number;
+}
+
+export interface StartupScene {
+  id: string;
+  name: string;
+  description: string;
+  itemIds: string[];
+}
+
+export interface CommandTask {
+  id: string;
+  name: string;
+  description: string;
+  commands: string[];
+  workingDirectory?: string;
+  showTerminal: boolean;
+  closeTerminalOnFinish: boolean;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface FolderFavorite {
+  id: string;
+  name: string;
+  path: string;
+  description: string;
+  createdAt: number;
 }
 
 export type SearchResultKind = "link" | "app" | "file" | "folder";
@@ -64,13 +97,14 @@ export interface QuickLink {
   name: string;
   description: string;
   keyword: string;
+  parameterName?: string;
   urlTemplate: string;
   enabled: boolean;
 }
 
 export interface AppSettings {
   theme: "light" | "dark";
-  fontFamily: "system" | "serif" | "mono";
+  fontFamily: "system" | "serif" | "yahei";
   fontScale: number;
   shortcuts: {
     search: string;
@@ -82,6 +116,8 @@ export interface AppSettings {
   excludedPatterns: string[];
   searchFilters: SearchFilters;
   clipboardLimit: number;
+  launchAtLogin: boolean;
+  loginSceneId: string;
 }
 
 export interface ActivityLog {
@@ -93,6 +129,9 @@ export interface ActivityLog {
 export interface AppSnapshot {
   tools: Record<ToolId, ToolState>;
   startupItems: StartupItem[];
+  startupScenes: StartupScene[];
+  commandTasks: CommandTask[];
+  folderFavorites: FolderFavorite[];
   startupFailures?: Array<{
     id: string;
     name: string;

@@ -118,3 +118,36 @@ pub fn items_from_snapshot(snapshot: &serde_json::Value) -> Vec<StartupItem> {
         .and_then(|value| serde_json::from_value(value).ok())
         .unwrap_or_default()
 }
+
+pub fn items_for_login_scene(snapshot: &serde_json::Value) -> Vec<StartupItem> {
+    let items = items_from_snapshot(snapshot);
+    let scene_id = snapshot
+        .pointer("/settings/loginSceneId")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("default-scene");
+    if scene_id.trim().is_empty() {
+        return Vec::new();
+    }
+    let selected = snapshot
+        .get("startupScenes")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|scenes| {
+            scenes
+                .iter()
+                .find(|scene| scene.get("id").and_then(serde_json::Value::as_str) == Some(scene_id))
+        })
+        .and_then(|scene| scene.get("itemIds"))
+        .and_then(serde_json::Value::as_array)
+        .map(|ids| {
+            ids.iter()
+                .filter_map(serde_json::Value::as_str)
+                .collect::<std::collections::HashSet<_>>()
+        });
+    match selected {
+        Some(selected) => items
+            .into_iter()
+            .filter(|item| selected.contains(item.id.as_str()))
+            .collect(),
+        None => Vec::new(),
+    }
+}

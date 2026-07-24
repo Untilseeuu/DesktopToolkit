@@ -34,10 +34,12 @@ export function Switch({
   checked,
   onChange,
   label,
+  disabled = false,
 }: {
   checked: boolean;
   onChange: (checked: boolean) => void;
   label: string;
+  disabled?: boolean;
 }) {
   return (
     <button
@@ -46,6 +48,7 @@ export function Switch({
       role="switch"
       aria-checked={checked}
       aria-label={label}
+      disabled={disabled}
       onClick={(event) => {
         event.stopPropagation();
         onChange(!checked);
@@ -101,14 +104,16 @@ export function EmptyState({
   title,
   description,
   action,
+  fullSpan = false,
 }: {
   icon: ReactNode;
   title: string;
   description: string;
   action?: ReactNode;
+  fullSpan?: boolean;
 }) {
   return (
-    <div className="empty-state">
+    <div className={`empty-state ${fullSpan ? "full-span-empty" : ""}`}>
       <div className="empty-icon">{icon}</div>
       <h3>{title}</h3>
       <p>{description}</p>

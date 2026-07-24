@@ -4,6 +4,7 @@ import type {
   SearchFilters,
   SearchResult,
   StartupItem,
+  CommandTask,
 } from "./types";
 
 export interface LaunchResult {
@@ -23,6 +24,14 @@ export interface ClipboardActivationResult {
   pasted: boolean;
   kind: "text" | "image";
   reason?: string;
+}
+
+export interface CommandExecution {
+  command: string;
+  success: boolean;
+  exitCode?: number;
+  stdout: string;
+  stderr: string;
 }
 
 const LOCAL_KEY = "atlas-toolkit-state-v1";
@@ -168,8 +177,14 @@ export async function openTarget(path: string, reveal = false): Promise<void> {
 export async function launchStartupItems(items: StartupItem[]): Promise<LaunchResult[]> {
   return (
     (await invokeNative<LaunchResult[]>("launch_startup_items", {
-      itemIds: items.filter((item) => item.enabled).map((item) => item.id),
+      items: items.filter((item) => item.enabled),
     })) ?? []
+  );
+}
+
+export async function runCommandTask(task: CommandTask): Promise<CommandExecution[]> {
+  return (
+    (await invokeNative<CommandExecution[]>("run_command_task", { task })) ?? []
   );
 }
 

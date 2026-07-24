@@ -11,6 +11,7 @@ import {
   rankSearchResults,
   reorderItems,
   selectSearchResults,
+  startupItemsForScene,
 } from "./domain";
 import type {
   AppSnapshot,
@@ -84,6 +85,7 @@ describe("buildQuickLinkResults", () => {
       name: "Google 搜索",
       description: "使用浏览器搜索网页",
       keyword: "g",
+      parameterName: "query",
       urlTemplate: "https://www.google.com/search?q={query}",
       enabled: true,
     },
@@ -116,6 +118,40 @@ describe("buildQuickLinkResults", () => {
     const result = buildQuickLinkResults(links, "浏览器");
     expect(result).toHaveLength(1);
     expect(result[0].priority).toBeGreaterThan(10_000);
+  });
+
+  it("does not treat an alias as a parameter unless one is configured", () => {
+    const direct = [{
+      ...links[0],
+      id: "douyin",
+      name: "抖音",
+      keyword: "dy",
+      parameterName: "",
+      urlTemplate: "https://www.douyin.com/",
+    }];
+
+    expect(buildQuickLinkResults(direct, "dy")).toHaveLength(1);
+    expect(buildQuickLinkResults(direct, "dy 热门")).toHaveLength(0);
+    expect(buildQuickLinkResults(direct, "dy")[0].path).toBe("https://www.douyin.com/");
+  });
+});
+
+describe("startupItemsForScene", () => {
+  it("selects only enabled applications assigned to the chosen scene", () => {
+    const items = [
+      { id: "code", enabled: true, order: 0 },
+      { id: "music", enabled: true, order: 1 },
+      { id: "disabled", enabled: false, order: 2 },
+    ] as StartupItem[];
+
+    expect(
+      startupItemsForScene(items, {
+        id: "study",
+        name: "学习模式",
+        description: "",
+        itemIds: ["music", "disabled"],
+      }).map((item) => item.id),
+    ).toEqual(["music"]);
   });
 });
 
@@ -298,4 +334,94 @@ describe("mergeSnapshotDefaults", () => {
     expect(merged.tools.clipboard.enabled).toBe(true);
     expect(merged.quickLinks).toEqual([]);
   });
+
+  it("adds automation, folder favorites, scenes and independent login startup defaults", () => {
+    const merged = mergeSnapshotDefaults({
+      ...({} as AppSnapshot),
+      tools: {
+        startup: { enabled: true },
+        search: { enabled: true },
+        prompts: { enabled: true },
+        clipboard: { enabled: true },
+        automation: { enabled: true },
+        folders: { enabled: true },
+      },
+      startupItems: [],
+      prompts: [],
+      quickLinks: [],
+      clipboardHistory: [],
+      activity: { searches: [], copies: [] },
+      settings: {
+        ...({} as AppSnapshot["settings"]),
+        indexRoots: ["*"],
+      },
+    });
+
+    expect(merged.tools.automation.enabled).toBe(true);
+    expect(merged.tools.folders.enabled).toBe(true);
+    expect(merged.settings.launchAtLogin).toBe(true);
+    expect(merged.startupScenes[0].name).toBe("默认场景");
+    expect(merged.commandTasks).toEqual([]);
+    expect(merged.folderFavorites).toEqual([]);
+  });
+
+  it("migrates removed monospace fonts and terminal close behavior", () => {
+    const merged = mergeSnapshotDefaults({
+      ...defaultSnapshotForMigration(),
+      commandTasks: [{
+        id: "task",
+        name: "Task",
+        description: "",
+        commands: ["echo ok"],
+        showTerminal: true,
+        createdAt: 1,
+        updatedAt: 1,
+      }],
+      settings: {
+        ...defaultSnapshotForMigration().settings,
+        fontFamily: "mono",
+      },
+    } as unknown as AppSnapshot);
+
+    expect(merged.settings.fontFamily).toBe("system");
+    expect(merged.commandTasks[0].closeTerminalOnFinish).toBe(true);
+  });
 });
+
+function defaultSnapshotForMigration(): AppSnapshot {
+  return {
+    tools: {
+      startup: { enabled: true },
+      search: { enabled: true },
+      prompts: { enabled: true },
+      clipboard: { enabled: true },
+      automation: { enabled: true },
+      folders: { enabled: true },
+    },
+    startupItems: [],
+    startupScenes: [],
+    commandTasks: [],
+    folderFavorites: [],
+    prompts: [],
+    quickLinks: [],
+    clipboardHistory: [],
+    activity: { searches: [], copies: [] },
+    settings: {
+      theme: "light",
+      fontFamily: "system",
+      fontScale: 1,
+      shortcuts: {
+        search: "Alt+Space",
+        prompts: "Alt+Shift+P",
+        clipboard: "Alt+Shift+V",
+      },
+      dataDirectory: "",
+      indexRoots: ["*"],
+      excludedPatterns: [],
+      searchFilters: { kind: "all", extension: "", drive: "" },
+      clipboardLimit: 50,
+      launchAtLogin: true,
+      loginSceneId: "",
+    },
+  };
+}

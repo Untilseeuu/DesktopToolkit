@@ -1,3 +1,4 @@
+mod automation;
 mod domain;
 mod launcher;
 mod search;
@@ -417,6 +418,14 @@ fn save_snapshot(
         *previous = sanitized;
         Ok(true)
     })?;
+    if let Ok(current) = storage.load_snapshot() {
+        let entries = current
+            .get("clipboardHistory")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        cleanup_clipboard_images(&storage, &entries);
+    }
     if let Some((previous, proposed)) = runtime_transition {
         if let Err(error) = apply_runtime_settings(&app, &previous, &proposed, false) {
             let proposed_tools = proposed
@@ -604,16 +613,6 @@ fn record_activity(
 }
 
 #[tauri::command]
-fn migrate_data_directory(
-    storage: State<'_, SharedStorage>,
-    target: String,
-) -> Result<String, String> {
-    storage
-        .migrate(&PathBuf::from(target))
-        .map(|path| path.to_string_lossy().to_string())
-}
-
-#[tauri::command]
 fn search_index(
     storage: State<'_, SharedStorage>,
     query: String,
@@ -683,7 +682,7 @@ async fn rebuild_search_index(
 #[tauri::command]
 async fn launch_startup_items(
     storage: State<'_, SharedStorage>,
-    item_ids: Vec<String>,
+    items: Vec<launcher::StartupItem>,
 ) -> Result<Vec<launcher::LaunchResult>, String> {
     let snapshot = storage.load_snapshot()?;
     let startup_enabled = snapshot
@@ -693,13 +692,6 @@ async fn launch_startup_items(
     if !startup_enabled {
         return Err("启动编排当前已暂停".into());
     }
-    let allowed_ids = item_ids
-        .into_iter()
-        .collect::<std::collections::HashSet<_>>();
-    let items = launcher::items_from_snapshot(&snapshot)
-        .into_iter()
-        .filter(|item| allowed_ids.contains(&item.id))
-        .collect();
     let results = tauri::async_runtime::spawn_blocking(move || launcher::launch_queue(items))
         .await
         .map_err(|error| error.to_string())??;
@@ -712,6 +704,24 @@ async fn launch_startup_items(
         Ok(())
     })?;
     Ok(results)
+}
+
+#[tauri::command]
+async fn run_command_task(
+    storage: State<'_, SharedStorage>,
+    task: automation::CommandTask,
+) -> Result<Vec<automation::CommandExecution>, String> {
+    let snapshot = storage.load_snapshot()?;
+    let enabled = snapshot
+        .pointer("/tools/automation/enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    if !enabled {
+        return Err("自动化命令工具已暂停".into());
+    }
+    tauri::async_runtime::spawn_blocking(move || automation::execute_task(&task))
+        .await
+        .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -925,15 +935,15 @@ fn apply_runtime_settings(
     snapshot: &Value,
     force: bool,
 ) -> Result<(), String> {
-    let startup_enabled = snapshot
-        .pointer("/tools/startup/enabled")
+    let launch_at_login = snapshot
+        .pointer("/settings/launchAtLogin")
         .and_then(Value::as_bool)
         .unwrap_or(true);
-    let previous_startup = previous
-        .pointer("/tools/startup/enabled")
+    let previous_launch_at_login = previous
+        .pointer("/settings/launchAtLogin")
         .and_then(Value::as_bool);
-    let autostart_error = if force || previous_startup != Some(startup_enabled) {
-        let result = if startup_enabled {
+    let autostart_error = if force || previous_launch_at_login != Some(launch_at_login) {
+        let result = if launch_at_login {
             app.autolaunch().enable()
         } else {
             app.autolaunch().disable()
@@ -1245,7 +1255,7 @@ pub fn run() {
                     .and_then(Value::as_bool)
                     .unwrap_or(true);
                 if startup_enabled {
-                    let items = launcher::items_from_snapshot(&startup_snapshot);
+                    let items = launcher::items_for_login_scene(&startup_snapshot);
                     let storage_for_queue = storage.clone();
                     let app_for_queue = app.handle().clone();
                     std::thread::spawn(move || match launcher::launch_queue(items) {
@@ -1335,12 +1345,12 @@ pub fn run() {
             clear_startup_failures,
             set_search_filters,
             record_activity,
-            migrate_data_directory,
             search_index,
             get_index_status,
             get_index_count,
             rebuild_search_index,
             launch_startup_items,
+            run_command_task,
             open_target,
             hide_overlay,
             activate_clipboard_entry,

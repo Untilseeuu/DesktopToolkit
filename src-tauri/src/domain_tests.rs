@@ -1,10 +1,12 @@
 #[cfg(test)]
 mod tests {
+    use crate::automation::{execute_commands_with, CommandExecution};
     use crate::domain::{default_data_directory, runtime_settings_changed};
-    use crate::domain::{migration_plan, MigrationPlan};
     use crate::launcher::{launch_queue, validate_startup_item, StartupItem};
-    use crate::storage::{cleanup_committed_backup, recover_location_pointer};
-    use crate::{clipboard_file_path, search, shortcut_target, storage::StorageManager};
+    use crate::{
+        cleanup_clipboard_images, clipboard_file_path, search, shortcut_target,
+        storage::StorageManager,
+    };
     use std::str::FromStr;
     use std::{
         fs,
@@ -22,6 +24,82 @@ mod tests {
     }
 
     #[test]
+    fn installed_storage_ignores_legacy_data_and_retires_its_pointer() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("atlas-appdata-pointer-test-{nonce}"));
+        let install_dir = root.join("Atlas");
+        let legacy_data = root.join("legacy-external-data");
+        let legacy_pointer = root
+            .join("AppData")
+            .join("atlas")
+            .join("desktop-toolkit")
+            .join("config")
+            .join("data-location.json");
+        fs::create_dir_all(legacy_pointer.parent().unwrap()).unwrap();
+
+        let legacy = StorageManager::for_test(legacy_data.clone(), legacy_data.clone()).unwrap();
+        legacy
+            .update_snapshot(|snapshot| {
+                *snapshot = serde_json::json!({ "marker": "legacy-appdata" });
+                Ok(())
+            })
+            .unwrap();
+        drop(legacy);
+        fs::write(&legacy_pointer, serde_json::to_vec(&legacy_data).unwrap()).unwrap();
+
+        let storage = StorageManager::for_installed_test_with_legacy_pointer(
+            &install_dir.join("atlas.exe"),
+            &legacy_pointer,
+        )
+        .unwrap();
+
+        assert_eq!(storage.data_dir(), install_dir.join("data"));
+        assert_eq!(storage.load_snapshot().unwrap(), serde_json::Value::Null);
+        assert!(legacy_data.join("atlas.db").is_file());
+        assert!(!legacy_pointer.exists());
+        drop(storage);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn installed_storage_retires_a_legacy_pointer_to_a_deleted_directory() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("atlas-stale-pointer-test-{nonce}"));
+        let install_dir = root.join("Atlas");
+        let missing_legacy_data = root.join("deleted-external-data");
+        let legacy_pointer = root
+            .join("AppData")
+            .join("atlas")
+            .join("desktop-toolkit")
+            .join("config")
+            .join("data-location.json");
+        fs::create_dir_all(legacy_pointer.parent().unwrap()).unwrap();
+        fs::write(
+            &legacy_pointer,
+            serde_json::to_vec(&missing_legacy_data).unwrap(),
+        )
+        .unwrap();
+
+        let storage = StorageManager::for_installed_test_with_legacy_pointer(
+            &install_dir.join("atlas.exe"),
+            &legacy_pointer,
+        )
+        .unwrap();
+
+        assert_eq!(storage.data_dir(), install_dir.join("data"));
+        assert!(storage.database_path().is_file());
+        assert!(!legacy_pointer.exists());
+        drop(storage);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn content_only_changes_do_not_reapply_system_settings() {
         let previous = serde_json::json!({
             "tools": { "startup": { "enabled": true }, "search": { "enabled": true } },
@@ -31,6 +109,94 @@ mod tests {
         let mut next = previous.clone();
         next["prompts"] = serde_json::json!([{ "id": "new" }]);
         assert!(!runtime_settings_changed(&previous, &next));
+    }
+
+    #[test]
+    fn login_startup_setting_is_independent_from_the_startup_tool() {
+        let previous = serde_json::json!({
+            "tools": { "startup": { "enabled": true } },
+            "settings": { "launchAtLogin": true }
+        });
+        let mut tool_disabled = previous.clone();
+        tool_disabled["tools"]["startup"]["enabled"] = serde_json::json!(false);
+        assert!(!runtime_settings_changed(&previous, &tool_disabled));
+
+        let mut login_disabled = previous.clone();
+        login_disabled["settings"]["launchAtLogin"] = serde_json::json!(false);
+        assert!(runtime_settings_changed(&previous, &login_disabled));
+    }
+
+    #[test]
+    fn login_startup_uses_only_the_configured_scene() {
+        let snapshot = serde_json::json!({
+            "startupItems": [
+                { "id": "work", "name": "Work", "path": "C:\\Work.exe", "args": [], "delaySeconds": 0, "enabled": true, "order": 0 },
+                { "id": "study", "name": "Study", "path": "C:\\Study.exe", "args": [], "delaySeconds": 0, "enabled": true, "order": 1 }
+            ],
+            "startupScenes": [
+                { "id": "work-scene", "itemIds": ["work"] },
+                { "id": "study-scene", "itemIds": ["study"] }
+            ],
+            "settings": { "loginSceneId": "study-scene" }
+        });
+
+        let items = crate::launcher::items_for_login_scene(&snapshot);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, "study");
+    }
+
+    #[test]
+    fn boot_startup_can_explicitly_select_no_scene() {
+        let snapshot = serde_json::json!({
+            "startupItems": [
+                { "id": "work", "name": "Work", "path": "C:\\Work.exe", "args": [], "delaySeconds": 0, "enabled": true, "order": 0 }
+            ],
+            "startupScenes": [
+                { "id": "work-scene", "itemIds": ["work"] }
+            ],
+            "settings": { "loginSceneId": "" }
+        });
+
+        assert!(crate::launcher::items_for_login_scene(&snapshot).is_empty());
+    }
+
+    #[test]
+    fn visible_command_tasks_share_one_terminal_and_wait_in_sequence() {
+        assert_eq!(
+            crate::automation::terminal_script(&[
+                "python -m pip install requests".into(),
+                "python app.py".into()
+            ]),
+            "call python -m pip install requests && call python app.py"
+        );
+        assert_eq!(crate::automation::terminal_mode(true), "/C");
+        assert_eq!(crate::automation::terminal_mode(false), "/K");
+    }
+
+    #[test]
+    fn command_tasks_wait_for_each_command_and_stop_after_a_failure() {
+        let mut calls = Vec::new();
+        let results = execute_commands_with(
+            &["first".into(), "pip install example".into(), "never".into()],
+            |command| {
+                calls.push(command.to_string());
+                CommandExecution {
+                    command: command.into(),
+                    success: command != "pip install example",
+                    exit_code: Some(if command == "pip install example" {
+                        1
+                    } else {
+                        0
+                    }),
+                    stdout: format!("{command} output"),
+                    stderr: String::new(),
+                }
+            },
+        );
+
+        assert_eq!(calls, vec!["first", "pip install example"]);
+        assert_eq!(results.len(), 2);
+        assert!(!results[1].success);
     }
 
     #[test]
@@ -205,12 +371,34 @@ mod tests {
             .unwrap()
             .as_nanos();
         let root = std::env::temp_dir().join(format!("atlas-clipboard-path-test-{nonce}"));
-        let storage =
-            StorageManager::for_test(root.join("bootstrap"), root.join("data")).unwrap();
+        let storage = StorageManager::for_test(root.join("bootstrap"), root.join("data")).unwrap();
 
         assert!(clipboard_file_path(&storage, "clipboard-images/clip.png").is_ok());
         assert!(clipboard_file_path(&storage, "../outside.png").is_err());
         assert!(clipboard_file_path(&storage, r"C:\outside.png").is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn clipboard_cleanup_removes_images_that_fall_outside_the_history_limit() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("atlas-clipboard-cleanup-test-{nonce}"));
+        let storage = StorageManager::for_test(root.join("bootstrap"), root.join("data")).unwrap();
+        let image_directory = storage.data_dir().join("clipboard-images");
+        fs::create_dir_all(&image_directory).unwrap();
+        fs::write(image_directory.join("keep.png"), b"keep").unwrap();
+        fs::write(image_directory.join("orphan.png"), b"orphan").unwrap();
+
+        cleanup_clipboard_images(
+            &storage,
+            &[serde_json::json!({ "imageFile": "clipboard-images/keep.png" })],
+        );
+
+        assert!(image_directory.join("keep.png").exists());
+        assert!(!image_directory.join("orphan.png").exists());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -241,60 +429,6 @@ mod tests {
     #[test]
     fn background_helpers_use_the_no_console_window_flag() {
         assert_eq!(crate::background_process_creation_flags(), 0x0800_0000);
-    }
-
-    #[test]
-    fn migration_is_noop_for_the_same_directory() {
-        assert_eq!(
-            migration_plan("D:\\Atlas", "D:\\Atlas", true),
-            MigrationPlan::Noop
-        );
-    }
-
-    #[test]
-    fn migration_copies_existing_storage_to_a_new_directory() {
-        assert_eq!(
-            migration_plan("C:\\Old", "E:\\Atlas", true),
-            MigrationPlan::Migrate {
-                source: "C:\\Old".into(),
-                target: "E:\\Atlas".into(),
-            }
-        );
-    }
-
-    #[test]
-    fn location_pointer_recovers_the_previous_value_after_an_interrupted_replace() {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let directory = std::env::temp_dir().join(format!("atlas-pointer-test-{nonce}"));
-        fs::create_dir_all(&directory).unwrap();
-        let pointer = directory.join("data-location.json");
-        let backup = directory.join("data-location.backup");
-        fs::write(&backup, br#""D:\\Previous""#).unwrap();
-
-        recover_location_pointer(&pointer, &backup).unwrap();
-
-        assert_eq!(fs::read_to_string(&pointer).unwrap(), r#""D:\\Previous""#);
-        assert!(!backup.exists());
-        fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn committed_pointer_ignores_backup_cleanup_failure() {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let directory = std::env::temp_dir().join(format!("atlas-backup-test-{nonce}"));
-        let backup_as_directory = directory.join("data-location.backup");
-        fs::create_dir_all(&backup_as_directory).unwrap();
-
-        cleanup_committed_backup(&backup_as_directory);
-
-        assert!(backup_as_directory.exists());
-        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -378,8 +512,7 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name, "quarterly-notes.txt");
-        let chinese_results =
-            search::query(&storage, "纪要", "", "", "", &["*".into()]).unwrap();
+        let chinese_results = search::query(&storage, "纪要", "", "", "", &["*".into()]).unwrap();
         assert_eq!(chinese_results.len(), 1);
         assert_eq!(chinese_results[0].name, "项目会议纪要.docx");
         let unique_results =

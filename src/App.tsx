@@ -4,6 +4,7 @@ import {
   AppWindow,
   ArrowUpRight,
   BookOpenText,
+  Bookmark,
   Box,
   Check,
   ChevronDown,
@@ -32,10 +33,12 @@ import {
   MoreHorizontal,
   Plus,
   Power,
+  Play,
   Rocket,
   Search,
   Settings,
   Sparkles,
+  Terminal,
   Sun,
   Trash2,
   X,
@@ -60,6 +63,7 @@ import {
   filterSearchResults,
   rankSearchResults,
   selectSearchResults,
+  startupItemsForScene,
 } from "./domain";
 import {
   activateClipboardEntry,
@@ -74,10 +78,13 @@ import {
   launchStartupItems,
   openTarget,
   rebuildSearchIndex,
+  runCommandTask,
   searchNative,
 } from "./native";
 import QuickOverlay from "./QuickOverlay";
 import type {
+  CommandTask,
+  FolderFavorite,
   NavId,
   PromptEntry,
   QuickLink,
@@ -92,6 +99,8 @@ const navItems: Array<{ id: NavId; label: string; icon: typeof Home }> = [
   { id: "search", label: "全局搜索", icon: Search },
   { id: "prompts", label: "提示词库", icon: BookOpenText },
   { id: "clipboard", label: "剪贴板历史", icon: Clipboard },
+  { id: "automation", label: "自动化命令", icon: Terminal },
+  { id: "folders", label: "文件夹收藏", icon: Bookmark },
 ];
 
 const toolMeta: Record<
@@ -127,10 +136,24 @@ const toolMeta: Record<
   },
   clipboard: {
     title: "剪贴板历史",
-    caption: "跨越重启找回最近复制过的文本",
+    caption: "跨越重启找回最近复制的文字与图片",
     number: "04",
     icon: Clipboard,
     tint: "vermillion",
+  },
+  automation: {
+    title: "自动化命令",
+    caption: "让重复的终端步骤按依赖顺序完成",
+    number: "05",
+    icon: Terminal,
+    tint: "ink",
+  },
+  folders: {
+    title: "文件夹收藏",
+    caption: "把经常抵达的目录留在手边",
+    number: "06",
+    icon: Bookmark,
+    tint: "moss",
   },
 };
 
@@ -167,6 +190,7 @@ function MainApp() {
   const model = useToolkit();
   const [activeNav, setActiveNav] = useState<NavId>("overview");
   const [toast, setToast] = useState<string | null>(null);
+  const mainPanelRef = useRef<HTMLElement>(null);
 
   useEffect(() => {
     const showSearch = () => setActiveNav("search");
@@ -205,10 +229,14 @@ function MainApp() {
     return () => window.clearTimeout(timer);
   }, [toast]);
 
+  useEffect(() => {
+    if (mainPanelRef.current) mainPanelRef.current.scrollTop = 0;
+  }, [activeNav]);
+
   if (!model.hydrated) {
     return (
       <div className="app-loading" role="status">
-        <span className="brand-mark"><Layers3 size={20} /></span>
+        <span className="brand-mark brand-mark--fixed-contrast"><Layers3 size={20} /></span>
         <strong>正在载入 Atlas 工作区</strong>
       </div>
     );
@@ -236,6 +264,10 @@ function MainApp() {
         return <PromptsPage model={model} notify={setToast} />;
       case "clipboard":
         return <ClipboardPage model={model} notify={setToast} />;
+      case "automation":
+        return <AutomationPage model={model} notify={setToast} />;
+      case "folders":
+        return <FolderFavoritesPage model={model} notify={setToast} />;
       case "settings":
         return <EnhancedSettingsPage model={model} notify={setToast} />;
       default:
@@ -247,7 +279,7 @@ function MainApp() {
     <div className="app-shell">
       <aside className="sidebar">
         <button className="brand" onClick={() => setActiveNav("overview")} aria-label="Atlas 首页">
-          <span className="brand-mark">
+          <span className="brand-mark brand-mark--fixed-contrast">
             <Layers3 size={20} />
           </span>
           <span>
@@ -298,20 +330,9 @@ function MainApp() {
         </div>
       </aside>
 
-      <main className="main-panel">
+      <main className="main-panel" ref={mainPanelRef}>
         <div className="titlebar-drag" data-tauri-drag-region />
-        <AnimatePresence mode="wait">
-          <motion.div
-            key={activeNav}
-            className="page"
-            initial={{ opacity: 0, y: 8 }}
-            animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0, y: -5 }}
-            transition={{ duration: 0.24, ease: [0.2, 0.8, 0.2, 1] }}
-          >
-            {page}
-          </motion.div>
-        </AnimatePresence>
+        <div className="page">{page}</div>
       </main>
 
       <AnimatePresence>
@@ -369,7 +390,7 @@ function OverviewPage({
             <i />
             一切就绪
           </strong>
-          <small>{enabledCount} / 4 个工具正在运行</small>
+          <small>{enabledCount} / 6 个工具正在运行</small>
         </div>
       </header>
 
@@ -378,16 +399,14 @@ function OverviewPage({
           const meta = toolMeta[id];
           const Icon = meta.icon;
           const enabled = model.snapshot.tools[id].enabled;
-          const stat =
-            id === "startup"
-              ? `${model.snapshot.startupItems.filter((item) => item.enabled).length} 个应用`
-              : id === "search"
-                ? model.snapshot.settings.shortcuts.search.replaceAll("+", " + ")
-                : `${model.snapshot.prompts.length} 条收藏`;
-          const resolvedStat =
-            id === "clipboard"
-              ? `${model.snapshot.clipboardHistory.length} 条记录`
-              : stat;
+          const resolvedStat = {
+            startup: `${model.snapshot.startupScenes.length} 个场景`,
+            search: model.snapshot.settings.shortcuts.search.replaceAll("+", " + "),
+            prompts: `${model.snapshot.prompts.length} 条收藏`,
+            clipboard: `${model.snapshot.clipboardHistory.length} 条记录`,
+            automation: `${model.snapshot.commandTasks.length} 个任务`,
+            folders: `${model.snapshot.folderFavorites.length} 个文件夹`,
+          }[id];
           return (
             <motion.article
               className={`tool-card ${meta.tint} ${enabled ? "" : "disabled"}`}
@@ -469,10 +488,29 @@ function StartupPage({
 }) {
   const enabled = model.snapshot.tools.startup.enabled;
   const [draggedItemId, setDraggedItemId] = useState<string | null>(null);
+  const [activeSceneId, setActiveSceneId] = useState(
+    model.snapshot.startupScenes[0]?.id ?? "default-scene",
+  );
+  const [sceneDraft, setSceneDraft] = useState<{ name: string; description: string } | null>(null);
+  const activeScene =
+    model.snapshot.startupScenes.find((scene) => scene.id === activeSceneId) ??
+    model.snapshot.startupScenes[0];
+  const sceneItems = (activeScene?.itemIds ?? [])
+    .map((id) => model.snapshot.startupItems.find((item) => item.id === id))
+    .filter((item): item is NonNullable<typeof item> => Boolean(item))
+    .sort((a, b) => a.order - b.order);
   const addItem = async () => {
     const item = await chooseExecutable();
     if (!item) return;
     model.addStartupItem(item);
+    model.setSnapshot((current) => ({
+      ...current,
+      startupScenes: current.startupScenes.map((scene) =>
+        scene.id === activeScene?.id && !scene.itemIds.includes(item.id)
+          ? { ...scene, itemIds: [...scene.itemIds, item.id] }
+          : scene,
+      ),
+    }));
     notify("应用已加入启动队列");
   };
 
@@ -481,14 +519,94 @@ function StartupPage({
       <SectionHeading
         eyebrow="TOOL 01 · STARTUP"
         title="启动编排"
-        description="按你的节奏唤醒工作环境，而不是让所有应用争抢开机资源。"
+        description="为工作、学习或自定义场景安排不同的应用组合，并按顺序启动。"
         action={<Switch checked={enabled} onChange={(value) => model.setToolEnabled("startup", value)} label="启动编排" />}
       />
+      <section className="scene-switcher">
+        <div className="scene-tabs" role="tablist" aria-label="启动场景">
+          {model.snapshot.startupScenes.map((scene) => (
+            <button
+              type="button"
+              role="tab"
+              aria-selected={scene.id === activeScene?.id}
+              className={scene.id === activeScene?.id ? "active" : ""}
+              key={scene.id}
+              onClick={() => setActiveSceneId(scene.id)}
+            >
+              <Layers3 size={15} />
+              <span><strong>{scene.name}</strong><small>{scene.itemIds.length} 个应用</small></span>
+            </button>
+          ))}
+          <button type="button" className="add-scene" onClick={() => setSceneDraft({ name: "", description: "" })}>
+            <Plus size={16} /> 新建场景
+          </button>
+        </div>
+        {sceneDraft ? (
+          <form
+            className="scene-editor"
+            onSubmit={(event) => {
+              event.preventDefault();
+              if (!sceneDraft.name.trim()) {
+                notify("请填写场景名称");
+                return;
+              }
+              const scene = {
+                id: `scene-${Date.now()}`,
+                name: sceneDraft.name.trim(),
+                description: sceneDraft.description.trim(),
+                itemIds: [] as string[],
+              };
+              model.setSnapshot((current) => ({
+                ...current,
+                startupScenes: [...current.startupScenes, scene],
+              }));
+              setActiveSceneId(scene.id);
+              setSceneDraft(null);
+            }}
+          >
+            <input aria-label="场景名称" placeholder="例如：学习模式" value={sceneDraft.name} onChange={(event) => setSceneDraft({ ...sceneDraft, name: event.target.value })} />
+            <input aria-label="场景描述" placeholder="这个场景用于什么" value={sceneDraft.description} onChange={(event) => setSceneDraft({ ...sceneDraft, description: event.target.value })} />
+            <button type="button" className="button ghost" onClick={() => setSceneDraft(null)}>取消</button>
+            <button className="button primary" type="submit">创建</button>
+          </form>
+        ) : null}
+        {activeScene ? (
+          <div className="scene-summary">
+            <div>
+              <span className="eyebrow">ACTIVE SCENE</span>
+              <strong>{activeScene.name}</strong>
+              <small>{activeScene.description || "自定义应用组合"}</small>
+            </div>
+            {model.snapshot.startupScenes.length > 1 ? (
+              <button
+                className="button ghost danger"
+                onClick={() => {
+                  const remaining = model.snapshot.startupScenes.filter((scene) => scene.id !== activeScene.id);
+                  model.setSnapshot((current) => ({
+                    ...current,
+                    startupScenes: remaining,
+                    settings: {
+                      ...current.settings,
+                      loginSceneId:
+                        current.settings.loginSceneId === activeScene.id
+                          ? remaining[0].id
+                          : current.settings.loginSceneId,
+                    },
+                  }));
+                  setActiveSceneId(remaining[0].id);
+                }}
+              >
+                <Trash2 size={15} /> 删除场景
+              </button>
+            ) : null}
+          </div>
+        ) : null}
+      </section>
       {model.snapshot.startupFailures?.length ? (
         <div className="startup-failure-banner" role="status">
           <AlertTriangle size={17} />
           <span>
-            上次登录时有 {model.snapshot.startupFailures.length} 个应用未能启动：
+            上次开机时有 {model.snapshot.startupFailures.length} 个应用未能启动：
             {model.snapshot.startupFailures.map((item) => item.name).join("、")}
           </span>
           <button
@@ -503,15 +621,15 @@ function StartupPage({
       <div className="page-toolbar">
         <div className="toolbar-state">
           <Power size={16} />
-          <span>{enabled ? "登录 Windows 后自动执行队列" : "启动队列当前暂停"}</span>
+          <span>{enabled ? "场景已就绪；开机行为由设置单独控制" : "所有启动场景当前暂停"}</span>
         </div>
         <div className="toolbar-actions">
           <button
             type="button"
             className="button secondary"
-            disabled={!model.snapshot.startupItems.length}
+            disabled={!startupItemsForScene(model.snapshot.startupItems, activeScene).length}
             onClick={() => {
-              void launchStartupItems(model.snapshot.startupItems)
+              void launchStartupItems(startupItemsForScene(model.snapshot.startupItems, activeScene))
                 .then((results) => {
                   model.setSnapshot((current) => ({
                     ...current,
@@ -546,8 +664,8 @@ function StartupPage({
           <span>状态</span>
           <span />
         </div>
-        {model.snapshot.startupItems.length ? (
-          model.snapshot.startupItems.map((item, index) => (
+        {sceneItems.length ? (
+          sceneItems.map((item, index) => (
             <div
               className={`startup-row ${draggedItemId === item.id ? "dragging" : ""}`}
               key={item.id}
@@ -613,7 +731,7 @@ function StartupPage({
               >
                 <Trash2 size={17} />
               </button>
-              {index < model.snapshot.startupItems.length - 1 ? (
+              {index < sceneItems.length - 1 ? (
                 <span className="sequence-line" />
               ) : null}
             </div>
@@ -632,10 +750,44 @@ function StartupPage({
         )}
       </section>
 
+      {model.snapshot.startupItems.length ? (
+        <section className="content-card scene-membership">
+          <header>
+            <div><strong>场景应用</strong><small>勾选要包含在“{activeScene?.name}”中的应用</small></div>
+          </header>
+          <div>
+            {model.snapshot.startupItems.map((item) => (
+              <label key={item.id}>
+                <input
+                  type="checkbox"
+                  checked={activeScene?.itemIds.includes(item.id) ?? false}
+                  onChange={(event) =>
+                    model.setSnapshot((current) => ({
+                      ...current,
+                      startupScenes: current.startupScenes.map((scene) =>
+                        scene.id === activeScene?.id
+                          ? {
+                              ...scene,
+                              itemIds: event.target.checked
+                                ? Array.from(new Set([...scene.itemIds, item.id]))
+                                : scene.itemIds.filter((id) => id !== item.id),
+                            }
+                          : scene,
+                      ),
+                    }))
+                  }
+                />
+                <span>{item.name}</span>
+              </label>
+            ))}
+          </div>
+        </section>
+      ) : null}
+
       <aside className="note-panel">
         <Info size={17} />
         <p>
-          Atlas 本身会注册为 Windows 登录启动项。队列中的应用不会被写入系统启动文件夹，因此暂停工具即可一次性停用整个编排。
+          是否让 Atlas 随 Windows 开机自启动由“设置 → 开机自启动”单独控制；启动编排开关只控制开机后是否执行所选场景。
         </p>
       </aside>
     </>
@@ -961,15 +1113,19 @@ function PromptsPage({
 }) {
   const [query, setQuery] = useState("");
   const [category, setCategory] = useState("all");
+  const [favoritesOnly, setFavoritesOnly] = useState(false);
   const [editing, setEditing] = useState<PromptEntry | "new" | null>(null);
   const categories = useMemo(
     () => Array.from(new Set(model.snapshot.prompts.map((prompt) => prompt.category))).sort(),
     [model.snapshot.prompts],
   );
-  const prompts = useMemo(
-    () => filterPromptsByCategory(filterPrompts(model.snapshot.prompts, query), category),
-    [category, model.snapshot.prompts, query],
-  );
+  const prompts = useMemo(() => {
+    const filtered = filterPromptsByCategory(
+      filterPrompts(model.snapshot.prompts, query),
+      category,
+    );
+    return favoritesOnly ? filtered.filter((prompt) => prompt.favorite) : filtered;
+  }, [category, favoritesOnly, model.snapshot.prompts, query]);
 
   return (
     <>
@@ -1008,12 +1164,21 @@ function PromptsPage({
           </select>
           <ChevronDown size={15} />
         </label>
+        <button
+          type="button"
+          className={`favorites-filter ${favoritesOnly ? "active" : ""}`}
+          aria-pressed={favoritesOnly}
+          onClick={() => setFavoritesOnly((value) => !value)}
+        >
+          <Heart size={15} fill={favoritesOnly ? "currentColor" : "none"} />
+          只看收藏
+        </button>
         <div className="library-count">{model.snapshot.prompts.length} 条提示词</div>
       </div>
       <section className="prompt-grid">
         {prompts.map((prompt) => (
           <motion.article
-            className="prompt-card"
+            className={`prompt-card ${prompt.favorite ? "is-favorite" : ""}`}
             key={prompt.id}
             onClick={() => setEditing(prompt)}
           >
@@ -1021,10 +1186,13 @@ function PromptsPage({
               <span className="category-chip">{prompt.category}</span>
               <button
                 className={`favorite-button ${prompt.favorite ? "active" : ""}`}
-                aria-label={prompt.favorite ? "取消收藏" : "收藏"}
+                type="button"
+                aria-label={`${prompt.favorite ? "取消收藏" : "收藏"} ${prompt.title}`}
+                aria-pressed={prompt.favorite}
                 onClick={(event) => {
                   event.stopPropagation();
                   model.upsertPrompt({ ...prompt, favorite: !prompt.favorite });
+                  notify(prompt.favorite ? "已取消收藏" : "已加入收藏");
                 }}
               >
                 <Heart size={16} fill={prompt.favorite ? "currentColor" : "none"} />
@@ -1163,22 +1331,6 @@ function SettingsPage({
   model: ToolkitModel;
   notify: (message: string) => void;
 }) {
-  const [migrating, setMigrating] = useState(false);
-  const changeDirectory = async () => {
-    const target = await chooseDirectory();
-    if (!target) return;
-    setMigrating(true);
-    try {
-      const result = await invokeNative<string>("migrate_data_directory", { target });
-      model.setDataDirectory(result ?? target);
-      notify("数据存储位置已更新");
-    } catch (error) {
-      notify(`迁移失败：${String(error)}`);
-    } finally {
-      setMigrating(false);
-    }
-  };
-
   return (
     <>
       <SectionHeading
@@ -1194,11 +1346,8 @@ function SettingsPage({
             <div>
               <strong>当前存储位置</strong>
               <code>{model.snapshot.settings.dataDirectory}</code>
-              <small>迁移时会先复制并校验新数据库，失败不会删除原数据。</small>
+              <small>存储位置跟随软件安装目录</small>
             </div>
-            <button className="button secondary" onClick={() => void changeDirectory()} disabled={migrating} aria-label="更改位置">
-              <FolderOpen size={16} /> {migrating ? "正在迁移…" : "更改位置"}
-            </button>
           </div>
         </section>
 
@@ -1359,6 +1508,470 @@ function ShortcutRecorder({
   );
 }
 
+function AutomationPage({
+  model,
+  notify,
+}: {
+  model: ToolkitModel;
+  notify: (message: string) => void;
+}) {
+  const enabled = model.snapshot.tools.automation.enabled;
+  const [draft, setDraft] = useState<CommandTask | null>(null);
+  const [runningId, setRunningId] = useState<string | null>(null);
+  const [logs, setLogs] = useState<Array<{
+    command: string;
+    success: boolean;
+    exitCode?: number;
+    stdout: string;
+    stderr: string;
+  }>>([]);
+
+  const saveTask = (task: CommandTask) => {
+    const normalized = {
+      ...task,
+      name: task.name.trim(),
+      description: task.description.trim(),
+      commands: task.commands.map((command) => command.trim()).filter(Boolean),
+      workingDirectory: task.workingDirectory?.trim() || undefined,
+      updatedAt: Date.now(),
+    };
+    if (!normalized.name || !normalized.commands.length) {
+      notify("请填写任务名称和至少一条命令");
+      return;
+    }
+    model.setSnapshot((current) => ({
+      ...current,
+      commandTasks: current.commandTasks.some((item) => item.id === normalized.id)
+        ? current.commandTasks.map((item) =>
+            item.id === normalized.id ? normalized : item,
+          )
+        : [normalized, ...current.commandTasks],
+    }));
+    setDraft(null);
+    notify("命令任务已保存");
+  };
+
+  return (
+    <>
+      <SectionHeading
+        eyebrow="TOOL 05 · AUTOMATION"
+        title="自动化命令"
+        description="把重复的终端步骤保存为任务。每条命令结束后，下一条才会开始。"
+        action={
+          <Switch
+            checked={enabled}
+            onChange={(value) => model.setToolEnabled("automation", value)}
+            label="自动化命令"
+          />
+        }
+      />
+      <div className="page-toolbar">
+        <div className="toolbar-state">
+          <Terminal size={16} />
+          <span>命令严格串行；任一命令失败后立即停止后续步骤</span>
+        </div>
+        <button
+          className="button primary"
+          onClick={() =>
+            setDraft({
+              id: `command-${Date.now()}`,
+              name: "",
+              description: "",
+              commands: [""],
+              showTerminal: true,
+              closeTerminalOnFinish: true,
+              createdAt: Date.now(),
+              updatedAt: Date.now(),
+            })
+          }
+        >
+          <Plus size={17} /> 新建任务
+        </button>
+      </div>
+
+      {draft ? (
+        <form
+          className="content-card command-editor"
+          onSubmit={(event) => {
+            event.preventDefault();
+            saveTask(draft);
+          }}
+        >
+          <div className="command-editor-grid">
+            <label>
+              <span>任务名称</span>
+              <input
+                aria-label="任务名称"
+                value={draft.name}
+                onChange={(event) => setDraft({ ...draft, name: event.target.value })}
+                placeholder="例如：初始化 Python 环境"
+              />
+            </label>
+            <label>
+              <span>工作目录（可选）</span>
+              <input
+                aria-label="命令工作目录"
+                value={draft.workingDirectory ?? ""}
+                onChange={(event) =>
+                  setDraft({ ...draft, workingDirectory: event.target.value })
+                }
+                placeholder="D:\Workspace\Project"
+              />
+            </label>
+          </div>
+          <label>
+            <span>描述</span>
+            <input
+              aria-label="任务描述"
+              value={draft.description}
+              onChange={(event) =>
+                setDraft({ ...draft, description: event.target.value })
+              }
+              placeholder="说明这个任务会完成什么"
+            />
+          </label>
+          <label>
+            <span>命令列表（每行一条，按顺序执行）</span>
+            <textarea
+              aria-label="命令列表"
+              rows={7}
+              value={draft.commands.join("\n")}
+              onChange={(event) =>
+                setDraft({ ...draft, commands: event.target.value.split("\n") })
+              }
+              placeholder={"python -m venv .venv\n.venv\\Scripts\\python -m pip install -r requirements.txt"}
+            />
+          </label>
+          <div className="command-terminal-options">
+            <label className="command-terminal-option">
+              <span>
+                <strong>显示命令窗口</strong>
+                <small>全部命令会在同一个终端中按顺序执行，不再为每条命令重复弹窗。</small>
+              </span>
+              <Switch
+                checked={draft.showTerminal}
+                label="显示命令窗口"
+                onChange={(showTerminal) => setDraft({ ...draft, showTerminal })}
+              />
+            </label>
+            <label className={`command-terminal-option ${draft.showTerminal ? "" : "disabled"}`}>
+              <span>
+                <strong>运行完毕后关闭终端</strong>
+                <small>关闭此项可保留终端，适合开发服务器、监听任务或执行完成后继续输入命令。</small>
+              </span>
+              <Switch
+                checked={draft.closeTerminalOnFinish}
+                label="运行完毕后关闭终端"
+                disabled={!draft.showTerminal}
+                onChange={(closeTerminalOnFinish) =>
+                  setDraft({ ...draft, closeTerminalOnFinish })
+                }
+              />
+            </label>
+          </div>
+          <div className="form-actions">
+            <button type="button" className="button ghost" onClick={() => setDraft(null)}>
+              取消
+            </button>
+            <button type="submit" className="button primary">保存任务</button>
+          </div>
+        </form>
+      ) : null}
+
+      <section className="automation-grid">
+        {model.snapshot.commandTasks.map((task) => (
+          <article className="content-card command-task-card" key={task.id}>
+            <header>
+              <span className="task-terminal"><Terminal size={19} /></span>
+              <div>
+                <h3>{task.name}</h3>
+                <p>{task.description || "无描述"}</p>
+              </div>
+              <span className="command-count">{task.commands.length} 步</span>
+            </header>
+            <ol>
+              {task.commands.slice(0, 4).map((command, index) => (
+                <li key={`${task.id}-${index}`}><code>{command}</code></li>
+              ))}
+            </ol>
+            <footer>
+              <button className="button ghost" onClick={() => setDraft(task)}>
+                <Settings size={15} /> 编辑
+              </button>
+              <button
+                className="icon-button danger"
+                aria-label={`删除 ${task.name}`}
+                onClick={() =>
+                  model.setSnapshot((current) => ({
+                    ...current,
+                    commandTasks: current.commandTasks.filter((item) => item.id !== task.id),
+                  }))
+                }
+              >
+                <Trash2 size={16} />
+              </button>
+              <button
+                className="button primary run-task"
+                disabled={runningId !== null}
+                onClick={() => {
+                  setRunningId(task.id);
+                  setLogs([]);
+                  void runCommandTask(task)
+                    .then((results) => {
+                      setLogs(results);
+                      const failed = results.find((result) => !result.success);
+                       notify(
+                         failed
+                           ? `任务在“${failed.command}”处停止`
+                           : task.showTerminal && !task.closeTerminalOnFinish
+                             ? `任务“${task.name}”已在终端中启动`
+                             : `任务“${task.name}”已完成`,
+                       );
+                    })
+                    .catch((error: unknown) => notify(`执行失败：${String(error)}`))
+                    .finally(() => setRunningId(null));
+                }}
+              >
+                <Play size={15} />
+                {runningId === task.id ? "执行中…" : "运行"}
+              </button>
+            </footer>
+          </article>
+        ))}
+        {!model.snapshot.commandTasks.length && !draft ? (
+          <EmptyState
+            icon={<Terminal size={28} />}
+            title="还没有自动化任务"
+            description="把安装依赖、构建、备份等连续命令保存下来，一次点击顺序完成。"
+            fullSpan
+          />
+        ) : null}
+      </section>
+
+      {logs.length ? (
+        <section className="content-card command-console" aria-label="命令执行结果">
+          <header><Terminal size={17} /><strong>执行结果</strong></header>
+          {logs.map((result, index) => (
+            <div className={result.success ? "success" : "failed"} key={`${result.command}-${index}`}>
+              <p><span>{result.success ? "✓" : "×"}</span><code>{result.command}</code><em>退出码 {result.exitCode ?? "—"}</em></p>
+              {result.stdout ? <pre>{result.stdout}</pre> : null}
+              {result.stderr ? <pre className="stderr">{result.stderr}</pre> : null}
+            </div>
+          ))}
+        </section>
+      ) : null}
+    </>
+  );
+}
+
+function FolderFavoritesPage({
+  model,
+  notify,
+}: {
+  model: ToolkitModel;
+  notify: (message: string) => void;
+}) {
+  const enabled = model.snapshot.tools.folders.enabled;
+  const addFolder = async () => {
+    const path = await chooseDirectory();
+    if (!path) return;
+    if (model.snapshot.folderFavorites.some((item) => item.path === path)) {
+      notify("这个文件夹已经收藏");
+      return;
+    }
+    const favorite: FolderFavorite = {
+      id: `folder-${Date.now()}`,
+      name: path.split(/[\\/]/).filter(Boolean).at(-1) ?? path,
+      path,
+      description: "",
+      createdAt: Date.now(),
+    };
+    model.setSnapshot((current) => ({
+      ...current,
+      folderFavorites: [favorite, ...current.folderFavorites],
+    }));
+    notify("文件夹已收藏");
+  };
+  return (
+    <>
+      <SectionHeading
+        eyebrow="TOOL 06 · PLACES"
+        title="文件夹收藏"
+        description="收藏经常使用的项目、资料和下载目录，随时一键打开。"
+        action={
+          <Switch
+            checked={enabled}
+            onChange={(value) => model.setToolEnabled("folders", value)}
+            label="文件夹收藏"
+          />
+        }
+      />
+      <div className="page-toolbar">
+        <div className="toolbar-state"><Bookmark size={16} /><span>{model.snapshot.folderFavorites.length} 个常用位置</span></div>
+        <button className="button primary" onClick={() => void addFolder()}>
+          <Plus size={17} /> 收藏文件夹
+        </button>
+      </div>
+      <section className="folder-favorites-grid">
+        {model.snapshot.folderFavorites.map((favorite) => (
+          <article className="content-card folder-favorite-card" key={favorite.id}>
+            <button className="folder-open-target" onClick={() => void openTarget(favorite.path)}>
+              <span><FolderOpen size={24} /></span>
+              <strong>{favorite.name}</strong>
+              <small title={favorite.path}>{favorite.path}</small>
+            </button>
+            <button
+              className="icon-button danger"
+              aria-label={`取消收藏 ${favorite.name}`}
+              onClick={() =>
+                model.setSnapshot((current) => ({
+                  ...current,
+                  folderFavorites: current.folderFavorites.filter(
+                    (item) => item.id !== favorite.id,
+                  ),
+                }))
+              }
+            >
+              <Trash2 size={16} />
+            </button>
+          </article>
+        ))}
+        {!model.snapshot.folderFavorites.length ? (
+          <EmptyState
+            icon={<Bookmark size={28} />}
+            title="还没有收藏文件夹"
+            description="收藏后点击卡片即可在资源管理器中打开。"
+            fullSpan
+          />
+        ) : null}
+      </section>
+    </>
+  );
+}
+
+function BootScenePicker({
+  value,
+  scenes,
+  onChange,
+}: {
+  value: string;
+  scenes: Array<{ id: string; name: string }>;
+  onChange: (value: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const pickerRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const options = [{ id: "", name: "无" }, ...scenes];
+  const selected = options.find((option) => option.id === value) ?? options[0];
+
+  const focusOption = (position: "first" | "last" | "next" | "previous") => {
+    const optionButtons = [
+      ...(pickerRef.current?.querySelectorAll<HTMLButtonElement>('[role="option"]') ?? []),
+    ];
+    if (!optionButtons.length) return;
+    const activeIndex = optionButtons.indexOf(document.activeElement as HTMLButtonElement);
+    const selectedIndex = optionButtons.findIndex(
+      (option) => option.getAttribute("aria-selected") === "true",
+    );
+    const baseIndex = activeIndex >= 0 ? activeIndex : Math.max(selectedIndex, 0);
+    const targetIndex =
+      position === "first"
+        ? 0
+        : position === "last"
+          ? optionButtons.length - 1
+          : position === "next"
+            ? (baseIndex + 1) % optionButtons.length
+            : (baseIndex - 1 + optionButtons.length) % optionButtons.length;
+    optionButtons[targetIndex]?.focus();
+  };
+
+  useEffect(() => {
+    if (!open) return;
+    const closeOnOutsidePress = (event: PointerEvent) => {
+      if (!pickerRef.current?.contains(event.target as Node)) setOpen(false);
+    };
+    document.addEventListener("pointerdown", closeOnOutsidePress);
+    return () => document.removeEventListener("pointerdown", closeOnOutsidePress);
+  }, [open]);
+
+  return (
+    <div
+      className={`boot-scene-picker ${open ? "is-open" : ""}`}
+      ref={pickerRef}
+      onKeyDown={(event) => {
+        if (event.key === "Escape" && open) {
+          event.preventDefault();
+          setOpen(false);
+          triggerRef.current?.focus();
+          return;
+        }
+        if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+          event.preventDefault();
+          const direction = event.key === "ArrowDown" ? "next" : "previous";
+          if (!open) {
+            setOpen(true);
+            window.requestAnimationFrame(() =>
+              focusOption(event.key === "ArrowDown" ? "first" : "last"),
+            );
+          } else {
+            focusOption(direction);
+          }
+          return;
+        }
+        if (open && (event.key === "Home" || event.key === "End")) {
+          event.preventDefault();
+          focusOption(event.key === "Home" ? "first" : "last");
+        }
+      }}
+    >
+      <button
+        type="button"
+        className="boot-scene-trigger"
+        ref={triggerRef}
+        role="combobox"
+        aria-label="开机启动场景"
+        aria-controls="boot-scene-options"
+        aria-expanded={open}
+        aria-haspopup="listbox"
+        onClick={() => setOpen((current) => !current)}
+      >
+        <Rocket size={15} />
+        <span title={selected.name}>{selected.name}</span>
+        <ChevronDown size={14} />
+      </button>
+      {open ? (
+        <div
+          className="boot-scene-options"
+          id="boot-scene-options"
+          role="listbox"
+          aria-label="开机启动场景选项"
+        >
+          {options.map((option) => {
+            const isSelected = option.id === selected.id;
+            return (
+              <button
+                type="button"
+                role="option"
+                aria-selected={isSelected}
+                className={isSelected ? "selected" : ""}
+                key={option.id || "none"}
+                onClick={() => {
+                  onChange(option.id);
+                  setOpen(false);
+                  triggerRef.current?.focus();
+                }}
+              >
+                <span>{option.name}</span>
+                {isSelected ? <Check size={14} /> : null}
+              </button>
+            );
+          })}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 function EnhancedSettingsPage({
   model,
   notify,
@@ -1366,24 +1979,8 @@ function EnhancedSettingsPage({
   model: ToolkitModel;
   notify: (message: string) => void;
 }) {
-  const [migrating, setMigrating] = useState(false);
   const [indexing, setIndexing] = useState(false);
   const [linkDraft, setLinkDraft] = useState<QuickLink | null>(null);
-
-  const changeDirectory = async () => {
-    const target = await chooseDirectory();
-    if (!target) return;
-    setMigrating(true);
-    try {
-      const result = await invokeNative<string>("migrate_data_directory", { target });
-      model.setDataDirectory(result ?? target);
-      notify("数据存储位置已更新");
-    } catch (error) {
-      notify(`迁移失败：${String(error)}`);
-    } finally {
-      setMigrating(false);
-    }
-  };
 
   const rebuild = async (roots: string[]) => {
     setIndexing(true);
@@ -1450,23 +2047,49 @@ function EnhancedSettingsPage({
         <section className="settings-section">
           <header>
             <Database size={19} />
-            <div><h2>数据与存储</h2><p>默认保存在应用安装目录下的 data 文件夹。</p></div>
+            <div><h2>数据与存储</h2><p>固定保存在软件安装目录内部的 data 文件夹。</p></div>
           </header>
           <div className="setting-row storage-row">
             <span className="drive-icon"><HardDrive size={22} /></span>
             <div>
               <strong>当前存储位置</strong>
               <code>{model.snapshot.settings.dataDirectory}</code>
-              <small>提示词、配置、索引和剪贴板历史均保存在这里。</small>
+              <small>存储位置跟随软件安装目录</small>
             </div>
-            <button
-              className="button secondary"
-              onClick={() => void changeDirectory()}
-              disabled={migrating}
-              aria-label="更改位置"
-            >
-              <FolderOpen size={16} /> {migrating ? "正在迁移…" : "更改位置"}
-            </button>
+          </div>
+        </section>
+
+        <section className="settings-section boot-settings-section">
+          <header>
+            <Power size={19} />
+            <div>
+              <h2>开机自启动</h2>
+              <p>Atlas 必须随 Windows 开机自启动，才能在开机后执行所选启动场景。</p>
+            </div>
+          </header>
+          <div className="setting-row">
+            <div>
+              <strong>开机自启动 Atlas</strong>
+              <small>关闭后，仍可手动打开 Atlas 和运行任意场景。</small>
+            </div>
+            <Switch
+              checked={model.snapshot.settings.launchAtLogin}
+              label="开机自启动 Atlas"
+              onChange={(launchAtLogin) =>
+                model.setSetting("launchAtLogin", launchAtLogin)
+              }
+            />
+          </div>
+          <div className="setting-row boot-scene-row">
+            <div>
+              <strong>开机时运行场景</strong>
+              <small>选择“无”时只启动 Atlas，不自动打开场景中的应用。</small>
+            </div>
+            <BootScenePicker
+              value={model.snapshot.settings.loginSceneId}
+              scenes={model.snapshot.startupScenes}
+              onChange={(sceneId) => model.setSetting("loginSceneId", sceneId)}
+            />
           </div>
         </section>
 
@@ -1485,6 +2108,7 @@ function EnhancedSettingsPage({
                   name: "",
                   description: "",
                   keyword: "",
+                  parameterName: "",
                   urlTemplate: "https://",
                   enabled: true,
                 })
@@ -1505,11 +2129,25 @@ function EnhancedSettingsPage({
                   notify("请填写名称和有效的网址或 Edge 搜索模板");
                   return;
                 }
+                const parameterName =
+                  linkDraft.parameterName?.trim() ||
+                  linkDraft.urlTemplate.match(/\{([a-zA-Z][\w-]*)\}/)?.[1] ||
+                  "";
+                if (
+                  parameterName &&
+                  !linkDraft.urlTemplate
+                    .toLocaleLowerCase()
+                    .includes(`{${parameterName}}`.toLocaleLowerCase())
+                ) {
+                  notify(`链接模板中需要包含 {${parameterName}}`);
+                  return;
+                }
                 model.upsertQuickLink({
                   ...linkDraft,
                   name: linkDraft.name.trim(),
                   description: linkDraft.description.trim(),
                   keyword: linkDraft.keyword.trim(),
+                  parameterName,
                   urlTemplate: linkDraft.urlTemplate.trim(),
                   id: linkDraft.id || undefined,
                 });
@@ -1538,6 +2176,14 @@ function EnhancedSettingsPage({
                 }
               />
               <input
+                aria-label="链接参数名"
+                placeholder="参数名（可选），例如 query"
+                value={linkDraft.parameterName ?? ""}
+                onChange={(event) =>
+                  setLinkDraft({ ...linkDraft, parameterName: event.target.value })
+                }
+              />
+              <input
                 className="link-template-input"
                 aria-label="链接模板"
                 placeholder="https://www.google.com/search?q={query}"
@@ -1547,7 +2193,8 @@ function EnhancedSettingsPage({
                 }
               />
               <p className="quick-link-help">
-                参数位置使用 <code>{"{query}"}</code>。强制使用 Edge：
+                无参数链接请留空。填写参数名 <code>query</code> 后，在网址中使用
+                <code>{"{query}"}</code>。强制使用 Edge：
                 <code>microsoft-edge:https://www.bing.com/search?q={"{query}"}</code>
               </p>
               <div className="quick-link-editor-actions">
@@ -1570,7 +2217,12 @@ function EnhancedSettingsPage({
                   <strong>{link.name}</strong>
                   <small>{link.description || link.urlTemplate}</small>
                 </div>
-                {link.keyword ? <code>{link.keyword} {"{query}"}</code> : null}
+                {link.keyword ? (
+                  <code>
+                    {link.keyword}
+                    {link.parameterName ? ` {${link.parameterName}}` : ""}
+                  </code>
+                ) : null}
                 <Switch
                   checked={link.enabled}
                   label={`${link.name} 快捷链接`}
@@ -1650,6 +2302,7 @@ function EnhancedSettingsPage({
           <div className="setting-row">
             <div><strong>界面字体</strong><small>选择更适合阅读或编程的字体风格</small></div>
             <select
+              aria-label="界面字体"
               value={model.snapshot.settings.fontFamily}
               onChange={(event) =>
                 model.setSetting(
@@ -1660,7 +2313,7 @@ function EnhancedSettingsPage({
             >
               <option value="system">系统黑体</option>
               <option value="serif">人文宋体</option>
-              <option value="mono">等宽字体</option>
+              <option value="yahei">微软雅黑</option>
             </select>
           </div>
           <div className="setting-row">
@@ -1693,7 +2346,7 @@ function EnhancedSettingsPage({
         <section className="settings-section">
           <header>
             <Clipboard size={19} />
-            <div><h2>剪贴板历史</h2><p>设置跨重启保留的最近文本数量。</p></div>
+            <div><h2>剪贴板历史</h2><p>设置跨重启保留的最近文字与图片数量。</p></div>
           </header>
           <label className="setting-row">
             <div><strong>保留数量</strong><small>允许 10–500 条</small></div>

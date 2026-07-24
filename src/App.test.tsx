@@ -3,6 +3,7 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import App from "./App";
 import { defaultSnapshot } from "./useToolkit";
+import stylesheet from "./styles.css?inline";
 
 afterEach(() => localStorage.clear());
 
@@ -61,16 +62,184 @@ describe("Atlas desktop toolkit", () => {
     expect(screen.queryByText("代码助手")).not.toBeInTheDocument();
   });
 
-  it("opens settings and exposes a custom data location action", async () => {
+  it("keeps data inside the selected software installation folder", async () => {
     const user = userEvent.setup();
     render(<App />);
 
     await user.click(await screen.findByRole("button", { name: "设置" }));
     expect(await screen.findByText("数据与存储")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "更改位置" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "更改位置" })).not.toBeInTheDocument();
+    expect(screen.getByText("存储位置跟随软件安装目录")).toBeInTheDocument();
     expect(screen.getByText("全局快捷键")).toBeInTheDocument();
     expect(screen.getByText("字体与外观")).toBeInTheDocument();
     expect(screen.getByText("全盘索引")).toBeInTheDocument();
+    expect(screen.getByRole("switch", { name: "开机自启动 Atlas" })).toBeInTheDocument();
+    const bootScene = screen.getByRole("combobox", { name: "开机启动场景" });
+    await user.click(bootScene);
+    expect(screen.getByRole("listbox", { name: "开机启动场景选项" })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "无" })).toBeInTheDocument();
+    expect(bootScene.closest(".settings-section")).toHaveClass("boot-settings-section");
+    expect(screen.queryByText("登录启动")).not.toBeInTheDocument();
+  });
+
+  it("exposes automation and folder favorites as independent tools", async () => {
+    render(<App />);
+
+    expect(await screen.findByRole("button", { name: "自动化命令" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "文件夹收藏" })).toBeInTheDocument();
+    expect(screen.getByRole("switch", { name: "自动化命令" })).toBeChecked();
+    expect(screen.getByRole("switch", { name: "文件夹收藏" })).toBeChecked();
+  });
+
+  it("creates a sequential command task with multiple commands", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole("button", { name: "自动化命令" }));
+    await user.click(await screen.findByRole("button", { name: "新建任务" }));
+    await user.type(screen.getByRole("textbox", { name: "任务名称" }), "安装依赖");
+    await user.type(
+      screen.getByRole("textbox", { name: "命令列表" }),
+      "python -m pip install requests{enter}python app.py",
+    );
+    expect(screen.getByRole("switch", { name: "运行完毕后关闭终端" })).toBeChecked();
+    await user.click(screen.getByRole("button", { name: "保存任务" }));
+
+    expect(await screen.findByText("安装依赖")).toBeInTheDocument();
+    expect(screen.getByText("2 步")).toBeInTheDocument();
+  });
+
+  it("offers Microsoft YaHei and removes the monospace interface font", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole("button", { name: "设置" }));
+    await screen.findByText("字体与外观");
+
+    const font = screen.getByRole("combobox", { name: "界面字体" });
+    expect(font).toHaveTextContent("微软雅黑");
+    expect(font).not.toHaveTextContent("等宽字体");
+  });
+
+  it("lets the user explicitly disable the boot scene", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole("button", { name: "设置" }));
+    await screen.findByText("开机自启动");
+
+    const scene = screen.getByRole("combobox", { name: "开机启动场景" });
+    await user.click(scene);
+    await user.click(screen.getByRole("option", { name: "无" }));
+    expect(scene).toHaveTextContent("无");
+    expect(scene).toHaveAttribute("aria-expanded", "false");
+  });
+
+  it("opens the boot scene picker with the standard combobox arrow key", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole("button", { name: "设置" }));
+    const scene = await screen.findByRole("combobox", { name: "开机启动场景" });
+
+    fireEvent.keyDown(scene, { key: "ArrowDown" });
+
+    expect(scene).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByRole("listbox", { name: "开机启动场景选项" })).toBeInTheDocument();
+  });
+
+  it("switches pages immediately without retaining a fading long page", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole("button", { name: "设置" }));
+    await screen.findByRole("heading", { name: "设置", level: 1 });
+    const main = screen.getByRole("main");
+    main.scrollTop = 480;
+
+    await user.click(screen.getByRole("button", { name: "自动化命令" }));
+
+    expect(screen.getByRole("heading", { name: "自动化命令", level: 1 })).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "设置", level: 1 })).not.toBeInTheDocument();
+    expect(main.scrollTop).toBe(0);
+  });
+
+  it("keeps the brand mark on a fixed high-contrast surface in dark mode", async () => {
+    const user = userEvent.setup();
+    const { container } = render(<App />);
+    await user.click(await screen.findByRole("button", { name: "设置" }));
+    await screen.findByRole("heading", { name: "设置", level: 1 });
+    await user.click(screen.getByRole("button", { name: "深色" }));
+
+    expect(document.documentElement).toHaveAttribute("data-theme", "dark");
+    expect(container.querySelector(".brand-mark")).toHaveClass(
+      "brand-mark--fixed-contrast",
+    );
+    const darkTheme = stylesheet.match(/:root\[data-theme="dark"\]\s*\{([\s\S]*?)\}/)?.[1] ?? "";
+    const surface = darkTheme.match(/--brand-mark-surface:\s*(#[0-9a-f]{6})/i)?.[1];
+    const glyph = darkTheme.match(/--brand-mark-ink:\s*(#[0-9a-f]{6})/i)?.[1];
+    expect(surface).toBe("#242925");
+    expect(glyph).toBe("#f8f5ed");
+    expect(surface).not.toBe(glyph);
+  });
+
+  it("centers empty states across full-width grid pages", async () => {
+    const user = userEvent.setup();
+    const { container } = render(<App />);
+
+    await user.click(await screen.findByRole("button", { name: "自动化命令" }));
+    await screen.findByRole("heading", { name: "自动化命令", level: 1 });
+    expect(container.querySelector(".automation-grid > .empty-state")).toHaveClass(
+      "full-span-empty",
+    );
+
+    await user.click(screen.getByRole("button", { name: "文件夹收藏" }));
+    await screen.findByRole("heading", { name: "文件夹收藏", level: 1 });
+    expect(container.querySelector(".folder-favorites-grid > .empty-state")).toHaveClass(
+      "full-span-empty",
+    );
+  });
+
+  it("makes prompt favorites visible and filterable", async () => {
+    localStorage.setItem(
+      "atlas-toolkit-state-v1",
+      JSON.stringify({
+        ...defaultSnapshot,
+        prompts: [
+          { ...defaultSnapshot.prompts[0], id: "plain", title: "普通提示词", favorite: false },
+        ],
+      }),
+    );
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole("button", { name: "提示词库" }));
+    await screen.findByRole("heading", { name: "提示词库", level: 1 });
+
+    await user.click(screen.getByRole("button", { name: "收藏 普通提示词" }));
+    expect(screen.getByRole("button", { name: "取消收藏 普通提示词" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    await user.click(screen.getByRole("button", { name: "只看收藏" }));
+    expect(screen.getByText("普通提示词")).toBeInTheDocument();
+  });
+
+  it("creates a custom startup scene", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole("button", { name: "启动编排" }));
+    await user.click(await screen.findByRole("button", { name: "新建场景" }));
+    await user.type(screen.getByRole("textbox", { name: "场景名称" }), "学习模式");
+    await user.type(screen.getByRole("textbox", { name: "场景描述" }), "打开学习软件");
+    await user.click(screen.getByRole("button", { name: "创建" }));
+
+    expect((await screen.findAllByText("学习模式")).length).toBeGreaterThan(0);
+  });
+
+  it("adds and removes a folder favorite", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole("button", { name: "文件夹收藏" }));
+    await user.click(await screen.findByRole("button", { name: "收藏文件夹" }));
+
+    expect(await screen.findByText("AtlasData")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "取消收藏 AtlasData" }));
+    expect(screen.queryByText("AtlasData")).not.toBeInTheDocument();
   });
 
   it("creates a parameterized quick link that appears first in global search", async () => {
@@ -115,6 +284,30 @@ describe("Atlas desktop toolkit", () => {
     );
 
     expect((await screen.findAllByText("Edge 搜索 · Tauri")).length).toBeGreaterThan(0);
+  });
+
+  it("shows a quick-link parameter token only when a parameter is configured", async () => {
+    localStorage.setItem(
+      "atlas-toolkit-state-v1",
+      JSON.stringify({
+        ...defaultSnapshot,
+        quickLinks: [{
+          id: "douyin",
+          name: "抖音",
+          description: "抖音-记录美好生活",
+          keyword: "dy",
+          parameterName: "",
+          urlTemplate: "https://www.douyin.com/",
+          enabled: true,
+        }],
+      }),
+    );
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole("button", { name: "设置" }));
+
+    expect(await screen.findByText("dy")).toBeInTheDocument();
+    expect(screen.queryByText("dy {query}")).not.toBeInTheDocument();
   });
 
   it("opens the persistent clipboard history tool", async () => {
@@ -247,12 +440,18 @@ describe("Atlas desktop toolkit", () => {
             order: 1,
           },
         ],
+        startupScenes: [{
+          id: "default-scene",
+          name: "默认场景",
+          description: "",
+          itemIds: ["first", "second"],
+        }],
       }),
     );
     const user = userEvent.setup();
     const { container } = render(<App />);
     await user.click(await screen.findByRole("button", { name: "启动编排" }));
-    await screen.findByText("First");
+    await screen.findAllByText("First");
 
     const handles = container.querySelectorAll<HTMLButtonElement>(".drag-handle");
     fireEvent.dragStart(handles[0], {

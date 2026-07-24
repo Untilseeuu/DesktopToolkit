@@ -32,8 +32,18 @@ export const defaultSnapshot: AppSnapshot = {
     search: { enabled: true },
     prompts: { enabled: true },
     clipboard: { enabled: true },
+    automation: { enabled: true },
+    folders: { enabled: true },
   },
   startupItems: [],
+  startupScenes: [{
+    id: "default-scene",
+    name: "默认场景",
+    description: "开机后使用的基础工作环境",
+    itemIds: [],
+  }],
+  commandTasks: [],
+  folderFavorites: [],
   startupFailures: [],
   prompts: [
     {
@@ -66,6 +76,8 @@ export const defaultSnapshot: AppSnapshot = {
     excludedPatterns: ["node_modules", ".git", "Windows\\WinSxS"],
     searchFilters: { kind: "all", extension: "", drive: "" },
     clipboardLimit: 50,
+    launchAtLogin: true,
+    loginSceneId: "default-scene",
   },
 };
 
@@ -275,6 +287,10 @@ export function useToolkit() {
       startupItems: current.startupItems
         .filter((item) => item.id !== id)
         .map((item, order) => ({ ...item, order })),
+      startupScenes: current.startupScenes.map((scene) => ({
+        ...scene,
+        itemIds: scene.itemIds.filter((itemId) => itemId !== id),
+      })),
     }));
   }, []);
 

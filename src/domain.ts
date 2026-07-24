@@ -7,6 +7,7 @@ import type {
   SearchFilters,
   SearchResult,
   StartupItem,
+  StartupScene,
 } from "./types";
 
 export type DataMigrationPlan =
@@ -87,7 +88,16 @@ export function buildQuickLinkResults(
     const keyword = link.keyword.trim().toLocaleLowerCase();
     const name = link.name.trim();
     const normalizedName = name.toLocaleLowerCase();
-    const parameterPrefixes = [keyword, normalizedName].filter(Boolean);
+    const parameterName =
+      link.parameterName?.trim() ??
+      (/\{query\}/i.test(link.urlTemplate) ? "query" : "");
+    const token = parameterName ? `{${parameterName}}` : "";
+    const acceptsParameter =
+      Boolean(parameterName) &&
+      link.urlTemplate.toLocaleLowerCase().includes(token.toLocaleLowerCase());
+    const parameterPrefixes = acceptsParameter
+      ? [keyword, normalizedName].filter(Boolean)
+      : [];
     const parameterPrefix = parameterPrefixes.find((prefix) =>
       normalized.startsWith(`${prefix} `),
     );
@@ -96,10 +106,13 @@ export function buildQuickLinkResults(
       : "";
     const haystack = `${name} ${link.description} ${keyword}`.toLocaleLowerCase();
     if (!parameter && !fuzzyIncludes(haystack, normalized)) return [];
-    const resolvedUrl = link.urlTemplate.replace(
-      /\{query\}/gi,
-      encodeURIComponent(parameter),
-    );
+    const escapedParameterName = parameterName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const resolvedUrl = acceptsParameter
+      ? link.urlTemplate.replace(
+          new RegExp(`\\{${escapedParameterName}\\}`, "gi"),
+          encodeURIComponent(parameter),
+        )
+      : link.urlTemplate;
     return [{
       id: `link-${link.id}`,
       name: parameter ? `${name} · ${parameter}` : name,
@@ -109,6 +122,17 @@ export function buildQuickLinkResults(
       priority: parameter ? 30_000 : 20_000,
     }];
   });
+}
+
+export function startupItemsForScene(
+  items: StartupItem[],
+  scene: StartupScene | undefined,
+): StartupItem[] {
+  if (!scene) return [];
+  const selected = new Set(scene.itemIds);
+  return items
+    .filter((item) => item.enabled && selected.has(item.id))
+    .sort((a, b) => a.order - b.order);
 }
 
 function searchScore(result: SearchResult, normalizedQuery: string): number {
@@ -239,6 +263,15 @@ export function mergeSnapshotDefaults(snapshot: AppSnapshot): AppSnapshot {
     )
       ? ["*"]
       : savedRoots;
+  const startupItems = snapshot.startupItems ?? [];
+  const startupScenes = snapshot.startupScenes?.length
+    ? snapshot.startupScenes
+    : [{
+        id: "default-scene",
+        name: "默认场景",
+        description: "原有启动编排",
+        itemIds: startupItems.map((item) => item.id),
+      }];
   return {
     ...snapshot,
     tools: {
@@ -246,11 +279,25 @@ export function mergeSnapshotDefaults(snapshot: AppSnapshot): AppSnapshot {
       search: snapshot.tools?.search ?? { enabled: true },
       prompts: snapshot.tools?.prompts ?? { enabled: true },
       clipboard: snapshot.tools?.clipboard ?? { enabled: true },
+      automation: snapshot.tools?.automation ?? { enabled: true },
+      folders: snapshot.tools?.folders ?? { enabled: true },
     },
-    startupItems: snapshot.startupItems ?? [],
+    startupItems,
+    startupScenes,
+    commandTasks: (snapshot.commandTasks ?? []).map((task) => ({
+      ...task,
+      showTerminal: task.showTerminal ?? true,
+      closeTerminalOnFinish: task.closeTerminalOnFinish ?? true,
+    })),
+    folderFavorites: snapshot.folderFavorites ?? [],
     startupFailures: snapshot.startupFailures ?? [],
     prompts: snapshot.prompts ?? [],
-    quickLinks: snapshot.quickLinks ?? [],
+    quickLinks: (snapshot.quickLinks ?? []).map((link) => ({
+      ...link,
+      parameterName:
+        link.parameterName ??
+        (/\{query\}/i.test(link.urlTemplate) ? "query" : ""),
+    })),
     clipboardHistory: (snapshot.clipboardHistory ?? []).map((entry) => ({
       ...entry,
       kind: clipboardEntryKind(entry),
@@ -260,7 +307,10 @@ export function mergeSnapshotDefaults(snapshot: AppSnapshot): AppSnapshot {
     settings: {
       ...snapshot.settings,
       theme: snapshot.settings?.theme ?? "light",
-      fontFamily: snapshot.settings?.fontFamily ?? "system",
+      fontFamily:
+        (snapshot.settings?.fontFamily as string | undefined) === "mono"
+          ? "system"
+          : snapshot.settings?.fontFamily ?? "system",
       fontScale: snapshot.settings?.fontScale ?? 1,
       shortcuts: snapshot.settings?.shortcuts ?? {
         search: legacyShortcut ?? "Alt+Space",
@@ -280,6 +330,9 @@ export function mergeSnapshotDefaults(snapshot: AppSnapshot): AppSnapshot {
         drive: "",
       },
       clipboardLimit: snapshot.settings?.clipboardLimit ?? 50,
+      launchAtLogin: snapshot.settings?.launchAtLogin ?? true,
+      loginSceneId:
+        snapshot.settings?.loginSceneId ?? startupScenes[0]?.id ?? "default-scene",
     },
   };
 }
