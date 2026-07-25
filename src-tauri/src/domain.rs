@@ -18,11 +18,13 @@ pub fn runtime_settings_changed(previous: &serde_json::Value, next: &serde_json:
         "/tools/search/enabled",
         "/tools/prompts/enabled",
         "/tools/clipboard/enabled",
+        "/tools/folders/enabled",
         "/settings/shortcuts/search",
         "/settings/shortcuts/prompts",
         "/settings/shortcuts/clipboard",
     ]
     .iter()
     .any(|pointer| runtime_value(previous, pointer) != runtime_value(next, pointer))
+        || previous.get("folderFavorites") != next.get("folderFavorites")
 }
 use std::path::{Path, PathBuf};

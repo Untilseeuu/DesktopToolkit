@@ -1,12 +1,14 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
-const executable = resolve(
-  "src-tauri",
-  "target",
-  "release",
-  "atlas-desktop-toolkit.exe",
-);
+const executable = process.argv[2]
+  ? resolve(process.argv[2])
+  : resolve(
+      "src-tauri",
+      "target",
+      "release",
+      "atlas-desktop-toolkit.exe",
+    );
 const bytes = readFileSync(executable);
 const text = bytes.toString("latin1");
 const indexHtml = readFileSync(resolve("dist", "index.html"), "utf8");

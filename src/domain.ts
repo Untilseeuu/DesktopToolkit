@@ -9,6 +9,7 @@ import type {
   StartupItem,
   StartupScene,
 } from "./types";
+import { normalizeFolderFavorites } from "./folderFavorites";
 
 export type DataMigrationPlan =
   | { kind: "noop"; target: string }
@@ -164,11 +165,20 @@ export function rankSearchResults(
 ): SearchResult[] {
   const normalized = query.trim().toLocaleLowerCase();
   if (!normalized) return results;
-  return [...results].sort(
-    (a, b) =>
-      searchScore(b, normalized) - searchScore(a, normalized) ||
-      a.name.localeCompare(b.name),
-  );
+  return results
+    .map((result, index) => ({
+      result,
+      index,
+      score: searchScore(result, normalized),
+      normalizedName: result.name.toLocaleLowerCase(),
+    }))
+    .sort(
+      (a, b) =>
+        b.score - a.score ||
+        a.normalizedName.localeCompare(b.normalizedName) ||
+        a.index - b.index,
+    )
+    .map(({ result }) => result);
 }
 
 export function selectSearchResults(
@@ -264,14 +274,19 @@ export function mergeSnapshotDefaults(snapshot: AppSnapshot): AppSnapshot {
       ? ["*"]
       : savedRoots;
   const startupItems = snapshot.startupItems ?? [];
-  const startupScenes = snapshot.startupScenes?.length
+  const startupScenes = (snapshot.startupScenes?.length
     ? snapshot.startupScenes
     : [{
         id: "default-scene",
         name: "默认场景",
         description: "原有启动编排",
         itemIds: startupItems.map((item) => item.id),
-      }];
+      }]).map((scene) => ({
+        ...scene,
+        closePreviousApps: scene.closePreviousApps ?? false,
+        restoreLayout: scene.restoreLayout ?? false,
+        windowLayouts: scene.windowLayouts ?? [],
+      }));
   return {
     ...snapshot,
     tools: {
@@ -289,7 +304,7 @@ export function mergeSnapshotDefaults(snapshot: AppSnapshot): AppSnapshot {
       showTerminal: task.showTerminal ?? true,
       closeTerminalOnFinish: task.closeTerminalOnFinish ?? true,
     })),
-    folderFavorites: snapshot.folderFavorites ?? [],
+    folderFavorites: normalizeFolderFavorites(snapshot.folderFavorites ?? []),
     startupFailures: snapshot.startupFailures ?? [],
     prompts: snapshot.prompts ?? [],
     quickLinks: (snapshot.quickLinks ?? []).map((link) => ({
@@ -330,6 +345,14 @@ export function mergeSnapshotDefaults(snapshot: AppSnapshot): AppSnapshot {
         drive: "",
       },
       clipboardLimit: snapshot.settings?.clipboardLimit ?? 50,
+      clipboardRetentionDays: snapshot.settings?.clipboardRetentionDays ?? 30,
+      clipboardCapturePaused: snapshot.settings?.clipboardCapturePaused ?? false,
+      clipboardExcludedApps: snapshot.settings?.clipboardExcludedApps ?? [
+        "1Password.exe",
+        "Bitwarden.exe",
+        "KeePass.exe",
+        "KeePassXC.exe",
+      ],
       launchAtLogin: snapshot.settings?.launchAtLogin ?? true,
       loginSceneId:
         snapshot.settings?.loginSceneId ?? startupScenes[0]?.id ?? "default-scene",

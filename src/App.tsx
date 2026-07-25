@@ -30,16 +30,20 @@ import {
   Link2,
   ListFilter,
   Moon,
+  Monitor,
   MoreHorizontal,
+  Pencil,
   Plus,
   Power,
   Play,
   Rocket,
+  Save,
   Search,
   Settings,
   Sparkles,
   Terminal,
   Sun,
+  Tag,
   Trash2,
   X,
   Zap,
@@ -66,22 +70,37 @@ import {
   startupItemsForScene,
 } from "./domain";
 import {
+  DEFAULT_FOLDER_GROUP,
+  filterFolderFavorites,
+  findFolderShortcutConflict,
+  groupFolderFavorites,
+  normalizeFolderFavorite,
+  normalizeFolderShortcut,
+  normalizeFolderTags,
+} from "./folderFavorites";
+import {
   activateClipboardEntry,
   bindNativeSearchShortcut,
+  captureStartupSceneLayout,
   chooseDirectory,
   chooseExecutable,
+  closePreviousStartupScene,
   copyText,
   getSearchIndexCount,
   getSearchIndexStatus,
   getAppIcons,
   invokeNative,
   launchStartupItems,
+  listStartupSceneMonitors,
   openTarget,
   rebuildSearchIndex,
+  restoreStartupSceneLayout,
   runCommandTask,
   searchNative,
 } from "./native";
 import QuickOverlay from "./QuickOverlay";
+import { SearchQueryInput } from "./SearchQueryInput";
+import WindowChrome from "./WindowChrome";
 import type {
   CommandTask,
   FolderFavorite,
@@ -183,7 +202,12 @@ export default function App() {
   if (overlay === "search" || overlay === "prompts" || overlay === "clipboard") {
     return <QuickOverlay mode={overlay} />;
   }
-  return <MainApp />;
+  return (
+    <div className="desktop-frame">
+      <WindowChrome />
+      <MainApp />
+    </div>
+  );
 }
 
 function MainApp() {
@@ -331,7 +355,6 @@ function MainApp() {
       </aside>
 
       <main className="main-panel" ref={mainPanelRef}>
-        <div className="titlebar-drag" data-tauri-drag-region />
         <div className="page">{page}</div>
       </main>
 
@@ -411,8 +434,13 @@ function OverviewPage({
             <motion.article
               className={`tool-card ${meta.tint} ${enabled ? "" : "disabled"}`}
               key={id}
-              onClick={() => navigate(id)}
             >
+              <button
+                type="button"
+                className="tool-card-hit-target"
+                aria-label={`打开${meta.title}`}
+                onClick={() => navigate(id)}
+              />
               <div className="tool-card-top">
                 <span className="tool-number">{meta.number}</span>
                 <Switch
@@ -492,6 +520,14 @@ function StartupPage({
     model.snapshot.startupScenes[0]?.id ?? "default-scene",
   );
   const [sceneDraft, setSceneDraft] = useState<{ name: string; description: string } | null>(null);
+  const [sceneBusy, setSceneBusy] = useState(false);
+  const [monitors, setMonitors] = useState<Array<{
+    deviceName: string;
+    primary: boolean;
+  }>>([]);
+  const [lastLaunchedSceneId, setLastLaunchedSceneId] = useState(
+    () => sessionStorage.getItem("atlas-last-startup-scene") ?? "",
+  );
   const activeScene =
     model.snapshot.startupScenes.find((scene) => scene.id === activeSceneId) ??
     model.snapshot.startupScenes[0];
@@ -499,6 +535,91 @@ function StartupPage({
     .map((id) => model.snapshot.startupItems.find((item) => item.id === id))
     .filter((item): item is NonNullable<typeof item> => Boolean(item))
     .sort((a, b) => a.order - b.order);
+  useEffect(() => {
+    let cancelled = false;
+    void listStartupSceneMonitors()
+      .then((available) => {
+        if (!cancelled) setMonitors(available);
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+  const updateActiveScene = (
+    patch: Partial<NonNullable<typeof activeScene>>,
+  ) => {
+    if (!activeScene) return;
+    model.setSnapshot((current) => ({
+      ...current,
+      startupScenes: current.startupScenes.map((scene) =>
+        scene.id === activeScene.id ? { ...scene, ...patch } : scene,
+      ),
+    }));
+  };
+  const captureLayout = async () => {
+    if (!activeScene) return;
+    setSceneBusy(true);
+    try {
+      const capture = await captureStartupSceneLayout(sceneItems);
+      updateActiveScene({
+        windowLayouts: capture.layouts,
+        restoreLayout: capture.layouts.length > 0,
+      });
+      notify(
+        capture.layouts.length
+          ? `已保存 ${capture.layouts.length} 个应用窗口的位置${capture.errors.length ? `，${capture.errors.length} 项未捕获` : ""}`
+          : "未找到可捕获的应用窗口，请先运行场景中的应用",
+      );
+    } catch (error) {
+      notify(`保存桌面布局失败：${String(error)}`);
+    } finally {
+      setSceneBusy(false);
+    }
+  };
+  const runActiveScene = async () => {
+    if (!activeScene || sceneBusy) return;
+    setSceneBusy(true);
+    try {
+      let closed = 0;
+      const previousScene = model.snapshot.startupScenes.find(
+        (scene) => scene.id === lastLaunchedSceneId,
+      );
+      if (
+        activeScene.closePreviousApps &&
+        previousScene &&
+        previousScene.id !== activeScene.id
+      ) {
+        const closeResults = await closePreviousStartupScene(
+          startupItemsForScene(model.snapshot.startupItems, previousScene),
+          sceneItems,
+        );
+        closed = closeResults.filter((result) => result.status === "closeRequested").length;
+      }
+      const results = await launchStartupItems(sceneItems);
+      const failed = results.filter((result) => !result.success);
+      const skipped = results.filter((result) => result.status === "alreadyRunning").length;
+      if (activeScene.restoreLayout && activeScene.windowLayouts?.length) {
+        await new Promise((resolve) => window.setTimeout(resolve, 700));
+        await restoreStartupSceneLayout(activeScene.windowLayouts);
+      }
+      model.setSnapshot((current) => ({
+        ...current,
+        activity: { ...current.activity, startupLastRunAt: Date.now() },
+      }));
+      setLastLaunchedSceneId(activeScene.id);
+      sessionStorage.setItem("atlas-last-startup-scene", activeScene.id);
+      notify(
+        failed.length
+          ? `已启动 ${results.length - failed.length - skipped} 项，${skipped} 项已在运行，${failed.length} 项失败`
+          : `场景已运行：新启动 ${results.length - skipped} 项，跳过 ${skipped} 个已运行应用${closed ? `，已请求关闭 ${closed} 项` : ""}`,
+      );
+    } catch (error) {
+      notify(`启动失败：${String(error)}`);
+    } finally {
+      setSceneBusy(false);
+    }
+  };
   const addItem = async () => {
     const item = await chooseExecutable();
     if (!item) return;
@@ -555,6 +676,9 @@ function StartupPage({
                 name: sceneDraft.name.trim(),
                 description: sceneDraft.description.trim(),
                 itemIds: [] as string[],
+                closePreviousApps: false,
+                restoreLayout: false,
+                windowLayouts: [],
               };
               model.setSnapshot((current) => ({
                 ...current,
@@ -627,28 +751,11 @@ function StartupPage({
           <button
             type="button"
             className="button secondary"
-            disabled={!startupItemsForScene(model.snapshot.startupItems, activeScene).length}
-            onClick={() => {
-              void launchStartupItems(startupItemsForScene(model.snapshot.startupItems, activeScene))
-                .then((results) => {
-                  model.setSnapshot((current) => ({
-                    ...current,
-                    activity: { ...current.activity, startupLastRunAt: Date.now() },
-                  }));
-                  const failed = results.filter((result) => !result.success);
-                  notify(
-                    failed.length
-                      ? `已启动 ${results.length - failed.length} 项，${failed.length} 项失败：${failed
-                          .map((item) => item.name)
-                          .join("、")}`
-                      : `已成功启动 ${results.length} 项`,
-                  );
-                })
-                .catch((error: unknown) => notify(`启动失败：${String(error)}`));
-            }}
+            disabled={!sceneItems.length || sceneBusy}
+            onClick={() => void runActiveScene()}
           >
             <Zap size={16} />
-            立即运行
+            {sceneBusy ? "处理中…" : "立即运行"}
           </button>
           <button type="button" className="button primary" onClick={() => void addItem()}>
             <Plus size={17} />
@@ -656,6 +763,88 @@ function StartupPage({
           </button>
         </div>
       </div>
+
+      {activeScene ? (
+        <section className="content-card scene-behavior">
+          <header>
+            <div>
+              <strong>场景切换与桌面布局</strong>
+              <small>避免重复启动；也可以关闭上一场景独有的软件，并恢复窗口位置。</small>
+            </div>
+            <button
+              type="button"
+              className="button secondary"
+              disabled={!sceneItems.length || sceneBusy}
+              onClick={() => void captureLayout()}
+            >
+              <Save size={15} /> 保存当前桌面布局
+            </button>
+          </header>
+          <div className="scene-behavior-options">
+            <label>
+              <span><strong>关闭上一场景的软件</strong><small>先正常关闭；仍驻留托盘时会结束对应应用进程</small></span>
+              <Switch
+                checked={activeScene.closePreviousApps ?? false}
+                onChange={(closePreviousApps) => updateActiveScene({ closePreviousApps })}
+                label="切换场景时关闭上一场景的软件"
+              />
+            </label>
+            <label>
+              <span><strong>恢复桌面布局</strong><small>运行场景后还原窗口位置、大小、最大化状态和显示器</small></span>
+              <Switch
+                checked={activeScene.restoreLayout ?? false}
+                onChange={(restoreLayout) => updateActiveScene({ restoreLayout })}
+                label="运行场景时恢复桌面布局"
+              />
+            </label>
+          </div>
+          {activeScene.windowLayouts?.length ? (
+            <div className="scene-layout-list">
+              {activeScene.windowLayouts.map((layout) => {
+                const item = model.snapshot.startupItems.find(
+                  (candidate) => candidate.id === layout.itemId,
+                );
+                const updateLayout = (
+                  patch: Partial<typeof layout>,
+                ) =>
+                  updateActiveScene({
+                    windowLayouts: activeScene.windowLayouts?.map((candidate) =>
+                      candidate.itemId === layout.itemId
+                        ? { ...candidate, ...patch }
+                        : candidate,
+                    ),
+                  });
+                return (
+                  <div className="scene-layout-row" key={layout.itemId}>
+                    <span className="scene-layout-app"><AppWindow size={15} /><strong>{item?.name ?? layout.itemId}</strong></span>
+                    <label><span>X</span><input aria-label={`${item?.name ?? layout.itemId} 窗口 X`} type="number" value={layout.rect.x} onChange={(event) => updateLayout({ rect: { ...layout.rect, x: Number(event.target.value) } })} /></label>
+                    <label><span>Y</span><input aria-label={`${item?.name ?? layout.itemId} 窗口 Y`} type="number" value={layout.rect.y} onChange={(event) => updateLayout({ rect: { ...layout.rect, y: Number(event.target.value) } })} /></label>
+                    <label><span>宽</span><input aria-label={`${item?.name ?? layout.itemId} 窗口宽度`} type="number" min={240} value={layout.rect.width} onChange={(event) => updateLayout({ rect: { ...layout.rect, width: Math.max(240, Number(event.target.value)) } })} /></label>
+                    <label><span>高</span><input aria-label={`${item?.name ?? layout.itemId} 窗口高度`} type="number" min={160} value={layout.rect.height} onChange={(event) => updateLayout({ rect: { ...layout.rect, height: Math.max(160, Number(event.target.value)) } })} /></label>
+                    <label className="scene-monitor-select">
+                      <Monitor size={14} />
+                      <select
+                        aria-label={`${item?.name ?? layout.itemId} 显示器`}
+                        value={layout.monitorDeviceName ?? ""}
+                        onChange={(event) => updateLayout({ monitorDeviceName: event.target.value || undefined })}
+                      >
+                        <option value="">自动选择显示器</option>
+                        {monitors.map((monitor, index) => (
+                          <option value={monitor.deviceName} key={monitor.deviceName}>
+                            {`显示器 ${index + 1}${monitor.primary ? "（主显示器）" : ""}`}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                  </div>
+                );
+              })}
+            </div>
+          ) : (
+            <p className="scene-layout-empty"><Monitor size={15} />运行场景中的应用并摆好窗口后，点击“保存当前桌面布局”。</p>
+          )}
+        </section>
+      ) : null}
 
       <section className="content-card startup-list">
         <div className="list-header">
@@ -811,19 +1000,25 @@ function SearchPage({
   const requestSequence = useRef(0);
   const lastRecordedQuery = useRef("");
   const [indexStatus, setIndexStatus] = useState("idle");
+  const displayedResults = results.slice(0, 60);
+  const active = displayedResults[selected];
 
   useEffect(() => {
     let active = true;
-    const refresh = () => {
-      void invokeNative<string>("get_index_status").then((status) => {
-        if (active) setIndexStatus(status ?? "demo");
-      });
+    let timer: number | undefined;
+    const refresh = async () => {
+      const status = (await invokeNative<string>("get_index_status")) ?? "demo";
+      if (!active) return;
+      setIndexStatus(status);
+      timer = window.setTimeout(
+        refresh,
+        status === "indexing" || status === "idle" ? 1200 : 10_000,
+      );
     };
-    refresh();
-    const timer = window.setInterval(refresh, 1200);
+    void refresh();
     return () => {
       active = false;
-      window.clearInterval(timer);
+      if (timer !== undefined) window.clearTimeout(timer);
     };
   }, []);
 
@@ -831,58 +1026,64 @@ function SearchPage({
     const requestId = ++requestSequence.current;
     if (!query.trim()) {
       setResults([]);
+      setLoading(false);
       return;
     }
-    const timer = window.setTimeout(() => {
-      setLoading(true);
-      void searchNative(query, filters)
-        .then((nativeResults) => {
+    setLoading(true);
+    void searchNative(query, filters)
+      .then((nativeResults) => {
+        if (requestId !== requestSequence.current) return;
+        const source = selectSearchResults(nativeResults, demoSearchResults);
+        const quickLinks = buildQuickLinkResults(model.snapshot.quickLinks, query);
+        const ranked = rankSearchResults(
+          filterSearchResults([...quickLinks, ...source], filters),
+          query,
+        );
+        setResults(ranked);
+        const appPaths = ranked
+          .filter((result) => result.kind === "app")
+          .slice(0, 16)
+          .map((result) => result.path);
+        void getAppIcons(appPaths).then((icons) => {
           if (requestId !== requestSequence.current) return;
-          const source = selectSearchResults(nativeResults, demoSearchResults);
-          const quickLinks = buildQuickLinkResults(model.snapshot.quickLinks, query);
-          const ranked = rankSearchResults(
-            filterSearchResults([...quickLinks, ...source], filters),
-            query,
-          );
-          setResults(ranked);
-          const appPaths = ranked
-            .filter((result) => result.kind === "app")
-            .slice(0, 16)
-            .map((result) => result.path);
-          void getAppIcons(appPaths).then((icons) => {
-            if (requestId !== requestSequence.current) return;
-            setResults((current) =>
-              current.map((result) => ({
-                ...result,
-                iconDataUrl: icons[result.path] ?? result.iconDataUrl,
-              })),
-            );
+          if (!Object.keys(icons).length) return;
+          setResults((current) => {
+            let changed = false;
+            const next = current.map((result) => {
+              const iconDataUrl = icons[result.path];
+              if (!iconDataUrl || iconDataUrl === result.iconDataUrl) return result;
+              changed = true;
+              return { ...result, iconDataUrl };
+            });
+            return changed ? next : current;
           });
-          setSelected(0);
-          if (query.trim() && query.trim() !== lastRecordedQuery.current) {
-            lastRecordedQuery.current = query.trim();
-            recordSearch(query.trim());
-          }
-        })
-        .catch((error: unknown) => {
-          if (requestId !== requestSequence.current) return;
-          setResults([]);
-          notify(`搜索失败：${String(error)}`);
-        })
-        .finally(() => {
-          if (requestId === requestSequence.current) setLoading(false);
         });
-    }, 120);
-    return () => window.clearTimeout(timer);
-  }, [filters, model.snapshot.quickLinks, notify, query, recordSearch]);
+        setSelected(0);
+      })
+      .catch((error: unknown) => {
+        if (requestId !== requestSequence.current) return;
+        setResults([]);
+        notify(`搜索失败：${String(error)}`);
+      })
+      .finally(() => {
+        if (requestId === requestSequence.current) setLoading(false);
+      });
+  }, [filters, model.snapshot.quickLinks, notify, query]);
 
-  const active = results[selected];
+  const activateResult = (result: SearchResult) => {
+    const normalizedQuery = query.trim();
+    if (normalizedQuery && normalizedQuery !== lastRecordedQuery.current) {
+      lastRecordedQuery.current = normalizedQuery;
+      recordSearch(normalizedQuery);
+    }
+    void openTarget(result.path);
+  };
   return (
     <>
       <SectionHeading
         eyebrow="TOOL 02 · FINDER"
         title="全局搜索"
-        description="应用、文件与文件夹，在一次按键和几次输入之间抵达。"
+        description="搜索应用、文件与文件夹；支持拼音、首字母、常见错拼和同义词。"
         action={
           <Switch
             checked={enabled}
@@ -894,28 +1095,31 @@ function SearchPage({
       <section className="search-stage">
         <div className="search-box">
           <Search size={22} />
-          <input
+          <SearchQueryInput
             autoFocus
-            value={query}
-            onChange={(event) => setQuery(event.target.value)}
+            onSearchChange={setQuery}
+            showClear
             placeholder="搜索应用、文件或文件夹…"
             onKeyDown={(event) => {
               if (event.key === "ArrowDown") {
                 event.preventDefault();
-                setSelected((value) => Math.min(value + 1, results.length - 1));
+                setSelected((value) =>
+                  Math.max(0, Math.min(value + 1, displayedResults.length - 1)),
+                );
               }
               if (event.key === "ArrowUp") {
                 event.preventDefault();
                 setSelected((value) => Math.max(value - 1, 0));
               }
-              if (event.key === "Enter" && active) void openTarget(active.path);
+            }}
+            onSubmit={(inputQuery) => {
+              if (inputQuery === query && active) {
+                activateResult(active);
+              } else {
+                setQuery(inputQuery);
+              }
             }}
           />
-          {query ? (
-            <button type="button" className="icon-button" onClick={() => setQuery("")} aria-label="清空搜索">
-              <X size={17} />
-            </button>
-          ) : null}
         </div>
         <div className="search-filter-bar">
           <select
@@ -969,7 +1173,7 @@ function SearchPage({
                   <span><Folder size={15} /> 文件夹</span>
                 </div>
               </div>
-            ) : loading ? (
+            ) : loading && !results.length ? (
               <div className="loading-lines"><i /><i /><i /></div>
             ) : results.length ? (
               <>
@@ -977,14 +1181,14 @@ function SearchPage({
                   <span>最佳匹配</span>
                   <small>{results.length} 项结果</small>
                 </div>
-                {results.map((result, index) => {
+                {displayedResults.map((result, index) => {
                   return (
                     <button
                       type="button"
                       className={`result-row ${selected === index ? "selected" : ""}`}
                       key={result.id}
                       onMouseEnter={() => setSelected(index)}
-                      onDoubleClick={() => void openTarget(result.path)}
+                      onDoubleClick={() => activateResult(result)}
                     >
                       <span className={`result-icon ${result.kind}`}>
                         <ResultGlyph result={result} />
@@ -1027,7 +1231,7 @@ function SearchPage({
                 <h3>{active.name}</h3>
                 <p>{active.description ?? active.path}</p>
                 <div className="preview-actions">
-                  <button className="button primary" onClick={() => void openTarget(active.path)}>
+                  <button className="button primary" onClick={() => activateResult(active)}>
                     <ArrowUpRight size={16} /> 打开
                   </button>
                   {active.kind !== "link" ? (
@@ -1772,6 +1976,27 @@ function FolderFavoritesPage({
   notify: (message: string) => void;
 }) {
   const enabled = model.snapshot.tools.folders.enabled;
+  const [query, setQuery] = useState("");
+  const [groupFilter, setGroupFilter] = useState("");
+  const [draft, setDraft] = useState<FolderFavorite | null>(null);
+  const allFavorites = useMemo(
+    () => model.snapshot.folderFavorites.map(normalizeFolderFavorite),
+    [model.snapshot.folderFavorites],
+  );
+  const availableGroups = useMemo(
+    () => groupFolderFavorites(allFavorites).map((group) => group.name),
+    [allFavorites],
+  );
+  const visibleGroups = useMemo(
+    () =>
+      groupFolderFavorites(
+        filterFolderFavorites(allFavorites, {
+          query,
+          group: groupFilter,
+        }),
+      ),
+    [allFavorites, groupFilter, query],
+  );
   const addFolder = async () => {
     const path = await chooseDirectory();
     if (!path) return;
@@ -1784,13 +2009,56 @@ function FolderFavoritesPage({
       name: path.split(/[\\/]/).filter(Boolean).at(-1) ?? path,
       path,
       description: "",
+      group: DEFAULT_FOLDER_GROUP,
+      tags: [],
+      alias: "",
+      shortcut: "",
       createdAt: Date.now(),
     };
     model.setSnapshot((current) => ({
       ...current,
       folderFavorites: [favorite, ...current.folderFavorites],
     }));
+    setDraft(favorite);
     notify("文件夹已收藏");
+  };
+  const saveDraft = () => {
+    if (!draft) return;
+    const normalized = normalizeFolderFavorite({
+      ...draft,
+      shortcut: normalizeFolderShortcut(draft.shortcut),
+      tags: normalizeFolderTags(draft.tags),
+    });
+    if (draft.shortcut && !normalized.shortcut) {
+      notify("快捷键无效，请使用 Ctrl/Alt/Shift 加一个按键");
+      return;
+    }
+    const conflict = findFolderShortcutConflict(
+      model.snapshot.folderFavorites,
+      normalized.shortcut,
+      normalized.id,
+    );
+    if (conflict) {
+      notify(`快捷键已被“${conflict.alias || conflict.name}”使用`);
+      return;
+    }
+    const toolConflict = Object.entries(model.snapshot.settings.shortcuts).find(
+      ([, shortcut]) =>
+        normalized.shortcut &&
+        shortcut.toLocaleLowerCase() === normalized.shortcut.toLocaleLowerCase(),
+    );
+    if (toolConflict) {
+      notify("该快捷键已被工具快捷窗口使用，请换一个组合键");
+      return;
+    }
+    model.setSnapshot((current) => ({
+      ...current,
+      folderFavorites: current.folderFavorites.map((favorite) =>
+        favorite.id === normalized.id ? normalized : favorite,
+      ),
+    }));
+    setDraft(null);
+    notify("文件夹收藏设置已保存");
   };
   return (
     <>
@@ -1807,42 +2075,105 @@ function FolderFavoritesPage({
         }
       />
       <div className="page-toolbar">
-        <div className="toolbar-state"><Bookmark size={16} /><span>{model.snapshot.folderFavorites.length} 个常用位置</span></div>
-        <button className="button primary" onClick={() => void addFolder()}>
+        <div className="folder-filter-bar">
+          <label>
+            <Search size={15} />
+            <input
+              aria-label="搜索文件夹收藏"
+              placeholder="搜索名称、别名、标签或路径"
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+            />
+          </label>
+          <select
+            aria-label="按分组筛选文件夹"
+            value={groupFilter}
+            onChange={(event) => setGroupFilter(event.target.value)}
+          >
+            <option value="">全部分组</option>
+            {availableGroups.map((group) => (
+              <option value={group} key={group}>{group}</option>
+            ))}
+          </select>
+          <span>{allFavorites.length} 个常用位置</span>
+        </div>
+        <button className="button primary" disabled={!enabled} onClick={() => void addFolder()}>
           <Plus size={17} /> 收藏文件夹
         </button>
       </div>
-      <section className="folder-favorites-grid">
-        {model.snapshot.folderFavorites.map((favorite) => (
-          <article className="content-card folder-favorite-card" key={favorite.id}>
-            <button className="folder-open-target" onClick={() => void openTarget(favorite.path)}>
-              <span><FolderOpen size={24} /></span>
-              <strong>{favorite.name}</strong>
-              <small title={favorite.path}>{favorite.path}</small>
+      {draft ? (
+        <section className="content-card folder-favorite-editor" aria-label="编辑文件夹收藏">
+          <header>
+            <div><strong>整理收藏</strong><small>{draft.path}</small></div>
+            <button type="button" className="icon-button" aria-label="关闭编辑" onClick={() => setDraft(null)}>
+              <X size={16} />
             </button>
-            <button
-              className="icon-button danger"
-              aria-label={`取消收藏 ${favorite.name}`}
-              onClick={() =>
-                model.setSnapshot((current) => ({
-                  ...current,
-                  folderFavorites: current.folderFavorites.filter(
-                    (item) => item.id !== favorite.id,
-                  ),
-                }))
-              }
-            >
-              <Trash2 size={16} />
-            </button>
-          </article>
+          </header>
+          <div className="folder-editor-grid">
+            <label><span>别名</span><input aria-label="文件夹别名" placeholder={draft.name} value={draft.alias ?? ""} onChange={(event) => setDraft({ ...draft, alias: event.target.value })} /></label>
+            <label>
+              <span>分组</span>
+              <input aria-label="文件夹分组" list="folder-groups" value={draft.group ?? ""} onChange={(event) => setDraft({ ...draft, group: event.target.value })} />
+              <datalist id="folder-groups">{availableGroups.map((group) => <option value={group} key={group} />)}</datalist>
+            </label>
+            <label><span>标签</span><input aria-label="文件夹标签" placeholder="项目，常用" value={(draft.tags ?? []).join("，")} onChange={(event) => setDraft({ ...draft, tags: event.target.value.split(/[,，]/) })} /></label>
+            <label className="folder-shortcut-field"><span>快捷键</span><ShortcutRecorder value={draft.shortcut || "点击录制"} onChange={(shortcut) => setDraft({ ...draft, shortcut })} /></label>
+          </div>
+          <label className="folder-description-field"><span>描述</span><input aria-label="文件夹描述" placeholder="这个文件夹用于什么" value={draft.description} onChange={(event) => setDraft({ ...draft, description: event.target.value })} /></label>
+          <footer><button type="button" className="button ghost" onClick={() => setDraft(null)}>取消</button><button type="button" className="button primary" onClick={saveDraft}>保存设置</button></footer>
+        </section>
+      ) : null}
+      <section className="folder-groups">
+        {visibleGroups.map((group) => (
+          <div className="folder-group" key={group.name}>
+            <header><span><Folder size={15} /></span><strong>{group.name}</strong><small>{group.items.length}</small></header>
+            <div className="folder-favorites-grid">
+              {group.items.map((favorite) => (
+                <article className="content-card folder-favorite-card" key={favorite.id}>
+                  <button disabled={!enabled} className="folder-open-target" onClick={() => void openTarget(favorite.path)}>
+                    <span className="folder-icon"><FolderOpen size={24} /></span>
+                    <strong>{favorite.alias || favorite.name}</strong>
+                    {favorite.alias ? <em>{favorite.name}</em> : null}
+                    <small title={favorite.path}>{favorite.path}</small>
+                    {favorite.tags.length ? <span className="folder-tags">{favorite.tags.map((tag) => <i key={tag}><Tag size={11} />{tag}</i>)}</span> : null}
+                    {favorite.shortcut ? <kbd className="folder-shortcut">{favorite.shortcut}</kbd> : null}
+                  </button>
+                  <div className="folder-card-actions">
+                    <button type="button" className="icon-button" aria-label={`编辑 ${favorite.alias || favorite.name}`} onClick={() => setDraft(favorite)}><Pencil size={15} /></button>
+                    <button
+                      type="button"
+                      className="icon-button danger"
+                      aria-label={`取消收藏 ${favorite.alias || favorite.name}`}
+                      onClick={() =>
+                        model.setSnapshot((current) => ({
+                          ...current,
+                          folderFavorites: current.folderFavorites.filter(
+                            (item) => item.id !== favorite.id,
+                          ),
+                        }))
+                      }
+                    >
+                      <Trash2 size={16} />
+                    </button>
+                  </div>
+                </article>
+              ))}
+            </div>
+          </div>
         ))}
-        {!model.snapshot.folderFavorites.length ? (
-          <EmptyState
-            icon={<Bookmark size={28} />}
-            title="还没有收藏文件夹"
-            description="收藏后点击卡片即可在资源管理器中打开。"
-            fullSpan
-          />
+        {!allFavorites.length ? (
+          <div className="folder-favorites-grid empty-folder-grid">
+            <EmptyState
+              icon={<Bookmark size={28} />}
+              title="还没有收藏文件夹"
+              description="收藏后点击卡片即可在资源管理器中打开。"
+              fullSpan
+            />
+          </div>
+        ) : !visibleGroups.length ? (
+          <div className="folder-favorites-grid empty-folder-grid">
+            <EmptyState icon={<Search size={28} />} title="没有匹配的收藏" description="换个关键词或分组试试。" fullSpan />
+          </div>
         ) : null}
       </section>
     </>
@@ -1981,6 +2312,20 @@ function EnhancedSettingsPage({
 }) {
   const [indexing, setIndexing] = useState(false);
   const [linkDraft, setLinkDraft] = useState<QuickLink | null>(null);
+  const [excludedAppsText, setExcludedAppsText] = useState(
+    model.snapshot.settings.clipboardExcludedApps.join(", "),
+  );
+  const [retentionDaysText, setRetentionDaysText] = useState(
+    String(model.snapshot.settings.clipboardRetentionDays),
+  );
+
+  useEffect(() => {
+    setExcludedAppsText(model.snapshot.settings.clipboardExcludedApps.join(", "));
+  }, [model.snapshot.settings.clipboardExcludedApps]);
+
+  useEffect(() => {
+    setRetentionDaysText(String(model.snapshot.settings.clipboardRetentionDays));
+  }, [model.snapshot.settings.clipboardRetentionDays]);
 
   const rebuild = async (roots: string[]) => {
     setIndexing(true);
@@ -2346,8 +2691,21 @@ function EnhancedSettingsPage({
         <section className="settings-section">
           <header>
             <Clipboard size={19} />
-            <div><h2>剪贴板历史</h2><p>设置跨重启保留的最近文字与图片数量。</p></div>
+            <div><h2>剪贴板历史与隐私</h2><p>控制本地保留周期，并避开密码管理器等敏感应用。</p></div>
           </header>
+          <div className="setting-row">
+            <div>
+              <strong>暂停采集</strong>
+              <small>已有历史仍可使用，恢复后再记录新的复制内容。</small>
+            </div>
+            <Switch
+              checked={model.snapshot.settings.clipboardCapturePaused}
+              label="暂停剪贴板采集"
+              onChange={(clipboardCapturePaused) =>
+                model.setSetting("clipboardCapturePaused", clipboardCapturePaused)
+              }
+            />
+          </div>
           <label className="setting-row">
             <div><strong>保留数量</strong><small>允许 10–500 条</small></div>
             <input
@@ -2366,6 +2724,51 @@ function EnhancedSettingsPage({
                   model.snapshot.clipboardHistory.slice(0, limit),
                 );
               }}
+            />
+          </label>
+          <label className="setting-row">
+            <div><strong>保留天数</strong><small>到期记录和对应图片会自动清理</small></div>
+            <input
+              aria-label="剪贴板保留天数"
+              className="number-setting no-native-spinner"
+              type="number"
+              min="1"
+              max="3650"
+              value={retentionDaysText}
+              onChange={(event) => setRetentionDaysText(event.target.value)}
+              onBlur={() => {
+                const days = Math.min(
+                  3650,
+                  Math.max(1, Number(retentionDaysText) || 30),
+                );
+                setRetentionDaysText(String(days));
+                model.setSetting("clipboardRetentionDays", days);
+              }}
+            />
+          </label>
+          <label className="setting-row privacy-apps-setting">
+            <div>
+              <strong>敏感应用排除</strong>
+              <small>逗号分隔进程名；这些应用位于前台时不会读取剪贴板</small>
+            </div>
+            <textarea
+              aria-label="不记录这些应用"
+              rows={2}
+              value={excludedAppsText}
+              onChange={(event) => setExcludedAppsText(event.target.value)}
+              onBlur={() =>
+                model.setSetting(
+                  "clipboardExcludedApps",
+                  Array.from(
+                    new Set(
+                      excludedAppsText
+                        .split(/[,，\n]/)
+                        .map((item) => item.trim())
+                        .filter(Boolean),
+                    ),
+                  ),
+                )
+              }
             />
           </label>
         </section>

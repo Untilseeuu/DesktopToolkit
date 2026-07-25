@@ -27,6 +27,24 @@ export interface StartupScene {
   name: string;
   description: string;
   itemIds: string[];
+  closePreviousApps?: boolean;
+  restoreLayout?: boolean;
+  windowLayouts?: SceneWindowLayout[];
+}
+
+export interface WindowRect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export interface SceneWindowLayout {
+  itemId: string;
+  executablePath: string;
+  rect: WindowRect;
+  maximized: boolean;
+  monitorDeviceName?: string;
 }
 
 export interface CommandTask {
@@ -46,6 +64,10 @@ export interface FolderFavorite {
   name: string;
   path: string;
   description: string;
+  group?: string;
+  tags?: string[];
+  alias?: string;
+  shortcut?: string;
   createdAt: number;
 }
 
@@ -116,6 +138,9 @@ export interface AppSettings {
   excludedPatterns: string[];
   searchFilters: SearchFilters;
   clipboardLimit: number;
+  clipboardRetentionDays: number;
+  clipboardCapturePaused: boolean;
+  clipboardExcludedApps: string[];
   launchAtLogin: boolean;
   loginSceneId: string;
 }

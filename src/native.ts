@@ -5,6 +5,7 @@ import type {
   SearchResult,
   StartupItem,
   CommandTask,
+  SceneWindowLayout,
 } from "./types";
 
 export interface LaunchResult {
@@ -12,6 +13,32 @@ export interface LaunchResult {
   name: string;
   success: boolean;
   error?: string;
+  status?: "started" | "alreadyRunning" | "failed";
+}
+
+export interface CloseResult {
+  executablePath: string;
+  status: "closeRequested" | "notRunning" | "unsupported" | "failed";
+  windowsNotified: number;
+  processesTerminated: number;
+  error?: string;
+}
+
+export interface SceneLayoutCapture {
+  layouts: SceneWindowLayout[];
+  errors: string[];
+}
+
+export interface RestoreResult {
+  itemId: string;
+  status: "restored" | "windowNotFound" | "noMonitor" | "unsupported" | "failed";
+  error?: string;
+}
+
+export interface MonitorDescriptor {
+  deviceName: string;
+  workArea: { x: number; y: number; width: number; height: number };
+  primary: boolean;
 }
 
 export interface RuntimeSettingsRejected {
@@ -35,6 +62,9 @@ export interface CommandExecution {
 }
 
 const LOCAL_KEY = "atlas-toolkit-state-v1";
+const APP_ICON_CACHE_LIMIT = 64;
+const appIconCache = new Map<string, string>();
+const appIconRequests = new Map<string, Promise<Record<string, string>>>();
 
 function hasTauriRuntime(): boolean {
   return "__TAURI_INTERNALS__" in window;
@@ -132,10 +162,45 @@ export async function searchNative(
 }
 
 export async function getAppIcons(paths: string[]): Promise<Record<string, string>> {
-  if (!paths.length) return {};
-  return (
-    (await invokeNative<Record<string, string>>("load_app_icons", { paths })) ?? {}
-  );
+  const uniquePaths = [...new Set(paths)].filter(Boolean);
+  if (!uniquePaths.length) return {};
+
+  const icons: Record<string, string> = {};
+  const missing: string[] = [];
+  for (const path of uniquePaths) {
+    const cached = appIconCache.get(path);
+    if (cached) {
+      icons[path] = cached;
+    } else {
+      missing.push(path);
+    }
+  }
+  if (!missing.length) return icons;
+
+  const requestKey = [...missing].sort().join("\n");
+  let request = appIconRequests.get(requestKey);
+  if (!request) {
+    request = invokeNative<Record<string, string>>("load_app_icons", {
+      paths: missing,
+    }).then((loaded) => loaded ?? {});
+    appIconRequests.set(requestKey, request);
+  }
+  try {
+    const loaded = await request;
+    for (const [path, dataUrl] of Object.entries(loaded)) {
+      if (!dataUrl) continue;
+      icons[path] = dataUrl;
+      appIconCache.set(path, dataUrl);
+      while (appIconCache.size > APP_ICON_CACHE_LIMIT) {
+        const oldest = appIconCache.keys().next().value;
+        if (oldest === undefined) break;
+        appIconCache.delete(oldest);
+      }
+    }
+    return icons;
+  } finally {
+    appIconRequests.delete(requestKey);
+  }
 }
 
 export async function rebuildSearchIndex(roots: string[]): Promise<number> {
@@ -179,6 +244,43 @@ export async function launchStartupItems(items: StartupItem[]): Promise<LaunchRe
     (await invokeNative<LaunchResult[]>("launch_startup_items", {
       items: items.filter((item) => item.enabled),
     })) ?? []
+  );
+}
+
+export async function closePreviousStartupScene(
+  previousItems: StartupItem[],
+  nextItems: StartupItem[],
+): Promise<CloseResult[]> {
+  return (
+    (await invokeNative<CloseResult[]>("close_previous_startup_scene", {
+      previousItems,
+      nextItems,
+    })) ?? []
+  );
+}
+
+export async function captureStartupSceneLayout(
+  items: StartupItem[],
+): Promise<SceneLayoutCapture> {
+  return (
+    (await invokeNative<SceneLayoutCapture>("capture_startup_scene_layout", { items })) ?? {
+      layouts: [],
+      errors: [],
+    }
+  );
+}
+
+export async function restoreStartupSceneLayout(
+  layouts: SceneWindowLayout[],
+): Promise<RestoreResult[]> {
+  return (
+    (await invokeNative<RestoreResult[]>("restore_startup_scene_layout", { layouts })) ?? []
+  );
+}
+
+export async function listStartupSceneMonitors(): Promise<MonitorDescriptor[]> {
+  return (
+    (await invokeNative<MonitorDescriptor[]>("list_startup_scene_monitors")) ?? []
   );
 }
 

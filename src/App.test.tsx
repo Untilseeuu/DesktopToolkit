@@ -82,6 +82,28 @@ describe("Atlas desktop toolkit", () => {
     expect(screen.queryByText("登录启动")).not.toBeInTheDocument();
   });
 
+  it("lets the user pause clipboard capture and configure privacy retention", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(await screen.findByRole("button", { name: "设置" }));
+    const pause = await screen.findByRole("switch", { name: "暂停剪贴板采集" });
+    expect(pause).not.toBeChecked();
+    await user.click(pause);
+    expect(pause).toBeChecked();
+
+    const retention = screen.getByRole("spinbutton", { name: "剪贴板保留天数" });
+    await user.clear(retention);
+    await user.type(retention, "7");
+    expect(retention).toHaveValue(7);
+
+    const excluded = screen.getByRole("textbox", { name: "不记录这些应用" });
+    await user.clear(excluded);
+    await user.type(excluded, "SecretEditor.exe, PasswordVault.exe");
+    fireEvent.blur(excluded);
+    expect(excluded).toHaveValue("SecretEditor.exe, PasswordVault.exe");
+  });
+
   it("exposes automation and folder favorites as independent tools", async () => {
     render(<App />);
 
@@ -229,6 +251,25 @@ describe("Atlas desktop toolkit", () => {
     await user.click(screen.getByRole("button", { name: "创建" }));
 
     expect((await screen.findAllByText("学习模式")).length).toBeGreaterThan(0);
+  });
+
+  it("exposes safe scene switching and desktop layout controls", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole("button", { name: "启动编排" }));
+
+    expect(
+      await screen.findByRole("switch", {
+        name: "切换场景时关闭上一场景的软件",
+      }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("switch", { name: "运行场景时恢复桌面布局" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: /保存当前桌面布局/ }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/避免重复启动/)).toBeInTheDocument();
   });
 
   it("adds and removes a folder favorite", async () => {
@@ -389,6 +430,40 @@ describe("Atlas desktop toolkit", () => {
     expect(container.querySelector(".number-setting")).toHaveClass("no-native-spinner");
   });
 
+  it("keeps settings form controls at the same compact type scale as their labels", () => {
+    expect(stylesheet).toMatch(
+      /\.settings-section\s+:is\(select,\s*input:not\(\[type="range"\]\),\s*textarea\)\s*\{[\s\S]*?font-size:\s*calc\(9px\s*\*\s*var\(--font-scale\)\)/,
+    );
+  });
+
+  it("shows folder favorites with groups, aliases, tags and shortcuts", async () => {
+    localStorage.setItem(
+      "atlas-toolkit-state-v1",
+      JSON.stringify({
+        ...defaultSnapshot,
+        folderFavorites: [{
+          id: "folder-docs",
+          name: "资料",
+          alias: "论文仓库",
+          path: "D:\\资料",
+          description: "",
+          group: "学习",
+          tags: ["论文", "常用"],
+          shortcut: "Ctrl+Alt+D",
+          createdAt: 1,
+        }],
+      }),
+    );
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole("button", { name: "文件夹收藏" }));
+
+    expect((await screen.findAllByText("学习")).length).toBeGreaterThan(0);
+    expect(screen.getByText("论文仓库")).toBeInTheDocument();
+    expect(screen.getByText("论文")).toBeInTheDocument();
+    expect(screen.getByText("Ctrl+Alt+D")).toBeInTheDocument();
+  });
+
   it("renders persisted clipboard image previews with an image marker", async () => {
     localStorage.setItem(
       "atlas-toolkit-state-v1",
@@ -470,5 +545,26 @@ describe("Atlas desktop toolkit", () => {
       );
       expect(names).toEqual(["Second", "First"]);
     });
+  });
+
+  it("opens overview tool cards with the keyboard without toggling the tool", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    const openSearch = await screen.findByRole("button", { name: "打开全局搜索" });
+    openSearch.focus();
+    await user.keyboard("{Enter}");
+
+    expect(
+      await screen.findByPlaceholderText("搜索应用、文件或文件夹…"),
+    ).toHaveFocus();
+    expect(screen.getByRole("switch", { name: "全局搜索" })).toBeChecked();
+  });
+
+  it("keeps large text layouts adaptive instead of forcing horizontal page scrolling", () => {
+    expect(stylesheet).toContain(":root[data-font-size=\"large\"] .overview-hero");
+    expect(stylesheet).toContain(":root[data-font-size=\"large\"] .activity-strip");
+    expect(stylesheet).toContain("overflow-x: hidden");
+    expect(stylesheet).toContain("scrollbar-gutter: stable");
   });
 });

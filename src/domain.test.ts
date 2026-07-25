@@ -248,6 +248,38 @@ describe("selectSearchResults", () => {
   });
 });
 
+describe("mergeSnapshotDefaults clipboard privacy", () => {
+  it("adds conservative clipboard privacy defaults without overwriting saved choices", () => {
+    const legacy = structuredClone({
+      ...({} as AppSnapshot),
+      tools: {},
+      settings: {
+        indexRoots: ["*"],
+      },
+    }) as AppSnapshot;
+
+    const migrated = mergeSnapshotDefaults(legacy);
+    expect(migrated.settings.clipboardCapturePaused).toBe(false);
+    expect(migrated.settings.clipboardRetentionDays).toBe(30);
+    expect(migrated.settings.clipboardExcludedApps).toEqual(
+      expect.arrayContaining(["1Password.exe", "Bitwarden.exe", "KeePass.exe"]),
+    );
+
+    const customized = mergeSnapshotDefaults({
+      ...legacy,
+      settings: {
+        ...legacy.settings,
+        clipboardCapturePaused: true,
+        clipboardRetentionDays: 7,
+        clipboardExcludedApps: ["SecretEditor.exe"],
+      },
+    });
+    expect(customized.settings.clipboardCapturePaused).toBe(true);
+    expect(customized.settings.clipboardRetentionDays).toBe(7);
+    expect(customized.settings.clipboardExcludedApps).toEqual(["SecretEditor.exe"]);
+  });
+});
+
 describe("filterSearchResults", () => {
   const results: SearchResult[] = [
     { id: "1", name: "Atlas.exe", path: "D:\\Apps\\Atlas.exe", kind: "app" },
@@ -309,6 +341,26 @@ describe("appendClipboardEntry", () => {
 });
 
 describe("mergeSnapshotDefaults", () => {
+  it("adds safe desktop-layout defaults to legacy startup scenes", () => {
+    const merged = mergeSnapshotDefaults({
+      tools: {},
+      startupItems: [],
+      startupScenes: [{
+        id: "legacy",
+        name: "工作",
+        description: "",
+        itemIds: [],
+      }],
+      settings: {},
+    } as unknown as AppSnapshot);
+
+    expect(merged.startupScenes[0]).toMatchObject({
+      closePreviousApps: false,
+      restoreLayout: false,
+      windowLayouts: [],
+    });
+  });
+
   it("upgrades an older saved snapshot with fonts, shortcuts and clipboard settings", () => {
     const old = {
       tools: {
@@ -420,6 +472,9 @@ function defaultSnapshotForMigration(): AppSnapshot {
       excludedPatterns: [],
       searchFilters: { kind: "all", extension: "", drive: "" },
       clipboardLimit: 50,
+      clipboardRetentionDays: 30,
+      clipboardCapturePaused: false,
+      clipboardExcludedApps: [],
       launchAtLogin: true,
       loginSceneId: "",
     },

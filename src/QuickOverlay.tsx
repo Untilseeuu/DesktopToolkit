@@ -1,6 +1,7 @@
 import { Clipboard, FileText, Image as ImageIcon, Search, Sparkles, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { ResultGlyph } from "./components";
+import { SearchQueryInput } from "./SearchQueryInput";
 import {
   buildQuickLinkResults,
   clipboardEntryKind,
@@ -41,6 +42,7 @@ const modeMeta = {
 export default function QuickOverlay({ mode }: { mode: OverlayMode }) {
   const [snapshot, setSnapshot] = useState<AppSnapshot | null>(null);
   const [query, setQuery] = useState("");
+  const [inputResetSignal, setInputResetSignal] = useState(0);
   const [results, setResults] = useState<SearchResult[]>([]);
   const [filters, setFilters] = useState<SearchFilters>({
     kind: "all",
@@ -49,6 +51,7 @@ export default function QuickOverlay({ mode }: { mode: OverlayMode }) {
   });
   const inputRef = useRef<HTMLInputElement>(null);
   const lastRecordedQuery = useRef("");
+  const requestSequence = useRef(0);
   const meta = modeMeta[mode];
   const Icon = meta.icon;
 
@@ -67,6 +70,7 @@ export default function QuickOverlay({ mode }: { mode: OverlayMode }) {
     void import("@tauri-apps/api/event").then(({ listen }) =>
       listen("atlas-overlay-focus", () => {
         setQuery("");
+        setInputResetSignal((value) => value + 1);
         setResults([]);
         lastRecordedQuery.current = "";
         refreshSnapshot();
@@ -92,12 +96,14 @@ export default function QuickOverlay({ mode }: { mode: OverlayMode }) {
   }, []);
 
   useEffect(() => {
+    const requestId = ++requestSequence.current;
     if (mode !== "search" || !query.trim()) {
       setResults([]);
       return;
     }
-    const timer = window.setTimeout(() => {
-      void searchNative(query, filters).then((items) => {
+    void searchNative(query, filters)
+      .then((items) => {
+        if (requestId !== requestSequence.current) return;
         const links = buildQuickLinkResults(snapshot?.quickLinks ?? [], query);
         const ranked = rankSearchResults(
           filterSearchResults([...links, ...(items ?? [])], filters),
@@ -108,22 +114,26 @@ export default function QuickOverlay({ mode }: { mode: OverlayMode }) {
           .filter((result) => result.kind === "app")
           .slice(0, 16)
           .map((result) => result.path);
-        void getAppIcons(appPaths).then((icons) => {
-          setResults((current) =>
-            current.map((result) => ({
-              ...result,
-              iconDataUrl: icons[result.path] ?? result.iconDataUrl,
-            })),
-          );
-        });
-        const normalized = query.trim();
-        if (normalized && normalized !== lastRecordedQuery.current) {
-          lastRecordedQuery.current = normalized;
-          void recordActivity("search", normalized);
-        }
+        void getAppIcons(appPaths)
+          .then((icons) => {
+            if (requestId !== requestSequence.current) return;
+            if (!Object.keys(icons).length) return;
+            setResults((current) => {
+              let changed = false;
+              const next = current.map((result) => {
+                const iconDataUrl = icons[result.path];
+                if (!iconDataUrl || iconDataUrl === result.iconDataUrl) return result;
+                changed = true;
+                return { ...result, iconDataUrl };
+              });
+              return changed ? next : current;
+            });
+          })
+          .catch(() => undefined);
+      })
+      .catch(() => {
+        if (requestId === requestSequence.current) setResults([]);
       });
-    }, 100);
-    return () => window.clearTimeout(timer);
   }, [filters, mode, query, snapshot?.quickLinks]);
 
   useEffect(() => {
@@ -134,13 +144,18 @@ export default function QuickOverlay({ mode }: { mode: OverlayMode }) {
         void hideOverlay(mode);
       }
       if (event.key === "Enter" && mode === "search" && results[0]) {
+        const normalized = query.trim();
+        if (normalized && normalized !== lastRecordedQuery.current) {
+          lastRecordedQuery.current = normalized;
+          void recordActivity("search", normalized);
+        }
         void openTarget(results[0].path);
         void hideOverlay(mode);
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [mode, results]);
+  }, [mode, query, results]);
 
   const prompts = useMemo(
     () => filterPrompts(snapshot?.prompts ?? [], query),
@@ -154,6 +169,9 @@ export default function QuickOverlay({ mode }: { mode: OverlayMode }) {
         clipboardEntrySearchText(entry).toLocaleLowerCase().includes(normalized),
     );
   }, [query, snapshot?.clipboardHistory]);
+  const displayedResults = results.slice(0, 40);
+  const displayedPrompts = prompts.slice(0, 60);
+  const displayedClipboard = clipboard.slice(0, 60);
 
   const updateFilters = (next: SearchFilters) => {
     setFilters(next);
@@ -172,6 +190,16 @@ export default function QuickOverlay({ mode }: { mode: OverlayMode }) {
     await hideOverlay(mode);
   };
 
+  const openSearchResult = (result: SearchResult) => {
+    const normalized = query.trim();
+    if (normalized && normalized !== lastRecordedQuery.current) {
+      lastRecordedQuery.current = normalized;
+      void recordActivity("search", normalized);
+    }
+    void openTarget(result.path);
+    void hideOverlay(mode);
+  };
+
   return (
     <main className="quick-overlay">
       <header className="quick-overlay-header">
@@ -184,12 +212,23 @@ export default function QuickOverlay({ mode }: { mode: OverlayMode }) {
       </header>
       <label className="quick-overlay-search">
         <Search size={21} />
-        <input
+        <SearchQueryInput
           ref={inputRef}
           autoFocus
-          value={query}
-          onChange={(event) => setQuery(event.target.value)}
+          onSearchChange={setQuery}
+          resetSignal={inputResetSignal}
           placeholder={meta.placeholder}
+          onSubmit={
+            mode === "search"
+              ? (inputQuery) => {
+                  if (inputQuery === query && results[0]) {
+                    openSearchResult(results[0]);
+                  } else {
+                    setQuery(inputQuery);
+                  }
+                }
+              : undefined
+          }
         />
       </label>
       {mode === "search" ? (
@@ -220,13 +259,10 @@ export default function QuickOverlay({ mode }: { mode: OverlayMode }) {
       ) : null}
       <section className="quick-results">
         {mode === "search"
-          ? results.map((result) => (
+          ? displayedResults.map((result) => (
               <button
                 key={result.id}
-                onClick={() => {
-                  void openTarget(result.path);
-                  void hideOverlay(mode);
-                }}
+                onClick={() => openSearchResult(result)}
               >
                 <span className={`quick-kind ${result.kind}`}>
                   <ResultGlyph result={result} size={17} />
@@ -244,14 +280,14 @@ export default function QuickOverlay({ mode }: { mode: OverlayMode }) {
               </button>
             ))
           : mode === "prompts"
-            ? prompts.map((prompt) => (
+            ? displayedPrompts.map((prompt) => (
                 <button key={prompt.id} onClick={() => void copyAndClose(prompt.content)}>
                   <span className="quick-kind prompt"><Sparkles size={17} /></span>
                   <span><strong>{prompt.title}</strong><small>{prompt.content}</small></span>
                   <em>{prompt.category}</em>
                 </button>
               ))
-            : clipboard.map((entry: ClipboardEntry) => {
+            : displayedClipboard.map((entry: ClipboardEntry) => {
                 const kind = clipboardEntryKind(entry);
                 return (
                   <button key={entry.id} onClick={() => void restoreClipboardAndClose(entry)}>

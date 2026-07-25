@@ -4,22 +4,35 @@ mod tests {
     use crate::domain::{default_data_directory, runtime_settings_changed};
     use crate::launcher::{launch_queue, validate_startup_item, StartupItem};
     use crate::{
-        cleanup_clipboard_images, clipboard_file_path, search, shortcut_target,
-        storage::StorageManager,
+        cleanup_clipboard_images, clipboard_file_path, desired_shortcuts, folder_shortcut_target,
+        search, shortcut_target, storage::StorageManager,
     };
     use std::str::FromStr;
     use std::{
         fs,
         path::Path,
+        sync::Mutex,
         time::{SystemTime, UNIX_EPOCH},
     };
     use tauri_plugin_global_shortcut::Shortcut;
+
+    static SEARCH_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn default_storage_is_next_to_the_executable() {
         assert_eq!(
             default_data_directory(Path::new("D:\\Apps\\Atlas\\atlas.exe")),
             Path::new("D:\\Apps\\Atlas\\data")
+        );
+    }
+
+    #[test]
+    fn startup_failures_are_written_beside_the_installed_application_data() {
+        assert_eq!(
+            crate::startup_log_path_for_executable(Path::new(
+                "D:\\Apps\\Atlas\\atlas-desktop-toolkit.exe"
+            )),
+            Path::new("D:\\Apps\\Atlas\\data\\atlas-startup.log")
         );
     }
 
@@ -146,6 +159,29 @@ mod tests {
     }
 
     #[test]
+    fn login_startup_restores_the_selected_scene_layout_when_enabled() {
+        let snapshot = serde_json::json!({
+            "settings": { "loginSceneId": "work-scene" },
+            "startupScenes": [{
+                "id": "work-scene",
+                "restoreLayout": true,
+                "windowLayouts": [{
+                    "itemId": "work",
+                    "executablePath": "C:\\Work.exe",
+                    "rect": { "x": 10, "y": 20, "width": 900, "height": 700 },
+                    "maximized": false,
+                    "monitorDeviceName": "\\\\.\\DISPLAY1"
+                }]
+            }]
+        });
+
+        let layouts = crate::launcher::layouts_for_login_scene(&snapshot);
+
+        assert_eq!(layouts.len(), 1);
+        assert_eq!(layouts[0].item_id, "work");
+    }
+
+    #[test]
     fn boot_startup_can_explicitly_select_no_scene() {
         let snapshot = serde_json::json!({
             "startupItems": [
@@ -218,6 +254,92 @@ mod tests {
         });
         let native = Shortcut::from_str("Alt+F").unwrap();
         assert_eq!(shortcut_target(&snapshot, &native), None);
+    }
+
+    #[test]
+    fn enabled_folder_favorites_register_and_resolve_their_shortcuts() {
+        let snapshot = serde_json::json!({
+            "tools": {
+                "search": { "enabled": false },
+                "prompts": { "enabled": false },
+                "clipboard": { "enabled": false },
+                "folders": { "enabled": true }
+            },
+            "folderFavorites": [{
+                "id": "docs",
+                "name": "资料",
+                "path": "D:\\资料",
+                "shortcut": "Ctrl+Alt+D"
+            }]
+        });
+        let shortcut = Shortcut::from_str("Ctrl+Alt+D").unwrap();
+
+        assert_eq!(
+            desired_shortcuts(&snapshot).unwrap().get("folder:docs"),
+            Some(&"Ctrl+Alt+D".to_string())
+        );
+        assert_eq!(
+            folder_shortcut_target(&snapshot, &shortcut),
+            Some("D:\\资料".to_string())
+        );
+    }
+
+    #[test]
+    fn disabled_folder_tool_does_not_register_or_resolve_favorite_shortcuts() {
+        let snapshot = serde_json::json!({
+            "tools": {
+                "search": { "enabled": false },
+                "prompts": { "enabled": false },
+                "clipboard": { "enabled": false },
+                "folders": { "enabled": false }
+            },
+            "folderFavorites": [{
+                "id": "docs",
+                "path": "D:\\资料",
+                "shortcut": "Ctrl+Alt+D"
+            }]
+        });
+        let shortcut = Shortcut::from_str("Ctrl+Alt+D").unwrap();
+
+        assert!(desired_shortcuts(&snapshot).unwrap().is_empty());
+        assert_eq!(folder_shortcut_target(&snapshot, &shortcut), None);
+    }
+
+    #[test]
+    fn folder_shortcuts_must_include_a_modifier_key() {
+        let snapshot = serde_json::json!({
+            "tools": {
+                "search": { "enabled": false },
+                "prompts": { "enabled": false },
+                "clipboard": { "enabled": false },
+                "folders": { "enabled": true }
+            },
+            "folderFavorites": [{
+                "id": "docs",
+                "path": "D:\\资料",
+                "shortcut": "D"
+            }]
+        });
+
+        assert!(desired_shortcuts(&snapshot)
+            .unwrap_err()
+            .contains("至少包含一个修饰键"));
+    }
+
+    #[test]
+    fn changing_folder_favorites_requests_runtime_shortcut_reconciliation() {
+        let previous = serde_json::json!({
+            "tools": { "folders": { "enabled": true } },
+            "folderFavorites": []
+        });
+        let mut next = previous.clone();
+        next["folderFavorites"] = serde_json::json!([{
+            "id": "docs",
+            "path": "D:\\资料",
+            "shortcut": "Ctrl+Alt+D"
+        }]);
+
+        assert!(runtime_settings_changed(&previous, &next));
     }
 
     #[test]
@@ -403,6 +525,59 @@ mod tests {
     }
 
     #[test]
+    fn clipboard_capture_respects_pause_and_excluded_applications() {
+        let enabled = serde_json::json!({
+            "tools": { "clipboard": { "enabled": true } },
+            "settings": {
+                "clipboardCapturePaused": false,
+                "clipboardExcludedApps": ["1Password.exe", "SecretEditor"]
+            }
+        });
+        assert!(crate::clipboard_capture_allowed(
+            &enabled,
+            Some("notepad.exe")
+        ));
+        assert!(!crate::clipboard_capture_allowed(
+            &enabled,
+            Some("1PASSWORD.EXE")
+        ));
+        assert!(!crate::clipboard_capture_allowed(
+            &enabled,
+            Some("SecretEditor.exe")
+        ));
+        assert!(!crate::clipboard_capture_allowed(&enabled, None));
+
+        let mut paused = enabled.clone();
+        paused["settings"]["clipboardCapturePaused"] = serde_json::json!(true);
+        assert!(!crate::clipboard_capture_allowed(
+            &paused,
+            Some("notepad.exe")
+        ));
+
+        let mut disabled = enabled;
+        disabled["tools"]["clipboard"]["enabled"] = serde_json::json!(false);
+        assert!(!crate::clipboard_capture_allowed(
+            &disabled,
+            Some("notepad.exe")
+        ));
+    }
+
+    #[test]
+    fn clipboard_retention_removes_expired_records_before_applying_the_count_limit() {
+        let day = 24 * 60 * 60 * 1000u64;
+        let now = 40 * day;
+        let entries = vec![
+            serde_json::json!({ "id": "new", "copiedAt": now - day }),
+            serde_json::json!({ "id": "old", "copiedAt": now - 31 * day }),
+            serde_json::json!({ "id": "undated" }),
+        ];
+
+        let retained = crate::retain_recent_clipboard_entries(entries, now, 30, 1);
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0]["id"], "new");
+    }
+
+    #[test]
     fn search_excludes_non_user_facing_executable_helpers() {
         for path in [
             r"D:\Apps\CloudMusic\Uninstall.exe",
@@ -479,6 +654,7 @@ mod tests {
 
     #[test]
     fn search_index_streams_files_through_staging_database() {
+        let _search_test = SEARCH_TEST_LOCK.lock().unwrap();
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -495,7 +671,7 @@ mod tests {
         fs::write(files.join("quarterly-notes.txt"), b"hello").unwrap();
         fs::write(files.join("项目会议纪要.docx"), b"hello").unwrap();
         fs::write(nested.join("unique-result.md"), b"hello").unwrap();
-        let storage = StorageManager::for_test(bootstrap, data).unwrap();
+        let storage = StorageManager::for_test(bootstrap, data.clone()).unwrap();
 
         assert_eq!(
             search::rebuild(
@@ -508,6 +684,7 @@ mod tests {
             .unwrap(),
             5
         );
+        assert!(!data.join("search-index-staging.db").exists());
         let results = search::query(&storage, "arter", "", "", "", &["*".into()]).unwrap();
 
         assert_eq!(results.len(), 1);
@@ -572,6 +749,199 @@ mod tests {
             &storage,
             &[files.to_string_lossy().to_string()]
         ));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn search_finds_a_root_folder_before_the_full_index_is_complete() {
+        let _search_test = SEARCH_TEST_LOCK.lock().unwrap();
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("atlas-root-search-{nonce}"));
+        let bootstrap = directory.join("bootstrap");
+        let data = directory.join("data");
+        let root = directory.join("drive");
+        let target = root.join("娱乐");
+        fs::create_dir_all(&bootstrap).unwrap();
+        fs::create_dir_all(&data).unwrap();
+        fs::create_dir_all(&target).unwrap();
+        let storage = StorageManager::for_test(bootstrap, data).unwrap();
+
+        let results = search::query(
+            &storage,
+            "娱乐",
+            "",
+            "",
+            "",
+            &[root.to_string_lossy().to_string()],
+        )
+        .unwrap();
+
+        assert!(results
+            .iter()
+            .any(|result| result.kind == "folder" && result.path == target.to_string_lossy()));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn search_matches_chinese_names_by_full_pinyin_and_initials() {
+        let _search_test = SEARCH_TEST_LOCK.lock().unwrap();
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("atlas-search-pinyin-test-{nonce}"));
+        let bootstrap = directory.join("bootstrap");
+        let data = directory.join("data");
+        let files = directory.join("files");
+        fs::create_dir_all(&files).unwrap();
+        fs::write(files.join("网易云音乐.exe"), b"app").unwrap();
+        let storage = StorageManager::for_test(bootstrap, data).unwrap();
+        search::rebuild(&storage, vec![files.to_string_lossy().to_string()]).unwrap();
+
+        let full = search::query(&storage, "wangyiyunyinyue", "", "", "", &["*".into()]).unwrap();
+        let initials = search::query(&storage, "wyyy", "", "", "", &["*".into()]).unwrap();
+
+        assert_eq!(
+            full.first().map(|result| result.name.as_str()),
+            Some("网易云音乐")
+        );
+        assert_eq!(
+            initials.first().map(|result| result.name.as_str()),
+            Some("网易云音乐")
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn search_tolerates_one_transposed_character() {
+        let _search_test = SEARCH_TEST_LOCK.lock().unwrap();
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("atlas-search-typo-test-{nonce}"));
+        let bootstrap = directory.join("bootstrap");
+        let data = directory.join("data");
+        let files = directory.join("files");
+        fs::create_dir_all(&files).unwrap();
+        fs::write(files.join("cloudmusic.exe"), b"app").unwrap();
+        let storage = StorageManager::for_test(bootstrap, data).unwrap();
+        search::rebuild(&storage, vec![files.to_string_lossy().to_string()]).unwrap();
+
+        let results = search::query(&storage, "cloudmuisc", "", "", "", &["*".into()]).unwrap();
+
+        assert_eq!(
+            results.first().map(|result| result.name.as_str()),
+            Some("cloudmusic")
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn search_recalls_a_four_character_name_after_one_substitution() {
+        let _search_test = SEARCH_TEST_LOCK.lock().unwrap();
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("atlas-search-short-typo-{nonce}"));
+        let files = directory.join("files");
+        fs::create_dir_all(&files).unwrap();
+        fs::write(files.join("note.txt"), b"note").unwrap();
+        let storage =
+            StorageManager::for_test(directory.join("bootstrap"), directory.join("data")).unwrap();
+        search::rebuild(&storage, vec![files.to_string_lossy().to_string()]).unwrap();
+
+        let results = search::query(&storage, "nate", "", "", "", &["*".into()]).unwrap();
+
+        assert_eq!(
+            results.first().map(|result| result.name.as_str()),
+            Some("note.txt")
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn short_synonyms_use_the_expanded_fts_candidate() {
+        let _search_test = SEARCH_TEST_LOCK.lock().unwrap();
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("atlas-search-short-synonym-{nonce}"));
+        let files = directory.join("files");
+        fs::create_dir_all(&files).unwrap();
+        fs::write(files.join("cloud-drive.txt"), b"cloud").unwrap();
+        let storage =
+            StorageManager::for_test(directory.join("bootstrap"), directory.join("data")).unwrap();
+        search::rebuild(&storage, vec![files.to_string_lossy().to_string()]).unwrap();
+
+        let results = search::query(&storage, "云盘", "", "", "", &["*".into()]).unwrap();
+
+        assert_eq!(
+            results.first().map(|result| result.name.as_str()),
+            Some("cloud-drive.txt")
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn old_index_format_scope_is_never_reused() {
+        let _search_test = SEARCH_TEST_LOCK.lock().unwrap();
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("atlas-search-old-scope-{nonce}"));
+        let storage =
+            StorageManager::for_test(directory.join("bootstrap"), directory.join("data")).unwrap();
+        storage
+            .with_connection(|connection| {
+                connection
+                    .execute(
+                        "INSERT INTO search_fts(name, path, kind) VALUES ('legacy', 'D:\\legacy.txt', 'file')",
+                        [],
+                    )
+                    .map_err(|error| error.to_string())?;
+                connection
+                    .execute(
+                        "INSERT INTO search_meta(id, scope, complete) VALUES (1, '[\"v5\",\"*\"]', 1)",
+                        [],
+                    )
+                    .map_err(|error| error.to_string())?;
+                Ok(())
+            })
+            .unwrap();
+
+        assert!(!search::has_index(&storage, &["*".into()]));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn search_expands_common_chinese_and_english_synonyms() {
+        let _search_test = SEARCH_TEST_LOCK.lock().unwrap();
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("atlas-search-synonym-test-{nonce}"));
+        let bootstrap = directory.join("bootstrap");
+        let data = directory.join("data");
+        let files = directory.join("files");
+        fs::create_dir_all(&files).unwrap();
+        fs::write(files.join("浏览器收藏夹.txt"), b"links").unwrap();
+        let storage = StorageManager::for_test(bootstrap, data).unwrap();
+        search::rebuild(&storage, vec![files.to_string_lossy().to_string()]).unwrap();
+
+        let results = search::query(&storage, "browser", "", "", "", &["*".into()]).unwrap();
+
+        assert_eq!(
+            results.first().map(|result| result.name.as_str()),
+            Some("浏览器收藏夹.txt")
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 

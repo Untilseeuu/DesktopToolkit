@@ -11,8 +11,9 @@ mod domain_tests;
 use std::os::windows::process::CommandExt;
 use std::{
     collections::BTreeMap,
+    fs::OpenOptions,
     hash::{DefaultHasher, Hash, Hasher},
-    io::Cursor,
+    io::{Cursor, Write},
     path::{Component, Path, PathBuf},
     process::Command,
     sync::Arc,
@@ -41,7 +42,10 @@ use windows_sys::Win32::{
     },
     UI::{
         Input::KeyboardAndMouse::{keybd_event, KEYEVENTF_KEYUP, VK_CONTROL},
-        WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId, SetForegroundWindow},
+        WindowsAndMessaging::{
+            GetForegroundWindow, GetWindowThreadProcessId, MessageBoxW, SetForegroundWindow,
+            MB_ICONERROR, MB_OK,
+        },
     },
 };
 
@@ -49,6 +53,64 @@ type SharedStorage = Arc<StorageManager>;
 static REGISTERED_SHORTCUTS: Mutex<BTreeMap<String, String>> = Mutex::new(BTreeMap::new());
 #[cfg(target_os = "windows")]
 static LAST_CLIPBOARD_TARGET: Mutex<Option<usize>> = Mutex::new(None);
+
+pub(crate) fn startup_log_path_for_executable(executable: &Path) -> PathBuf {
+    domain::default_data_directory(executable).join("atlas-startup.log")
+}
+
+fn append_startup_log(path: &Path, message: &str) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|error| error.to_string())?;
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default();
+    writeln!(file, "[{timestamp}] {message}").map_err(|error| error.to_string())
+}
+
+pub fn report_startup_failure(error: &str) {
+    let preferred_log_path = std::env::current_exe()
+        .map(|executable| startup_log_path_for_executable(&executable))
+        .unwrap_or_else(|_| std::env::temp_dir().join("atlas-startup.log"));
+    let log_path = match append_startup_log(&preferred_log_path, error) {
+        Ok(()) => preferred_log_path,
+        Err(write_error) => {
+            let fallback = std::env::temp_dir().join("atlas-startup.log");
+            let _ = append_startup_log(
+                &fallback,
+                &format!(
+                    "{error}\n无法写入首选日志位置 {}：{write_error}",
+                    preferred_log_path.display()
+                ),
+            );
+            fallback
+        }
+    };
+    let message = format!(
+        "Atlas 启动失败。\n\n{error}\n\n诊断日志：{}",
+        log_path.display()
+    );
+    eprintln!("{message}");
+    #[cfg(target_os = "windows")]
+    {
+        let title = "Atlas Desktop Toolkit\0".encode_utf16().collect::<Vec<_>>();
+        let body = format!("{message}\0").encode_utf16().collect::<Vec<_>>();
+        unsafe {
+            MessageBoxW(
+                std::ptr::null_mut(),
+                body.as_ptr(),
+                title.as_ptr(),
+                MB_OK | MB_ICONERROR,
+            );
+        }
+    }
+}
 
 pub(crate) fn supports_image_auto_paste(process_name: &str) -> bool {
     let lowered = process_name.trim().to_ascii_lowercase();
@@ -73,6 +135,67 @@ pub(crate) fn supports_image_auto_paste(process_name: &str) -> bool {
             | "mspaint"
             | "photoshop"
     )
+}
+
+fn normalized_process_name(process_name: &str) -> String {
+    let lowered = process_name
+        .trim()
+        .trim_end_matches(|character: char| character.is_ascii_whitespace())
+        .to_ascii_lowercase();
+    lowered.trim_end_matches(".exe").to_string()
+}
+
+pub(crate) fn clipboard_capture_allowed(
+    snapshot: &Value,
+    foreground_process: Option<&str>,
+) -> bool {
+    if !snapshot
+        .pointer("/tools/clipboard/enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(true)
+        || snapshot
+            .pointer("/settings/clipboardCapturePaused")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    {
+        return false;
+    }
+    let Some(foreground_process) = foreground_process else {
+        // Privacy exclusions must fail closed when Windows cannot resolve the
+        // active process. The next polling cycle can retry safely.
+        return false;
+    };
+    let foreground = normalized_process_name(foreground_process);
+    !snapshot
+        .pointer("/settings/clipboardExcludedApps")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .any(|excluded| normalized_process_name(excluded) == foreground)
+}
+
+pub(crate) fn retain_recent_clipboard_entries(
+    entries: Vec<Value>,
+    now_ms: u64,
+    retention_days: u64,
+    limit: usize,
+) -> Vec<Value> {
+    let retention_ms = retention_days
+        .clamp(1, 3650)
+        .saturating_mul(24 * 60 * 60 * 1000);
+    let cutoff = now_ms.saturating_sub(retention_ms);
+    entries
+        .into_iter()
+        .filter(|entry| {
+            entry
+                .get("copiedAt")
+                .and_then(Value::as_u64)
+                .map(|copied_at| copied_at >= cutoff)
+                .unwrap_or(true)
+        })
+        .take(limit.clamp(1, 500))
+        .collect()
 }
 
 #[cfg(target_os = "windows")]
@@ -199,8 +322,14 @@ fn target_process_name(handle: usize) -> Option<String> {
     unsafe {
         GetWindowThreadProcessId(handle as _, &mut process_id);
     }
-    if process_id == 0 || process_id == std::process::id() {
+    if process_id == 0 {
         return None;
+    }
+    if process_id == std::process::id() {
+        return std::env::current_exe().ok().and_then(|path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().to_string())
+        });
     }
     let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id) };
     if process.is_null() {
@@ -220,6 +349,21 @@ fn target_process_name(handle: usize) -> Option<String> {
         .file_name()
         .and_then(|name| name.to_str())
         .map(str::to_string)
+}
+
+#[cfg(target_os = "windows")]
+fn foreground_process_name() -> Option<String> {
+    let handle = unsafe { GetForegroundWindow() };
+    if handle.is_null() {
+        None
+    } else {
+        target_process_name(handle as usize)
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn foreground_process_name() -> Option<String> {
+    None
 }
 
 #[cfg(target_os = "windows")]
@@ -283,6 +427,22 @@ struct ShortcutRegistrationDelta {
     register: Vec<String>,
 }
 
+fn validate_global_shortcut(shortcut: &str) -> Result<(), String> {
+    shortcut
+        .parse::<Shortcut>()
+        .map_err(|error| format!("快捷键 {shortcut} 无效：{error}"))?;
+    let has_modifier = shortcut.split('+').any(|part| {
+        matches!(
+            part.trim().to_ascii_lowercase().as_str(),
+            "ctrl" | "control" | "alt" | "shift" | "meta" | "super" | "cmd" | "command"
+        )
+    });
+    if !has_modifier {
+        return Err(format!("快捷键 {shortcut} 至少包含一个修饰键"));
+    }
+    Ok(())
+}
+
 fn desired_shortcuts(snapshot: &Value) -> Result<BTreeMap<String, String>, String> {
     let mut desired: BTreeMap<String, String> = BTreeMap::new();
     for (tool, fallback) in [
@@ -302,9 +462,7 @@ fn desired_shortcuts(snapshot: &Value) -> Result<BTreeMap<String, String>, Strin
             .and_then(Value::as_str)
             .unwrap_or(fallback)
             .to_string();
-        shortcut
-            .parse::<Shortcut>()
-            .map_err(|error| format!("快捷键 {shortcut} 无效：{error}"))?;
+        validate_global_shortcut(&shortcut)?;
         if desired
             .values()
             .any(|value| value.eq_ignore_ascii_case(&shortcut))
@@ -312,6 +470,39 @@ fn desired_shortcuts(snapshot: &Value) -> Result<BTreeMap<String, String>, Strin
             return Err(format!("快捷键 {shortcut} 被多个工具重复使用"));
         }
         desired.insert(tool.to_string(), shortcut);
+    }
+    let folders_enabled = snapshot
+        .pointer("/tools/folders/enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    if folders_enabled {
+        for favorite in snapshot
+            .get("folderFavorites")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let shortcut = favorite
+                .get("shortcut")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim();
+            if shortcut.is_empty() {
+                continue;
+            }
+            let id = favorite
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "文件夹收藏缺少标识".to_string())?;
+            validate_global_shortcut(shortcut).map_err(|error| format!("文件夹{error}"))?;
+            if desired
+                .values()
+                .any(|value| value.eq_ignore_ascii_case(shortcut))
+            {
+                return Err(format!("快捷键 {shortcut} 被多个功能重复使用"));
+            }
+            desired.insert(format!("folder:{id}"), shortcut.to_string());
+        }
     }
     Ok(desired)
 }
@@ -377,9 +568,24 @@ fn save_snapshot(
             .and_then(Value::as_u64)
             .unwrap_or(50)
             .clamp(1, 500) as usize;
-        if let Some(entries) = sanitized["clipboardHistory"].as_array_mut() {
-            entries.truncate(clipboard_limit);
-        }
+        let retention_days = sanitized
+            .pointer("/settings/clipboardRetentionDays")
+            .and_then(Value::as_u64)
+            .unwrap_or(30);
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| error.to_string())?
+            .as_millis() as u64;
+        let entries = sanitized["clipboardHistory"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        sanitized["clipboardHistory"] = Value::Array(retain_recent_clipboard_entries(
+            entries,
+            now_ms,
+            retention_days,
+            clipboard_limit,
+        ));
         sanitized["activity"] = previous
             .get("activity")
             .cloned()
@@ -613,33 +819,47 @@ fn record_activity(
 }
 
 #[tauri::command]
-fn search_index(
+async fn search_index(
     storage: State<'_, SharedStorage>,
     query: String,
     kind: String,
     extension: String,
     drive: String,
 ) -> Result<Vec<search::SearchResult>, String> {
-    let snapshot = storage.load_snapshot()?;
-    let enabled = snapshot
-        .pointer("/tools/search/enabled")
-        .and_then(Value::as_bool)
-        .unwrap_or(true);
-    if !enabled {
-        return Err("全局搜索当前已暂停".into());
-    }
-    let roots = snapshot
-        .pointer("/settings/indexRoots")
-        .and_then(Value::as_array)
-        .map(|values| {
-            values
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::to_string)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_else(|| vec!["*".into()]);
-    search::query(&storage, &query, &kind, &extension, &drive, &roots)
+    let storage = storage.inner().clone();
+    let query_revision = search::begin_query();
+    tauri::async_runtime::spawn_blocking(move || {
+        let snapshot = storage.load_snapshot()?;
+        let enabled = snapshot
+            .pointer("/tools/search/enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        if !enabled {
+            return Err("全局搜索当前已暂停".into());
+        }
+        let roots = snapshot
+            .pointer("/settings/indexRoots")
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|| vec!["*".into()]);
+        search::query_latest(
+            &storage,
+            &query,
+            &kind,
+            &extension,
+            &drive,
+            &roots,
+            query_revision,
+        )
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -704,6 +924,43 @@ async fn launch_startup_items(
         Ok(())
     })?;
     Ok(results)
+}
+
+#[tauri::command]
+async fn close_previous_startup_scene(
+    previous_items: Vec<launcher::StartupItem>,
+    next_items: Vec<launcher::StartupItem>,
+) -> Result<Vec<launcher::CloseResult>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        launcher::close_previous_scene(&previous_items, &next_items)
+    })
+    .await
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn capture_startup_scene_layout(
+    items: Vec<launcher::StartupItem>,
+) -> Result<launcher::SceneLayoutCapture, String> {
+    tauri::async_runtime::spawn_blocking(move || launcher::capture_scene_layout(&items))
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn restore_startup_scene_layout(
+    layouts: Vec<launcher::SceneWindowLayout>,
+) -> Result<Vec<launcher::RestoreResult>, String> {
+    tauri::async_runtime::spawn_blocking(move || launcher::restore_scene_layout(&layouts))
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn list_startup_scene_monitors() -> Result<Vec<launcher::MonitorDescriptor>, String> {
+    tauri::async_runtime::spawn_blocking(launcher::list_scene_monitors)
+        .await
+        .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -903,29 +1160,45 @@ fn reconcile_shortcuts(app: &AppHandle, snapshot: &Value) -> Result<(), String> 
     let actual = REGISTERED_SHORTCUTS.lock().clone();
     let desired = desired_shortcuts(snapshot)?;
     let delta = shortcut_registration_delta(&actual, snapshot)?;
+    let mut unregistered: Vec<String> = Vec::new();
+    let mut newly_registered: Vec<String> = Vec::new();
 
     for shortcut in &delta.unregister {
-        app.global_shortcut()
-            .unregister(shortcut.as_str())
-            .map_err(|error| format!("注销快捷键 {shortcut} 失败：{error}"))?;
-        REGISTERED_SHORTCUTS
-            .lock()
-            .retain(|_, registered| registered != shortcut);
+        if let Err(error) = app.global_shortcut().unregister(shortcut.as_str()) {
+            for previous in &unregistered {
+                let _ = app.global_shortcut().register(previous.as_str());
+            }
+            return Err(format!("注销快捷键 {shortcut} 失败：{error}"));
+        }
+        unregistered.push(shortcut.clone());
     }
 
     for shortcut in &delta.register {
-        app.global_shortcut()
-            .register(shortcut.as_str())
-            .map_err(|error| format!("注册快捷键 {shortcut} 失败：{error}"))?;
-        if let Some((tool, _)) = desired
-            .iter()
-            .find(|(_, configured)| *configured == shortcut)
-        {
-            REGISTERED_SHORTCUTS
-                .lock()
-                .insert(tool.clone(), shortcut.clone());
+        if let Err(error) = app.global_shortcut().register(shortcut.as_str()) {
+            for registered in newly_registered.iter().rev() {
+                let _ = app.global_shortcut().unregister(registered.as_str());
+            }
+            let rollback_errors = unregistered
+                .iter()
+                .filter_map(|previous| {
+                    app.global_shortcut()
+                        .register(previous.as_str())
+                        .err()
+                        .map(|rollback| format!("{previous}: {rollback}"))
+                })
+                .collect::<Vec<_>>();
+            return Err(if rollback_errors.is_empty() {
+                format!("注册快捷键 {shortcut} 失败：{error}；原快捷键已恢复")
+            } else {
+                format!(
+                    "注册快捷键 {shortcut} 失败：{error}；恢复原快捷键失败：{}",
+                    rollback_errors.join("，")
+                )
+            });
         }
+        newly_registered.push(shortcut.clone());
     }
+    *REGISTERED_SHORTCUTS.lock() = desired;
     Ok(())
 }
 
@@ -958,12 +1231,14 @@ fn apply_runtime_settings(
             "/tools/search/enabled",
             "/tools/prompts/enabled",
             "/tools/clipboard/enabled",
+            "/tools/folders/enabled",
             "/settings/shortcuts/search",
             "/settings/shortcuts/prompts",
             "/settings/shortcuts/clipboard",
         ]
         .iter()
-        .any(|pointer| previous.pointer(pointer) != snapshot.pointer(pointer));
+        .any(|pointer| previous.pointer(pointer) != snapshot.pointer(pointer))
+        || previous.get("folderFavorites") != snapshot.get("folderFavorites");
     if shortcuts_changed {
         reconcile_shortcuts(app, snapshot)?;
     }
@@ -1089,11 +1364,44 @@ fn shortcut_target(snapshot: &Value, shortcut: &Shortcut) -> Option<&'static str
     None
 }
 
+fn folder_shortcut_target(snapshot: &Value, shortcut: &Shortcut) -> Option<String> {
+    let enabled = snapshot
+        .pointer("/tools/folders/enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    if !enabled {
+        return None;
+    }
+    snapshot
+        .get("folderFavorites")
+        .and_then(Value::as_array)?
+        .iter()
+        .find_map(|favorite| {
+            let configured = favorite.get("shortcut").and_then(Value::as_str)?;
+            let configured_shortcut = configured.parse::<Shortcut>().ok()?;
+            if configured_shortcut != *shortcut {
+                return None;
+            }
+            favorite
+                .get("path")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+}
+
 fn start_clipboard_monitor(app: AppHandle, storage: SharedStorage) {
     std::thread::spawn(move || {
         let mut last_seen = String::new();
         loop {
             std::thread::sleep(std::time::Duration::from_millis(700));
+            let policy_snapshot = match storage.load_snapshot() {
+                Ok(snapshot) => snapshot,
+                Err(_) => continue,
+            };
+            let foreground_process = foreground_process_name();
+            if !clipboard_capture_allowed(&policy_snapshot, foreground_process.as_deref()) {
+                continue;
+            }
             enum ClipboardContent {
                 Image(tauri::image::Image<'static>, String),
                 Text(String),
@@ -1119,16 +1427,16 @@ fn start_clipboard_monitor(app: AppHandle, storage: SharedStorage) {
                 ClipboardContent::Image(_, fingerprint) => format!("image:{fingerprint}"),
                 ClipboardContent::Text(text) => format!("text:{text}"),
             };
+            let commit_foreground_process = foreground_process_name();
+            if !clipboard_capture_allowed(&policy_snapshot, commit_foreground_process.as_deref()) {
+                continue;
+            }
             if marker == last_seen {
                 continue;
             }
             last_seen = marker;
             let update = storage.update_snapshot(|snapshot| {
-                let enabled = snapshot
-                    .pointer("/tools/clipboard/enabled")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(true);
-                if !enabled {
+                if !clipboard_capture_allowed(snapshot, commit_foreground_process.as_deref()) {
                     return Ok(None);
                 }
                 let limit = snapshot
@@ -1136,6 +1444,10 @@ fn start_clipboard_monitor(app: AppHandle, storage: SharedStorage) {
                     .and_then(Value::as_u64)
                     .unwrap_or(50)
                     .clamp(1, 500) as usize;
+                let retention_days = snapshot
+                    .pointer("/settings/clipboardRetentionDays")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(30);
                 let copied_at = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .map_err(|error| error.to_string())?
@@ -1176,7 +1488,8 @@ fn start_clipboard_monitor(app: AppHandle, storage: SharedStorage) {
                     }
                 };
                 entries.insert(0, new_entry);
-                entries.truncate(limit);
+                entries =
+                    retain_recent_clipboard_entries(entries, copied_at, retention_days, limit);
                 snapshot["clipboardHistory"] = Value::Array(entries.clone());
                 Ok(Some(entries))
             });
@@ -1188,13 +1501,24 @@ fn start_clipboard_monitor(app: AppHandle, storage: SharedStorage) {
     });
 }
 
-pub fn run() {
-    let storage =
-        Arc::new(StorageManager::initialize().expect("failed to initialize Atlas storage"));
+pub fn run() -> Result<(), String> {
+    let storage = Arc::new(
+        StorageManager::initialize()
+            .map_err(|error| format!("初始化软件安装目录内的 data 文件夹失败：{error}"))?,
+    );
     let startup_snapshot = storage.load_snapshot().unwrap_or(Value::Null);
     let launched_from_autostart = std::env::args().any(|argument| argument == "--autostart");
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(
+            |app, _arguments, _cwd| {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.unminimize();
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                }
+            },
+        ))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
@@ -1212,6 +1536,10 @@ pub fn run() {
                     if let Ok(snapshot) = storage.load_snapshot() {
                         if let Some(label) = shortcut_target(&snapshot, shortcut) {
                             show_quick_window(app, label);
+                        } else if let Some(path) = folder_shortcut_target(&snapshot, shortcut) {
+                            if let Err(error) = open_target(path, false) {
+                                eprintln!("failed to open folder shortcut target: {error}");
+                            }
                         }
                     }
                 })
@@ -1256,10 +1584,25 @@ pub fn run() {
                     .unwrap_or(true);
                 if startup_enabled {
                     let items = launcher::items_for_login_scene(&startup_snapshot);
+                    let layouts = launcher::layouts_for_login_scene(&startup_snapshot);
                     let storage_for_queue = storage.clone();
                     let app_for_queue = app.handle().clone();
                     std::thread::spawn(move || match launcher::launch_queue(items) {
                         Ok(results) => {
+                            if !layouts.is_empty() {
+                                for restored in launcher::restore_scene_layout(&layouts)
+                                    .into_iter()
+                                    .filter(|result| {
+                                        !matches!(result.status, launcher::RestoreStatus::Restored)
+                                    })
+                                {
+                                    eprintln!(
+                                        "failed to restore startup layout for {}: {}",
+                                        restored.item_id,
+                                        restored.error.as_deref().unwrap_or("window unavailable")
+                                    );
+                                }
+                            }
                             let failures = results
                                 .into_iter()
                                 .filter(|result| !result.success)
@@ -1350,6 +1693,10 @@ pub fn run() {
             get_index_count,
             rebuild_search_index,
             launch_startup_items,
+            close_previous_startup_scene,
+            capture_startup_scene_layout,
+            restore_startup_scene_layout,
+            list_startup_scene_monitors,
             run_command_task,
             open_target,
             hide_overlay,
@@ -1357,5 +1704,5 @@ pub fn run() {
             load_app_icons
         ])
         .run(tauri::generate_context!())
-        .expect("error while running Atlas desktop toolkit");
+        .map_err(|error| format!("运行 Atlas 桌面窗口失败：{error}"))
 }
