@@ -90,8 +90,20 @@ export async function getDataDirectory(): Promise<string | null> {
   return invokeNative<string>("get_data_directory");
 }
 
+export function snapshotForNativePersistence(snapshot: AppSnapshot): AppSnapshot {
+  return {
+    ...snapshot,
+    startupItems: [],
+    startupFailures: [],
+    clipboardHistory: [],
+    activity: { searches: [], copies: [] },
+  };
+}
+
 export async function saveSnapshot(snapshot: AppSnapshot): Promise<void> {
-  const saved = await invokeNative<boolean>("save_snapshot", { snapshot });
+  const saved = await invokeNative<boolean>("save_snapshot", {
+    snapshot: snapshotForNativePersistence(snapshot),
+  });
   if (!saved) localStorage.setItem(LOCAL_KEY, JSON.stringify(snapshot));
 }
 

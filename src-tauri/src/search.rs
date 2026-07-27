@@ -5,7 +5,12 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+
+#[cfg(all(target_os = "windows", not(test)))]
+use windows_sys::Win32::System::Threading::{
+    GetCurrentThread, SetThreadPriority, THREAD_MODE_BACKGROUND_BEGIN, THREAD_MODE_BACKGROUND_END,
 };
 
 use parking_lot::Mutex;
@@ -29,6 +34,8 @@ static INDEX_STATE: Mutex<IndexState> = Mutex::new(IndexState {
 });
 static INDEX_REVISION: AtomicU64 = AtomicU64::new(0);
 static QUERY_REVISION: AtomicU64 = AtomicU64::new(0);
+static LAST_QUERY_AT_MS: AtomicU64 = AtomicU64::new(0);
+static QUERY_GATE: Mutex<()> = Mutex::new(());
 static ROOT_FOLDER_CACHE: Mutex<RootFolderCache> = Mutex::new(RootFolderCache {
     scope: String::new(),
     refreshed_at: None,
@@ -41,11 +48,105 @@ const INDEXED_NAME_SEPARATOR: char = '\u{1f}';
 const RESULT_LIMIT: usize = 120;
 const CANDIDATE_LIMIT: usize = 320;
 const ROOT_FOLDER_CACHE_TTL: Duration = Duration::from_secs(5);
+#[cfg(not(test))]
+const INTERACTIVE_QUERY_GRACE_MS: u64 = 1_500;
 
 struct RootFolderCache {
     scope: String,
     refreshed_at: Option<Instant>,
     folders: Vec<SearchResult>,
+}
+
+#[cfg(all(target_os = "windows", not(test)))]
+struct BackgroundIndexPriority(bool);
+
+#[cfg(all(target_os = "windows", not(test)))]
+impl BackgroundIndexPriority {
+    fn begin() -> Self {
+        let changed =
+            unsafe { SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN) } != 0;
+        Self(changed)
+    }
+}
+
+#[cfg(all(target_os = "windows", not(test)))]
+impl Drop for BackgroundIndexPriority {
+    fn drop(&mut self) {
+        if self.0 {
+            unsafe {
+                SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END);
+            }
+        }
+    }
+}
+
+#[cfg(any(not(target_os = "windows"), test))]
+struct BackgroundIndexPriority;
+
+#[cfg(any(not(target_os = "windows"), test))]
+impl BackgroundIndexPriority {
+    fn begin() -> Self {
+        Self
+    }
+}
+
+fn epoch_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default()
+}
+
+#[cfg(not(test))]
+struct IndexThrottle {
+    enabled: bool,
+    work_started: Instant,
+}
+
+#[cfg(not(test))]
+impl IndexThrottle {
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            work_started: Instant::now(),
+        }
+    }
+
+    fn pause(&mut self) {
+        std::thread::yield_now();
+        if !self.enabled {
+            self.work_started = Instant::now();
+            return;
+        }
+        let work_time = self.work_started.elapsed();
+        let since_query = epoch_millis().saturating_sub(LAST_QUERY_AT_MS.load(Ordering::Acquire));
+        let multiplier = if since_query < INTERACTIVE_QUERY_GRACE_MS {
+            5
+        } else {
+            1
+        };
+        let pause_ms = (work_time.as_millis() as u64)
+            .saturating_mul(multiplier)
+            .clamp(2, 250);
+        std::thread::sleep(Duration::from_millis(pause_ms));
+        self.work_started = Instant::now();
+    }
+}
+
+#[cfg(test)]
+struct IndexThrottle;
+
+#[cfg(test)]
+impl IndexThrottle {
+    fn new(_enabled: bool) -> Self {
+        Self
+    }
+
+    fn pause(&mut self) {}
+}
+
+fn yield_indexer_to_interactive_work(throttle: &mut IndexThrottle) {
+    throttle.pause();
 }
 
 const SYNONYM_GROUPS: &[&[&str]] = &[
@@ -123,7 +224,7 @@ pub fn registered_apps_from_json(json: &str) -> Vec<RegisteredApp> {
 }
 
 #[cfg(all(target_os = "windows", not(test)))]
-fn registered_apps() -> Vec<RegisteredApp> {
+fn registered_apps() -> &'static [RegisteredApp] {
     REGISTERED_APPS
         .get_or_init(|| {
             let script = concat!(
@@ -139,17 +240,17 @@ fn registered_apps() -> Vec<RegisteredApp> {
                 .map(|json| registered_apps_from_json(&json))
                 .unwrap_or_default()
         })
-        .clone()
+        .as_slice()
 }
 
 #[cfg(all(not(target_os = "windows"), not(test)))]
-fn registered_apps() -> Vec<RegisteredApp> {
-    Vec::new()
+fn registered_apps() -> &'static [RegisteredApp] {
+    &[]
 }
 
 #[cfg(test)]
-fn registered_apps() -> Vec<RegisteredApp> {
-    Vec::new()
+fn registered_apps() -> &'static [RegisteredApp] {
+    &[]
 }
 
 fn normalized_search_value(value: &str) -> String {
@@ -180,10 +281,15 @@ fn pinyin_aliases(value: &str) -> Vec<String> {
     if !has_pinyin {
         return Vec::new();
     }
-    [full, initials]
-        .into_iter()
-        .filter(|alias| !alias.is_empty())
-        .collect()
+    let mut aliases = vec![full.clone(), initials];
+    // The pinyin crate resolves characters independently. Keep a small set of
+    // high-value phrase pronunciations so common product names remain natural
+    // to type (for example, 音乐 is yin-yue rather than yin-le).
+    if value.contains("音乐") && full.contains("yinle") {
+        aliases.push(full.replace("yinle", "yinyue"));
+    }
+    aliases.retain(|alias| !alias.is_empty());
+    aliases
 }
 
 fn expanded_search_terms(query: &str) -> Vec<String> {
@@ -206,11 +312,12 @@ fn expanded_search_terms(query: &str) -> Vec<String> {
     terms
 }
 
-fn encode_indexed_name(name: &str) -> String {
+fn encode_indexed_name(name: &str, kind: &str) -> String {
     let mut aliases = pinyin_aliases(name);
-    let fuzzy_sources = std::iter::once(name.to_string())
-        .chain(aliases.iter().cloned())
-        .collect::<Vec<_>>();
+    let mut fuzzy_sources = vec![name.to_string()];
+    if matches!(kind, "app" | "folder") || name.chars().any(|character| !character.is_ascii()) {
+        fuzzy_sources.extend(aliases.iter().cloned());
+    }
     for source in fuzzy_sources {
         aliases.extend(fuzzy_bigram_tokens(&source));
     }
@@ -386,6 +493,25 @@ fn fts_candidate_expression(terms: &[String]) -> Option<String> {
                     tokens.push(quote_fts_term(&trigram));
                 }
             }
+        }
+    }
+    (!tokens.is_empty()).then(|| tokens.join(" OR "))
+}
+
+fn fts_exact_expression(terms: &[String]) -> Option<String> {
+    let mut tokens = Vec::new();
+    let mut seen = HashSet::new();
+    for term in terms {
+        for candidate in [term.trim().to_lowercase(), normalized_search_value(term)] {
+            let character_count = candidate.chars().count();
+            if character_count < 2 || !seen.insert(candidate.clone()) {
+                continue;
+            }
+            tokens.push(if character_count == 2 {
+                quote_fts_term(&format!("~{candidate}"))
+            } else {
+                quote_fts_term(&candidate)
+            });
         }
     }
     (!tokens.is_empty()).then(|| tokens.join(" OR "))
@@ -813,7 +939,7 @@ fn distinct_roots(roots: Vec<PathBuf>) -> Vec<PathBuf> {
 
 fn scope_key(requested_roots: &[String]) -> String {
     if requested_roots.is_empty() || requested_roots.iter().any(|root| root == "*") {
-        return "[\"v7\",\"*\"]".to_string();
+        return "[\"v8\",\"*\"]".to_string();
     }
     let mut roots = distinct_roots(requested_roots.iter().map(PathBuf::from).collect())
         .iter()
@@ -827,7 +953,7 @@ fn scope_key(requested_roots: &[String]) -> String {
         })
         .collect::<Vec<_>>();
     roots.sort();
-    roots.insert(0, "v7".to_string());
+    roots.insert(0, "v8".to_string());
     serde_json::to_string(&roots).unwrap_or_else(|_| "[]".to_string())
 }
 
@@ -893,6 +1019,7 @@ fn rebuild_at_revision(
 }
 
 const INDEX_BATCH_SIZE: usize = 2_048;
+const INDEX_COPY_BATCH_SIZE: usize = 16_384;
 
 struct StagingFileGuard(PathBuf);
 
@@ -933,6 +1060,8 @@ fn rebuild_inner(
     requested_roots: Vec<String>,
     revision: u64,
 ) -> Result<usize, String> {
+    let _background_priority = BackgroundIndexPriority::begin();
+    let mut throttle = IndexThrottle::new(include_application_roots(&requested_roots));
     let scope = scope_key(&requested_roots);
     #[cfg(not(test))]
     let include_apps = include_application_roots(&requested_roots);
@@ -981,7 +1110,7 @@ fn rebuild_inner(
     let mut count = 0usize;
     let mut indexed_app_paths = HashSet::new();
 
-    for app in &system_apps {
+    for app in system_apps {
         if !path_matches_roots(Path::new(&app.path), &requested_roots)
             || is_noisy_application(Path::new(&app.path))
             || is_noisy_app_name(&app.name)
@@ -994,10 +1123,15 @@ fn rebuild_inner(
             app.path.clone()
         };
         indexed_app_paths.insert(path_key);
-        batch.push((encode_indexed_name(&app.name), app.path.clone(), "app"));
+        batch.push((
+            encode_indexed_name(&app.name, "app"),
+            app.path.clone(),
+            "app",
+        ));
         count += 1;
         if batch.len() >= INDEX_BATCH_SIZE {
             flush_index_batch(&mut staging, &mut batch)?;
+            yield_indexer_to_interactive_work(&mut throttle);
             if INDEX_REVISION.load(Ordering::Acquire) != revision {
                 return Err("索引范围已更新，正在切换到最新目录".into());
             }
@@ -1039,10 +1173,11 @@ fn rebuild_inner(
             // WalkDir already resolved the file type. Avoid another metadata
             // syscall for every item: modification time is optional in the UI,
             // while stat-ing millions of paths dominates a full-disk rebuild.
-            batch.push((encode_indexed_name(&name), display_path, kind));
+            batch.push((encode_indexed_name(&name, kind), display_path, kind));
             count += 1;
             if batch.len() >= INDEX_BATCH_SIZE {
                 flush_index_batch(&mut staging, &mut batch)?;
+                yield_indexer_to_interactive_work(&mut throttle);
                 if INDEX_REVISION.load(Ordering::Acquire) != revision {
                     return Err("索引范围已更新，正在切换到最新目录".into());
                 }
@@ -1056,38 +1191,62 @@ fn rebuild_inner(
     }
 
     let staging_display = staging_path.to_string_lossy().to_string();
-    let swap_result = storage.with_connection(|connection| {
+    let swap_result = storage.with_background_connection(|connection| {
         connection
             .execute("ATTACH DATABASE ?1 AS staging", [&staging_display])
             .map_err(|error| error.to_string())?;
         let operation = (|| -> Result<usize, String> {
-            let transaction = connection
-                .transaction()
-                .map_err(|error| error.to_string())?;
-            transaction
-                .execute("DELETE FROM search_fts", [])
+            connection
+                .execute_batch(
+                    "
+                    DROP TABLE IF EXISTS search_fts_next;
+                    CREATE VIRTUAL TABLE search_fts_next USING fts5(
+                        name,
+                        path UNINDEXED,
+                        kind UNINDEXED,
+                        modified_at UNINDEXED,
+                        tokenize = 'trigram'
+                    );
+                    ",
+                )
                 .map_err(|error| error.to_string())?;
             let mut copied = 0usize;
             while copied < count {
                 if INDEX_REVISION.load(Ordering::Acquire) != revision {
                     return Err("索引范围已更新，正在切换到最新目录".into());
                 }
+                let transaction = connection
+                    .transaction()
+                    .map_err(|error| error.to_string())?;
                 transaction
                     .execute(
                         "
-                INSERT INTO search_fts(rowid, name, path, kind, modified_at)
+                INSERT INTO search_fts_next(rowid, name, path, kind, modified_at)
                 SELECT rowid, name, path, kind, modified_at
-                FROM staging.search_entries
-                WHERE rowid > ?1 AND rowid <= ?2
-                ",
-                        params![copied, copied + INDEX_BATCH_SIZE],
+                        FROM staging.search_entries
+                        WHERE rowid > ?1 AND rowid <= ?2
+                        ",
+                        params![copied, copied + INDEX_COPY_BATCH_SIZE],
                     )
                     .map_err(|error| error.to_string())?;
-                copied += INDEX_BATCH_SIZE;
+                transaction.commit().map_err(|error| error.to_string())?;
+                copied += INDEX_COPY_BATCH_SIZE;
+                yield_indexer_to_interactive_work(&mut throttle);
             }
             if INDEX_REVISION.load(Ordering::Acquire) != revision {
                 return Err("索引范围已更新，正在切换到最新目录".into());
             }
+            let transaction = connection
+                .transaction()
+                .map_err(|error| error.to_string())?;
+            transaction
+                .execute_batch(
+                    "
+                    DROP TABLE search_fts;
+                    ALTER TABLE search_fts_next RENAME TO search_fts;
+                    ",
+                )
+                .map_err(|error| error.to_string())?;
             transaction
                 .execute(
                     "
@@ -1107,6 +1266,9 @@ fn rebuild_inner(
         let detach_result = connection
             .execute_batch("DETACH DATABASE staging")
             .map_err(|error| error.to_string());
+        if operation.is_err() {
+            let _ = connection.execute_batch("DROP TABLE IF EXISTS search_fts_next;");
+        }
         operation.and(detach_result.map(|_| count))
     });
     swap_result
@@ -1160,6 +1322,7 @@ pub fn count(storage: &StorageManager) -> Result<usize, String> {
 }
 
 pub fn begin_query() -> u64 {
+    LAST_QUERY_AT_MS.store(epoch_millis(), Ordering::Release);
     QUERY_REVISION.fetch_add(1, Ordering::AcqRel) + 1
 }
 
@@ -1195,6 +1358,89 @@ pub fn query_latest(
     )
 }
 
+fn indexed_candidates(
+    connection: &Connection,
+    expression: &str,
+    kind: &str,
+    extension_pattern: &str,
+    drive_pattern: &str,
+    root_filter: &str,
+) -> Result<Vec<SearchResult>, String> {
+    let mut statement = connection
+        .prepare(
+            "
+            SELECT rowid, name, path, kind, modified_at
+            FROM search_fts
+            WHERE search_fts MATCH ?1
+              AND (?2 = '' OR kind = ?2)
+              AND (?3 = '' OR lower(path) LIKE ?3)
+              AND (?4 = '' OR lower(path) LIKE ?4)
+              AND (
+                ?5 = ''
+                OR EXISTS (
+                  SELECT 1 FROM json_each(?5)
+                  WHERE lower(replace(search_fts.path, '/', char(92))) = value
+                     OR substr(
+                          lower(replace(search_fts.path, '/', char(92))),
+                          1,
+                          length(value) + 1
+                        ) = value || char(92)
+                )
+              )
+              AND NOT (
+                kind = 'app' AND (
+                    lower(name) LIKE '%uninstall%'
+                    OR lower(name) LIKE '%reporter%'
+                    OR lower(name) LIKE '%crash%'
+                    OR lower(name) LIKE '%minidump%'
+                    OR lower(name) LIKE '%helper%'
+                    OR lower(name) LIKE '%updater%'
+                    OR lower(name) LIKE '%installer%'
+                    OR lower(path) LIKE '%uninstall%'
+                    OR lower(path) LIKE '%reporter%'
+                    OR lower(path) LIKE '%minidump%'
+                    OR lower(path) LIKE '%helper%'
+                )
+              )
+            ORDER BY
+                CASE kind
+                    WHEN 'app' THEN 0
+                    WHEN 'folder' THEN 1
+                    ELSE 2
+                END,
+                bm25(search_fts),
+                length(name),
+                name
+            LIMIT ?6
+            ",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map(
+            params![
+                expression,
+                kind,
+                extension_pattern,
+                drive_pattern,
+                root_filter,
+                CANDIDATE_LIMIT as i64
+            ],
+            |row| {
+                let indexed_name = row.get::<_, String>(1)?;
+                Ok(SearchResult {
+                    id: format!("index-{}", row.get::<_, i64>(0)?),
+                    name: indexed_display_name(&indexed_name).to_string(),
+                    path: row.get(2)?,
+                    kind: row.get(3)?,
+                    modified_at: row.get(4)?,
+                })
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())
+}
+
 fn query_inner(
     storage: &StorageManager,
     query: &str,
@@ -1204,28 +1450,22 @@ fn query_inner(
     roots: &[String],
     query_revision: Option<u64>,
 ) -> Result<Vec<SearchResult>, String> {
+    let _query_guard = QUERY_GATE.lock();
+    if query_revision.is_some_and(|revision| QUERY_REVISION.load(Ordering::Acquire) != revision) {
+        return Ok(Vec::new());
+    }
     let normalized = query.trim();
     if normalized.is_empty() {
         return Ok(Vec::new());
     }
     let terms = expanded_search_terms(normalized);
-    let mut application_results = registered_app_results(
-        &registered_apps(),
-        normalized,
-        kind,
-        extension,
-        drive,
-        roots,
-    );
+    let mut application_results =
+        registered_app_results(registered_apps(), normalized, kind, extension, drive, roots);
     if query_revision.is_some_and(|revision| QUERY_REVISION.load(Ordering::Acquire) != revision) {
         return Ok(Vec::new());
     }
-    // Indexed bigram aliases make short synonyms and one-character
-    // substitutions eligible for the same bounded FTS candidate path.
-    let fts_expression = fts_candidate_expression(&terms);
-    let candidate_pattern = fts_expression
-        .clone()
-        .unwrap_or_else(|| format!("%{}%", normalized.replace('%', "\\%").replace('_', "\\_")));
+    let exact_expression = fts_exact_expression(&terms);
+    let fuzzy_expression = fts_candidate_expression(&terms);
     let extension_pattern = if extension.trim().is_empty() {
         String::new()
     } else {
@@ -1254,97 +1494,29 @@ fn query_inner(
     // A one-character term has no useful trigram. Falling back to `%x%` scans
     // the entire FTS table on every keystroke, so keep these queries to the
     // small registered-app and cached root-folder sets.
-    let indexed_results = if fts_expression.is_none() {
+    let indexed_results = if exact_expression.is_none() {
         Vec::new()
     } else {
         storage.with_read_connection(|connection| {
-            let candidate_clause = if fts_expression.is_some() {
-                "search_fts MATCH ?1"
-            } else {
-                "(name LIKE ?1 ESCAPE '\\' COLLATE NOCASE
-                OR path LIKE ?1 ESCAPE '\\' COLLATE NOCASE)"
-            };
-            let relevance_clause = if fts_expression.is_some() {
-                "bm25(search_fts),"
-            } else {
-                ""
-            };
-            let sql = format!(
-                "
-            SELECT rowid, name, path, kind, modified_at
-            FROM search_fts
-            WHERE {candidate_clause}
-              AND (?3 = '' OR kind = ?3)
-              AND (?4 = '' OR lower(path) LIKE ?4)
-              AND (?5 = '' OR lower(path) LIKE ?5)
-              AND (
-                ?6 = ''
-                OR EXISTS (
-                  SELECT 1 FROM json_each(?6)
-                  WHERE lower(replace(search_fts.path, '/', char(92))) = value
-                     OR substr(
-                          lower(replace(search_fts.path, '/', char(92))),
-                          1,
-                          length(value) + 1
-                        )
-                        = value || char(92)
-                )
-              )
-              AND NOT (
-                kind = 'app' AND (
-                    lower(name) LIKE '%uninstall%'
-                    OR lower(name) LIKE '%reporter%'
-                    OR lower(name) LIKE '%crash%'
-                    OR lower(name) LIKE '%minidump%'
-                    OR lower(name) LIKE '%helper%'
-                    OR lower(name) LIKE '%updater%'
-                    OR lower(name) LIKE '%installer%'
-                    OR lower(path) LIKE '%uninstall%'
-                    OR lower(path) LIKE '%reporter%'
-                    OR lower(path) LIKE '%minidump%'
-                    OR lower(path) LIKE '%helper%'
-                )
-              )
-            ORDER BY
-                CASE kind
-                    WHEN 'app' THEN 0
-                    WHEN 'folder' THEN 1
-                    ELSE 2
-                END,
-                {relevance_clause}
-                length(name),
-                name
-            LIMIT {CANDIDATE_LIMIT}
-            "
-            );
-            let mut statement = connection
-                .prepare(&sql)
-                .map_err(|error| error.to_string())?;
-            let rows = statement
-                .query_map(
-                    params![
-                        candidate_pattern,
-                        normalized,
-                        kind,
-                        extension_pattern,
-                        drive_pattern,
-                        root_filter
-                    ],
-                    |row| {
-                        let indexed_name = row.get::<_, String>(1)?;
-                        let display_name = indexed_display_name(&indexed_name);
-                        Ok(SearchResult {
-                            id: format!("index-{}", row.get::<_, i64>(0)?),
-                            name: display_name.to_string(),
-                            path: row.get(2)?,
-                            kind: row.get(3)?,
-                            modified_at: row.get(4)?,
-                        })
-                    },
-                )
-                .map_err(|error| error.to_string())?;
-            rows.collect::<Result<Vec<_>, _>>()
-                .map_err(|error| error.to_string())
+            let exact = indexed_candidates(
+                connection,
+                exact_expression.as_deref().unwrap_or_default(),
+                kind,
+                &extension_pattern,
+                &drive_pattern,
+                &root_filter,
+            )?;
+            if !exact.is_empty() || fuzzy_expression == exact_expression {
+                return Ok(exact);
+            }
+            indexed_candidates(
+                connection,
+                fuzzy_expression.as_deref().unwrap_or_default(),
+                kind,
+                &extension_pattern,
+                &drive_pattern,
+                &root_filter,
+            )
         })?
     };
     if query_revision.is_some_and(|revision| QUERY_REVISION.load(Ordering::Acquire) != revision) {

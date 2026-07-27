@@ -98,7 +98,6 @@ import {
   runCommandTask,
   searchNative,
 } from "./native";
-import QuickOverlay from "./QuickOverlay";
 import { SearchQueryInput } from "./SearchQueryInput";
 import WindowChrome from "./WindowChrome";
 import type {
@@ -198,10 +197,6 @@ const demoSearchResults: SearchResult[] = [
 ];
 
 export default function App() {
-  const overlay = new URLSearchParams(window.location.search).get("overlay");
-  if (overlay === "search" || overlay === "prompts" || overlay === "clipboard") {
-    return <QuickOverlay mode={overlay} />;
-  }
   return (
     <div className="desktop-frame">
       <WindowChrome />

@@ -87,7 +87,7 @@ impl StorageManager {
             data_dir: RwLock::new(data_dir),
             operation_gate: Mutex::new(()),
         };
-        manager.with_connection(|_| Ok(()))?;
+        manager.initialize_database()?;
         Ok(manager)
     }
 
@@ -107,7 +107,7 @@ impl StorageManager {
             data_dir: RwLock::new(data_dir),
             operation_gate: Mutex::new(()),
         };
-        manager.with_connection(|_| Ok(()))?;
+        manager.initialize_database()?;
         Ok(manager)
     }
 
@@ -119,6 +119,7 @@ impl StorageManager {
         self.data_dir().join(DATABASE_NAME)
     }
 
+    #[cfg(test)]
     pub fn with_connection<T>(
         &self,
         operation: impl FnOnce(&mut Connection) -> Result<T, String>,
@@ -143,6 +144,14 @@ impl StorageManager {
         operation(&connection)
     }
 
+    pub fn with_background_connection<T>(
+        &self,
+        operation: impl FnOnce(&mut Connection) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let mut connection = self.open_connection()?;
+        operation(&mut connection)
+    }
+
     fn open_connection(&self) -> Result<Connection, String> {
         let database_path = self.database_path();
         if let Some(parent) = database_path.parent() {
@@ -153,10 +162,18 @@ impl StorageManager {
             .busy_timeout(Duration::from_secs(8))
             .map_err(|error| error.to_string())?;
         connection
+            .execute_batch("PRAGMA synchronous = NORMAL;")
+            .map_err(|error| error.to_string())?;
+        Ok(connection)
+    }
+
+    fn initialize_database(&self) -> Result<(), String> {
+        let _operation = self.operation_gate.lock();
+        let connection = self.open_connection()?;
+        connection
             .execute_batch(
                 "
                 PRAGMA journal_mode = WAL;
-                PRAGMA synchronous = NORMAL;
                 CREATE TABLE IF NOT EXISTS app_state (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL,
@@ -179,7 +196,10 @@ impl StorageManager {
         );
         let has_trigram_schema = fts_schema
             .as_ref()
-            .map(|schema| schema.to_ascii_lowercase().contains("trigram"))
+            .map(|schema| {
+                let schema = schema.to_ascii_lowercase();
+                schema.contains("trigram") && schema.contains("path unindexed")
+            })
             .unwrap_or(false);
         if !has_trigram_schema {
             connection
@@ -188,7 +208,7 @@ impl StorageManager {
                     DROP TABLE IF EXISTS search_fts;
                     CREATE VIRTUAL TABLE search_fts USING fts5(
                         name,
-                        path,
+                        path UNINDEXED,
                         kind UNINDEXED,
                         modified_at UNINDEXED,
                         tokenize = 'trigram'
@@ -197,11 +217,14 @@ impl StorageManager {
                 )
                 .map_err(|error| error.to_string())?;
         }
-        Ok(connection)
+        connection
+            .execute_batch("DROP TABLE IF EXISTS search_fts_next;")
+            .map_err(|error| error.to_string())?;
+        Ok(())
     }
 
     pub fn load_snapshot(&self) -> Result<serde_json::Value, String> {
-        self.with_connection(|connection| {
+        self.with_read_connection(|connection| {
             let mut statement = connection
                 .prepare("SELECT value FROM app_state WHERE key = 'snapshot'")
                 .map_err(|error| error.to_string())?;

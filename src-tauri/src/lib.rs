@@ -20,14 +20,14 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
 use serde_json::Value;
 use storage::StorageManager;
 use tauri::{
     menu::{Menu, MenuItem},
     tray::TrayIconBuilder,
-    AppHandle, Emitter, Manager, State, WindowEvent,
+    AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder, WindowEvent,
 };
 use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_clipboard_manager::ClipboardExt;
@@ -37,8 +37,9 @@ use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::{
     Foundation::CloseHandle,
-    System::Threading::{
-        OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
+    System::{
+        DataExchange::GetClipboardSequenceNumber,
+        Threading::{OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION},
     },
     UI::{
         Input::KeyboardAndMouse::{keybd_event, KEYEVENTF_KEYUP, VK_CONTROL},
@@ -51,8 +52,59 @@ use windows_sys::Win32::{
 
 type SharedStorage = Arc<StorageManager>;
 static REGISTERED_SHORTCUTS: Mutex<BTreeMap<String, String>> = Mutex::new(BTreeMap::new());
+static RUNTIME_SHORTCUT_SNAPSHOT: RwLock<Value> = RwLock::new(Value::Null);
+static RUNTIME_SEARCH_SNAPSHOT: RwLock<Value> = RwLock::new(Value::Null);
 #[cfg(target_os = "windows")]
 static LAST_CLIPBOARD_TARGET: Mutex<Option<usize>> = Mutex::new(None);
+
+#[derive(Default)]
+struct ClipboardSequenceTracker {
+    last_seen: Option<u32>,
+    failing_sequence: Option<u32>,
+    failed_attempts: u8,
+}
+
+impl ClipboardSequenceTracker {
+    fn should_attempt(&self, sequence: Option<u32>) -> bool {
+        sequence.is_none() || self.last_seen != sequence
+    }
+
+    fn commit(&mut self, sequence: Option<u32>) {
+        if sequence.is_some() {
+            self.last_seen = sequence;
+        }
+        self.failing_sequence = None;
+        self.failed_attempts = 0;
+    }
+
+    fn record_failure(&mut self, sequence: Option<u32>) -> bool {
+        let Some(sequence) = sequence else {
+            return false;
+        };
+        if self.failing_sequence == Some(sequence) {
+            self.failed_attempts = self.failed_attempts.saturating_add(1);
+        } else {
+            self.failing_sequence = Some(sequence);
+            self.failed_attempts = 1;
+        }
+        if self.failed_attempts < 5 {
+            return false;
+        }
+        self.commit(Some(sequence));
+        true
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn clipboard_sequence_number() -> Option<u32> {
+    let sequence = unsafe { GetClipboardSequenceNumber() };
+    (sequence != 0).then_some(sequence)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn clipboard_sequence_number() -> Option<u32> {
+    None
+}
 
 pub(crate) fn startup_log_path_for_executable(executable: &Path) -> PathBuf {
     domain::default_data_directory(executable).join("atlas-startup.log")
@@ -548,6 +600,8 @@ fn save_snapshot(
     let mut changed_filters: Option<Value> = None;
     let mut rejected_runtime: Option<(Value, Value, String)> = None;
     let mut runtime_transition: Option<(Value, Value)> = None;
+    let mut retained_clipboard_entries = Vec::new();
+    let mut search_runtime_snapshot = None;
     let saved = storage.update_snapshot(|previous| {
         let previous_snapshot = previous.clone();
         let mut sanitized = snapshot;
@@ -586,6 +640,11 @@ fn save_snapshot(
             retention_days,
             clipboard_limit,
         ));
+        retained_clipboard_entries = sanitized["clipboardHistory"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        search_runtime_snapshot = Some(runtime_search_snapshot(&sanitized));
         sanitized["activity"] = previous
             .get("activity")
             .cloned()
@@ -624,14 +683,10 @@ fn save_snapshot(
         *previous = sanitized;
         Ok(true)
     })?;
-    if let Ok(current) = storage.load_snapshot() {
-        let entries = current
-            .get("clipboardHistory")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        cleanup_clipboard_images(&storage, &entries);
+    if let Some(snapshot) = search_runtime_snapshot {
+        *RUNTIME_SEARCH_SNAPSHOT.write() = snapshot;
     }
+    cleanup_clipboard_images(&storage, &retained_clipboard_entries);
     if let Some((previous, proposed)) = runtime_transition {
         if let Err(error) = apply_runtime_settings(&app, &previous, &proposed, false) {
             let proposed_tools = proposed
@@ -827,16 +882,12 @@ async fn search_index(
     drive: String,
 ) -> Result<Vec<search::SearchResult>, String> {
     let storage = storage.inner().clone();
-    let query_revision = search::begin_query();
-    tauri::async_runtime::spawn_blocking(move || {
-        let snapshot = storage.load_snapshot()?;
+    let (enabled, roots) = {
+        let snapshot = RUNTIME_SEARCH_SNAPSHOT.read();
         let enabled = snapshot
             .pointer("/tools/search/enabled")
             .and_then(Value::as_bool)
             .unwrap_or(true);
-        if !enabled {
-            return Err("全局搜索当前已暂停".into());
-        }
         let roots = snapshot
             .pointer("/settings/indexRoots")
             .and_then(Value::as_array)
@@ -848,6 +899,13 @@ async fn search_index(
                     .collect::<Vec<_>>()
             })
             .unwrap_or_else(|| vec!["*".into()]);
+        (enabled, roots)
+    };
+    if !enabled {
+        return Err("全局搜索当前已暂停".into());
+    }
+    let query_revision = search::begin_query();
+    tauri::async_runtime::spawn_blocking(move || {
         search::query_latest(
             &storage,
             &query,
@@ -1158,7 +1216,14 @@ foreach ($request in @($requests)) {
 
 fn reconcile_shortcuts(app: &AppHandle, snapshot: &Value) -> Result<(), String> {
     let actual = REGISTERED_SHORTCUTS.lock().clone();
-    let desired = desired_shortcuts(snapshot)?;
+    let desired = match desired_shortcuts(snapshot) {
+        Ok(desired) => desired,
+        Err(error) => {
+            *RUNTIME_SHORTCUT_SNAPSHOT.write() =
+                runtime_shortcut_snapshot_for_registered(snapshot, &actual);
+            return Err(error);
+        }
+    };
     let delta = shortcut_registration_delta(&actual, snapshot)?;
     let mut unregistered: Vec<String> = Vec::new();
     let mut newly_registered: Vec<String> = Vec::new();
@@ -1168,6 +1233,8 @@ fn reconcile_shortcuts(app: &AppHandle, snapshot: &Value) -> Result<(), String> 
             for previous in &unregistered {
                 let _ = app.global_shortcut().register(previous.as_str());
             }
+            *RUNTIME_SHORTCUT_SNAPSHOT.write() =
+                runtime_shortcut_snapshot_for_registered(snapshot, &actual);
             return Err(format!("注销快捷键 {shortcut} 失败：{error}"));
         }
         unregistered.push(shortcut.clone());
@@ -1187,6 +1254,8 @@ fn reconcile_shortcuts(app: &AppHandle, snapshot: &Value) -> Result<(), String> 
                         .map(|rollback| format!("{previous}: {rollback}"))
                 })
                 .collect::<Vec<_>>();
+            *RUNTIME_SHORTCUT_SNAPSHOT.write() =
+                runtime_shortcut_snapshot_for_registered(snapshot, &actual);
             return Err(if rollback_errors.is_empty() {
                 format!("注册快捷键 {shortcut} 失败：{error}；原快捷键已恢复")
             } else {
@@ -1199,7 +1268,82 @@ fn reconcile_shortcuts(app: &AppHandle, snapshot: &Value) -> Result<(), String> 
         newly_registered.push(shortcut.clone());
     }
     *REGISTERED_SHORTCUTS.lock() = desired;
+    *RUNTIME_SHORTCUT_SNAPSHOT.write() =
+        runtime_shortcut_snapshot_for_registered(snapshot, &REGISTERED_SHORTCUTS.lock());
     Ok(())
+}
+
+#[cfg(test)]
+fn runtime_shortcut_snapshot(snapshot: &Value) -> Value {
+    let registered = desired_shortcuts(snapshot).unwrap_or_default();
+    runtime_shortcut_snapshot_for_registered(snapshot, &registered)
+}
+
+fn runtime_shortcut_snapshot_for_registered(
+    snapshot: &Value,
+    registered: &BTreeMap<String, String>,
+) -> Value {
+    let mut tools = serde_json::Map::new();
+    for tool in ["search", "prompts", "clipboard", "folders"] {
+        tools.insert(
+            tool.to_string(),
+            serde_json::json!({
+                "enabled": snapshot
+                    .pointer(&format!("/tools/{tool}/enabled"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true)
+            }),
+        );
+    }
+    let mut shortcuts = serde_json::Map::new();
+    for tool in ["search", "prompts", "clipboard"] {
+        if let Some(shortcut) = registered.get(tool) {
+            shortcuts.insert(tool.to_string(), Value::String(shortcut.clone()));
+        }
+    }
+    let folder_favorites = snapshot
+        .get("folderFavorites")
+        .and_then(Value::as_array)
+        .map(|favorites| {
+            favorites
+                .iter()
+                .filter_map(|favorite| {
+                    let id = favorite.get("id")?.as_str()?;
+                    let shortcut = registered.get(&format!("folder:{id}"))?;
+                    Some(serde_json::json!({
+                        "path": favorite.get("path")?.as_str()?,
+                        "shortcut": shortcut
+                    }))
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    serde_json::json!({
+        "tools": tools,
+        "settings": {
+            "shortcuts": shortcuts
+        },
+        "folderFavorites": folder_favorites
+    })
+}
+
+fn runtime_search_snapshot(snapshot: &Value) -> Value {
+    serde_json::json!({
+        "tools": {
+            "search": {
+                "enabled": snapshot
+                    .pointer("/tools/search/enabled")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true)
+            }
+        },
+        "settings": {
+            "indexRoots": snapshot
+                .pointer("/settings/indexRoots")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!(["*"]))
+        }
+    })
 }
 
 fn apply_runtime_settings(
@@ -1277,6 +1421,34 @@ fn show_quick_window(app: &AppHandle, label: &str) {
             let _ = window.set_focus();
             let _ = app.emit_to(label, "atlas-overlay-focus", ());
         }
+        return;
+    }
+    let Some((overlay, title, width, height)) = (match label {
+        "search-overlay" => Some(("search", "Atlas Search", 760.0, 560.0)),
+        "prompts-overlay" => Some(("prompts", "Atlas Prompts", 700.0, 520.0)),
+        "clipboard-overlay" => Some(("clipboard", "Atlas Clipboard", 700.0, 520.0)),
+        _ => None,
+    }) else {
+        return;
+    };
+    if label == "clipboard-overlay" {
+        remember_clipboard_target();
+    }
+    let url = WebviewUrl::App(format!("index.html?overlay={overlay}").into());
+    match WebviewWindowBuilder::new(app, label, url)
+        .title(title)
+        .inner_size(width, height)
+        .center()
+        .decorations(false)
+        .always_on_top(true)
+        .skip_taskbar(true)
+        .resizable(false)
+        .build()
+    {
+        Ok(window) => {
+            let _ = window.set_focus();
+        }
+        Err(error) => eprintln!("failed to create {label}: {error}"),
     }
 }
 
@@ -1392,14 +1564,23 @@ fn folder_shortcut_target(snapshot: &Value, shortcut: &Shortcut) -> Option<Strin
 fn start_clipboard_monitor(app: AppHandle, storage: SharedStorage) {
     std::thread::spawn(move || {
         let mut last_seen = String::new();
+        let mut sequence_tracker = ClipboardSequenceTracker::default();
         loop {
             std::thread::sleep(std::time::Duration::from_millis(700));
+            let sequence = clipboard_sequence_number();
+            if !sequence_tracker.should_attempt(sequence) {
+                continue;
+            }
             let policy_snapshot = match storage.load_snapshot() {
                 Ok(snapshot) => snapshot,
-                Err(_) => continue,
+                Err(_) => {
+                    sequence_tracker.record_failure(sequence);
+                    continue;
+                }
             };
             let foreground_process = foreground_process_name();
             if !clipboard_capture_allowed(&policy_snapshot, foreground_process.as_deref()) {
+                sequence_tracker.commit(sequence);
                 continue;
             }
             enum ClipboardContent {
@@ -1414,10 +1595,12 @@ fn start_clipboard_monitor(app: AppHandle, storage: SharedStorage) {
                 }
                 Err(_) => {
                     let Ok(text) = app.clipboard().read_text() else {
+                        sequence_tracker.record_failure(sequence);
                         continue;
                     };
                     let text = text.trim().to_string();
                     if text.is_empty() {
+                        sequence_tracker.commit(sequence);
                         continue;
                     }
                     ClipboardContent::Text(text)
@@ -1429,12 +1612,13 @@ fn start_clipboard_monitor(app: AppHandle, storage: SharedStorage) {
             };
             let commit_foreground_process = foreground_process_name();
             if !clipboard_capture_allowed(&policy_snapshot, commit_foreground_process.as_deref()) {
+                sequence_tracker.commit(sequence);
                 continue;
             }
             if marker == last_seen {
+                sequence_tracker.commit(sequence);
                 continue;
             }
-            last_seen = marker;
             let update = storage.update_snapshot(|snapshot| {
                 if !clipboard_capture_allowed(snapshot, commit_foreground_process.as_deref()) {
                     return Ok(None);
@@ -1493,9 +1677,17 @@ fn start_clipboard_monitor(app: AppHandle, storage: SharedStorage) {
                 snapshot["clipboardHistory"] = Value::Array(entries.clone());
                 Ok(Some(entries))
             });
-            if let Ok(Some(entries)) = update {
-                cleanup_clipboard_images(&storage, &entries);
-                let _ = app.emit("atlas-clipboard-history", entries);
+            match update {
+                Ok(Some(entries)) => {
+                    last_seen = marker;
+                    sequence_tracker.commit(sequence);
+                    cleanup_clipboard_images(&storage, &entries);
+                    let _ = app.emit("atlas-clipboard-history", entries);
+                }
+                Ok(None) => sequence_tracker.commit(sequence),
+                Err(_) => {
+                    sequence_tracker.record_failure(sequence);
+                }
             }
         }
     });
@@ -1507,6 +1699,7 @@ pub fn run() -> Result<(), String> {
             .map_err(|error| format!("初始化软件安装目录内的 data 文件夹失败：{error}"))?,
     );
     let startup_snapshot = storage.load_snapshot().unwrap_or(Value::Null);
+    *RUNTIME_SEARCH_SNAPSHOT.write() = runtime_search_snapshot(&startup_snapshot);
     let launched_from_autostart = std::env::args().any(|argument| argument == "--autostart");
 
     tauri::Builder::default()
@@ -1532,14 +1725,18 @@ pub fn run() -> Result<(), String> {
                     if event.state() != ShortcutState::Pressed {
                         return;
                     }
-                    let storage = app.state::<SharedStorage>();
-                    if let Ok(snapshot) = storage.load_snapshot() {
-                        if let Some(label) = shortcut_target(&snapshot, shortcut) {
-                            show_quick_window(app, label);
-                        } else if let Some(path) = folder_shortcut_target(&snapshot, shortcut) {
-                            if let Err(error) = open_target(path, false) {
-                                eprintln!("failed to open folder shortcut target: {error}");
-                            }
+                    let (label, folder) = {
+                        let snapshot = RUNTIME_SHORTCUT_SNAPSHOT.read();
+                        (
+                            shortcut_target(&snapshot, shortcut),
+                            folder_shortcut_target(&snapshot, shortcut),
+                        )
+                    };
+                    if let Some(label) = label {
+                        show_quick_window(app, label);
+                    } else if let Some(path) = folder {
+                        if let Err(error) = open_target(path, false) {
+                            eprintln!("failed to open folder shortcut target: {error}");
                         }
                     }
                 })

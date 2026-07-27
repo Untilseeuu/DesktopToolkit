@@ -1557,6 +1557,27 @@ kbd {
   color: color-mix(in srgb, var(--muted) 72%, transparent);
 }
 
+.search-query-clear {
+  display: grid;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  place-items: center;
+  color: var(--muted);
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  font: inherit;
+  font-size: 20px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.search-query-clear:hover {
+  color: var(--ink);
+  background: color-mix(in srgb, var(--ink) 8%, transparent);
+}
+
 .shortcut-inline {
   display: flex;
   align-items: center;

@@ -5,12 +5,16 @@ mod tests {
     use crate::launcher::{launch_queue, validate_startup_item, StartupItem};
     use crate::{
         cleanup_clipboard_images, clipboard_file_path, desired_shortcuts, folder_shortcut_target,
-        search, shortcut_target, storage::StorageManager,
+        runtime_search_snapshot, runtime_shortcut_snapshot,
+        runtime_shortcut_snapshot_for_registered, search, shortcut_target, storage::StorageManager,
+        ClipboardSequenceTracker,
     };
-    use std::str::FromStr;
+    use serde_json::Value;
     use std::{
+        collections::BTreeMap,
         fs,
         path::Path,
+        str::FromStr,
         sync::Mutex,
         time::{SystemTime, UNIX_EPOCH},
     };
@@ -110,6 +114,192 @@ mod tests {
         assert!(!legacy_pointer.exists());
         drop(storage);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn loading_snapshot_never_runs_schema_migrations_or_mutates_tables() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("atlas-read-only-load-{nonce}"));
+        let storage =
+            StorageManager::for_test(directory.join("bootstrap"), directory.join("data")).unwrap();
+        storage
+            .with_connection(|connection| {
+                connection
+                    .execute_batch(
+                        "
+                        CREATE TABLE search_entries(marker TEXT NOT NULL);
+                        INSERT INTO search_entries(marker) VALUES ('must-survive');
+                        ",
+                    )
+                    .map_err(|error| error.to_string())
+            })
+            .unwrap();
+
+        assert_eq!(storage.load_snapshot().unwrap(), serde_json::Value::Null);
+        let marker = storage
+            .with_read_connection(|connection| {
+                connection
+                    .query_row("SELECT marker FROM search_entries", [], |row| {
+                        row.get::<_, String>(0)
+                    })
+                    .map_err(|error| error.to_string())
+            })
+            .unwrap();
+        assert_eq!(marker, "must-survive");
+
+        drop(storage);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn clipboard_monitor_skips_unchanged_windows_clipboard_sequences() {
+        let mut tracker = ClipboardSequenceTracker::default();
+
+        assert!(tracker.should_attempt(Some(41)));
+        assert!(tracker.should_attempt(Some(41)));
+        tracker.commit(Some(41));
+        assert!(!tracker.should_attempt(Some(41)));
+        assert!(tracker.should_attempt(Some(42)));
+        tracker.commit(Some(42));
+        assert!(!tracker.should_attempt(Some(42)));
+        assert!(tracker.should_attempt(None));
+    }
+
+    #[test]
+    fn clipboard_monitor_abandons_a_permanently_unreadable_sequence() {
+        let mut tracker = ClipboardSequenceTracker::default();
+
+        for _ in 0..4 {
+            assert!(!tracker.record_failure(Some(77)));
+            assert!(tracker.should_attempt(Some(77)));
+        }
+        assert!(tracker.record_failure(Some(77)));
+        assert!(!tracker.should_attempt(Some(77)));
+        assert!(tracker.should_attempt(Some(78)));
+    }
+
+    #[test]
+    fn runtime_shortcut_cache_keeps_only_routing_fields() {
+        let source = serde_json::json!({
+            "tools": {
+                "search": { "enabled": true },
+                "prompts": { "enabled": false },
+                "clipboard": { "enabled": true },
+                "folders": { "enabled": true },
+                "automation": { "enabled": true }
+            },
+            "settings": {
+                "shortcuts": {
+                    "search": "Alt+Space",
+                    "prompts": "Alt+Shift+P",
+                    "clipboard": "Alt+Shift+V"
+                },
+                "clipboardLimit": 500
+            },
+            "folderFavorites": [{
+                "id": "docs",
+                "path": "D:\\Documents",
+                "shortcut": "Ctrl+Alt+D",
+                "description": "kept out of the cache"
+            }],
+            "clipboardHistory": [{ "text": "private and potentially large" }],
+            "prompts": [{ "content": "also potentially large" }]
+        });
+
+        let cached = runtime_shortcut_snapshot(&source);
+
+        assert_eq!(
+            cached
+                .pointer("/settings/shortcuts/search")
+                .and_then(Value::as_str),
+            Some("Alt+Space")
+        );
+        assert_eq!(
+            cached
+                .pointer("/folderFavorites/0/path")
+                .and_then(Value::as_str),
+            Some("D:\\Documents")
+        );
+        assert!(cached.get("clipboardHistory").is_none());
+        assert!(cached.get("prompts").is_none());
+        assert!(cached.pointer("/settings/clipboardLimit").is_none());
+        assert!(cached.pointer("/tools/automation").is_none());
+        assert!(cached.pointer("/folderFavorites/0/description").is_none());
+    }
+
+    #[test]
+    fn runtime_shortcut_cache_uses_actual_registration_but_latest_tool_switches() {
+        let proposed = serde_json::json!({
+            "tools": {
+                "search": { "enabled": false },
+                "prompts": { "enabled": true },
+                "clipboard": { "enabled": true },
+                "folders": { "enabled": true }
+            },
+            "settings": {
+                "shortcuts": {
+                    "search": "Ctrl+Alt+S",
+                    "prompts": "Ctrl+Alt+P",
+                    "clipboard": "Ctrl+Alt+V"
+                }
+            },
+            "folderFavorites": []
+        });
+        let actual = BTreeMap::from([
+            ("search".to_string(), "Alt+Space".to_string()),
+            ("prompts".to_string(), "Alt+Shift+P".to_string()),
+            ("clipboard".to_string(), "Alt+Shift+V".to_string()),
+        ]);
+
+        let cached = runtime_shortcut_snapshot_for_registered(&proposed, &actual);
+
+        assert_eq!(
+            cached
+                .pointer("/settings/shortcuts/search")
+                .and_then(Value::as_str),
+            Some("Alt+Space")
+        );
+        let old_search = "Alt+Space".parse::<Shortcut>().unwrap();
+        assert_eq!(shortcut_target(&cached, &old_search), None);
+        let old_prompts = "Alt+Shift+P".parse::<Shortcut>().unwrap();
+        assert_eq!(
+            shortcut_target(&cached, &old_prompts),
+            Some("prompts-overlay")
+        );
+    }
+
+    #[test]
+    fn runtime_search_cache_excludes_large_user_collections() {
+        let source = serde_json::json!({
+            "tools": { "search": { "enabled": false } },
+            "settings": {
+                "indexRoots": ["D:\\学习资料"],
+                "clipboardLimit": 500
+            },
+            "clipboardHistory": [{ "text": "large history" }],
+            "prompts": [{ "content": "large prompt collection" }]
+        });
+
+        let cached = runtime_search_snapshot(&source);
+
+        assert_eq!(
+            cached
+                .pointer("/tools/search/enabled")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            cached
+                .pointer("/settings/indexRoots/0")
+                .and_then(Value::as_str),
+            Some("D:\\学习资料")
+        );
+        assert!(cached.get("clipboardHistory").is_none());
+        assert!(cached.get("prompts").is_none());
+        assert!(cached.pointer("/settings/clipboardLimit").is_none());
     }
 
     #[test]
@@ -458,6 +648,19 @@ mod tests {
     }
 
     #[test]
+    fn common_product_aliases_find_the_installed_application_name() {
+        let apps = vec![search::RegisteredApp {
+            name: "ChatGPT".into(),
+            path: r"shell:AppsFolder\OpenAI.Codex_2p2nqsd0c76g0!App".into(),
+        }];
+
+        let results = search::registered_app_results(&apps, "codex", "app", "", "", &["*".into()]);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "ChatGPT");
+    }
+
+    #[test]
     fn custom_index_roots_are_strict_path_boundaries() {
         let roots = vec![r"D:\Work\Notes".to_string()];
         assert!(search::path_matches_roots(
@@ -749,6 +952,86 @@ mod tests {
             &storage,
             &[files.to_string_lossy().to_string()]
         ));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn search_index_keeps_paths_unindexed_and_bounds_name_alias_payloads() {
+        let _search_test = SEARCH_TEST_LOCK.lock().unwrap();
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("atlas-compact-index-{nonce}"));
+        let files = directory.join("files");
+        fs::create_dir_all(&files).unwrap();
+        fs::write(files.join("网易云音乐.exe"), b"app").unwrap();
+        let storage =
+            StorageManager::for_test(directory.join("bootstrap"), directory.join("data")).unwrap();
+
+        search::rebuild(&storage, vec![files.to_string_lossy().to_string()]).unwrap();
+
+        let (schema, indexed_name) = storage
+            .with_read_connection(|connection| {
+                let schema = connection
+                    .query_row(
+                        "SELECT sql FROM sqlite_master WHERE name = 'search_fts'",
+                        [],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .map_err(|error| error.to_string())?;
+                let indexed_name = connection
+                    .query_row(
+                        "SELECT name FROM search_fts WHERE kind = 'app' LIMIT 1",
+                        [],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .map_err(|error| error.to_string())?;
+                Ok((schema, indexed_name))
+            })
+            .unwrap();
+        assert!(schema.to_ascii_lowercase().contains("path unindexed"));
+        assert!(
+            indexed_name.contains("wangyiyunyinyue"),
+            "indexed name was {indexed_name:?}"
+        );
+        assert!(indexed_name.len() < 256);
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn exact_folder_search_does_not_fill_results_with_unrelated_children() {
+        let _search_test = SEARCH_TEST_LOCK.lock().unwrap();
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("atlas-folder-quality-{nonce}"));
+        let root = directory.join("drive");
+        let entertainment = root.join("娱乐");
+        fs::create_dir_all(&entertainment).unwrap();
+        fs::write(entertainment.join("unrelated-helper.exe"), b"app").unwrap();
+        let storage =
+            StorageManager::for_test(directory.join("bootstrap"), directory.join("data")).unwrap();
+        search::rebuild(&storage, vec![root.to_string_lossy().to_string()]).unwrap();
+
+        let results = search::query(
+            &storage,
+            "娱乐",
+            "",
+            "",
+            "",
+            &[root.to_string_lossy().to_string()],
+        )
+        .unwrap();
+
+        assert!(results.iter().any(
+            |result| result.kind == "folder" && result.path == entertainment.to_string_lossy()
+        ));
+        assert!(!results
+            .iter()
+            .any(|result| result.name == "unrelated-helper"));
         fs::remove_dir_all(directory).unwrap();
     }
 

@@ -1,5 +1,14 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type Dispatch,
+  type SetStateAction,
+} from "react";
 import { mergeSnapshotDefaults, reorderItems } from "./domain";
+import { shouldSkipNativePersistence } from "./persistencePolicy";
 import {
   bindActivity,
   bindClipboardHistory,
@@ -94,20 +103,45 @@ function newId(prefix: string): string {
 }
 
 export function useToolkit() {
-  const [snapshot, setSnapshot] = useState<AppSnapshot>(defaultSnapshot);
+  const [snapshot, setSnapshotState] = useState<AppSnapshot>(defaultSnapshot);
   const [hydrated, setHydrated] = useState(false);
   const latestSnapshot = useRef(snapshot);
   const revision = useRef(0);
+  const localRevision = useRef(0);
+  const persistedLocalRevision = useRef(0);
   const saveInFlight = useRef(false);
   const retryTimer = useRef<number | null>(null);
   const retryDelay = useRef(1_000);
+  const nativeSnapshot = useRef<AppSnapshot | null>(null);
+
+  const setSnapshot = useCallback<Dispatch<SetStateAction<AppSnapshot>>>((update) => {
+    localRevision.current += 1;
+    setSnapshotState(update);
+  }, []);
+
+  const applyNativeUpdate = useCallback(
+    (update: (current: AppSnapshot) => AppSnapshot) => {
+      setSnapshotState((current) => {
+        const next = update(current);
+        nativeSnapshot.current = next;
+        latestSnapshot.current = next;
+        return next;
+      });
+    },
+    [],
+  );
 
   const persistLatest = useCallback(async () => {
     if (saveInFlight.current) return;
     saveInFlight.current = true;
     const savingRevision = revision.current;
+    const savingLocalRevision = localRevision.current;
     try {
       await saveSnapshot(latestSnapshot.current);
+      persistedLocalRevision.current = Math.max(
+        persistedLocalRevision.current,
+        savingLocalRevision,
+      );
       retryDelay.current = 1_000;
     } catch (error: unknown) {
       window.dispatchEvent(
@@ -129,7 +163,7 @@ export function useToolkit() {
     void Promise.all([loadSnapshot(), getDataDirectory()])
       .then(([stored, dataDirectory]) => {
         const next = stored ? mergeSnapshotDefaults(stored) : defaultSnapshot;
-        setSnapshot(
+        setSnapshotState(
           dataDirectory
             ? { ...next, settings: { ...next.settings, dataDirectory } }
             : next,
@@ -141,6 +175,18 @@ export function useToolkit() {
   useEffect(() => {
     if (!hydrated) return;
     latestSnapshot.current = snapshot;
+    if (
+      shouldSkipNativePersistence(
+        nativeSnapshot.current,
+        snapshot,
+        localRevision.current,
+        persistedLocalRevision.current,
+      )
+    ) {
+      nativeSnapshot.current = null;
+      return;
+    }
+    nativeSnapshot.current = null;
     revision.current += 1;
     if (retryTimer.current !== null) window.clearTimeout(retryTimer.current);
     const timer = window.setTimeout(() => void persistLatest(), 180);
@@ -194,29 +240,29 @@ export function useToolkit() {
     let startupEventRevision = 0;
     void bindStartupResults((startupFailures) => {
       startupEventRevision += 1;
-      setSnapshot((current) => ({ ...current, startupFailures }));
+      applyNativeUpdate((current) => ({ ...current, startupFailures }));
       void loadSnapshot().then((latest) => {
         if (!latest?.activity) return;
-        setSnapshot((current) => ({ ...current, activity: latest.activity }));
+        applyNativeUpdate((current) => ({ ...current, activity: latest.activity }));
       });
     }).then(async (dispose) => {
       disposeStartup = dispose;
       const revisionBeforeRead = startupEventRevision;
       const latest = await loadSnapshot().catch(() => null);
       if (latest?.startupFailures && revisionBeforeRead === startupEventRevision) {
-        setSnapshot((current) => ({
+        applyNativeUpdate((current) => ({
           ...current,
           startupFailures: latest.startupFailures,
         }));
       }
     });
     void bindClipboardHistory((clipboardHistory) => {
-      setSnapshot((current) => ({ ...current, clipboardHistory }));
+      applyNativeUpdate((current) => ({ ...current, clipboardHistory }));
     }).then((dispose) => {
       disposeClipboard = dispose;
     });
     void bindSearchFilters((searchFilters) => {
-      setSnapshot((current) => ({
+      applyNativeUpdate((current) => ({
         ...current,
         settings: { ...current.settings, searchFilters },
       }));
@@ -224,12 +270,12 @@ export function useToolkit() {
       disposeFilters = dispose;
     });
     void bindActivity((activity) => {
-      setSnapshot((current) => ({ ...current, activity }));
+      applyNativeUpdate((current) => ({ ...current, activity }));
     }).then((dispose) => {
       disposeActivity = dispose;
     });
     void bindRuntimeSettingsRejected(({ tools, shortcuts, error }) => {
-      setSnapshot((current) => ({
+      applyNativeUpdate((current) => ({
         ...current,
         tools,
         settings: { ...current.settings, shortcuts },
@@ -247,7 +293,7 @@ export function useToolkit() {
       disposeActivity();
       disposeRuntimeRejection();
     };
-  }, []);
+  }, [applyNativeUpdate]);
 
   const setToolEnabled = useCallback((tool: ToolId, enabled: boolean) => {
     setSnapshot((current) => ({
@@ -412,27 +458,10 @@ export function useToolkit() {
   }, []);
 
   const recordSearch = useCallback((query: string) => {
-    setSnapshot((current) => ({
-      ...current,
-      activity: {
-        ...current.activity,
-        searches: [
-          ...current.activity.searches.slice(-199),
-          { at: Date.now(), query },
-        ],
-      },
-    }));
     void recordActivity("search", query);
   }, []);
 
   const recordCopy = useCallback((source: "prompt" | "clipboard" | "path") => {
-    setSnapshot((current) => ({
-      ...current,
-      activity: {
-        ...current.activity,
-        copies: [...current.activity.copies.slice(-199), { at: Date.now(), source }],
-      },
-    }));
     void recordActivity("copy", source);
   }, []);
 
