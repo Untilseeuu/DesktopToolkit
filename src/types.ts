@@ -90,6 +90,15 @@ export interface SearchFilters {
   drive: string;
 }
 
+export interface IndexProgress {
+  status: "idle" | "indexing" | "ready" | "failed";
+  phase: "idle" | "scanning" | "complete" | "failed";
+  indexedItems: number;
+  completedRoots: number;
+  totalRoots: number;
+  currentRoot?: string;
+}
+
 export interface ClipboardEntry {
   id: string;
   kind?: "text" | "image";
@@ -124,6 +133,38 @@ export interface QuickLink {
   enabled: boolean;
 }
 
+export interface BrandingSettings {
+  appName: string;
+  appDescription: string;
+  workspaceName: string;
+  workspaceDescription: string;
+  logoPath: string;
+  avatarPath: string;
+  backgroundPath: string;
+  toolNames: Record<ToolId, string>;
+}
+
+export interface CustomFont {
+  id: string;
+  name: string;
+  path: string;
+}
+
+export interface CustomTheme {
+  id: string;
+  name: string;
+  mode: "light" | "dark";
+  colors: {
+    paper: string;
+    panel: string;
+    card: string;
+    ink: string;
+    muted: string;
+    accent: string;
+    moss: string;
+  };
+}
+
 export interface AppSettings {
   theme: "light" | "dark";
   fontFamily: "system" | "serif" | "yahei";
@@ -143,6 +184,12 @@ export interface AppSettings {
   clipboardExcludedApps: string[];
   launchAtLogin: boolean;
   loginSceneId: string;
+  branding: BrandingSettings;
+  customFonts: CustomFont[];
+  activeCustomFontId: string;
+  customThemes: CustomTheme[];
+  activeCustomThemeId: string;
+  confirmOnClose: boolean;
 }
 
 export interface ActivityLog {
@@ -156,6 +203,7 @@ export interface AppSnapshot {
   startupItems: StartupItem[];
   startupScenes: StartupScene[];
   commandTasks: CommandTask[];
+  folderGroups: string[];
   folderFavorites: FolderFavorite[];
   startupFailures?: Array<{
     id: string;

@@ -6,12 +6,13 @@ use std::{
     time::Duration,
 };
 
-use parking_lot::{Mutex, RwLock};
+use parking_lot::{Mutex, MutexGuard, RwLock};
 use rusqlite::{Connection, OpenFlags};
 
 use crate::domain::default_data_directory;
 
 const DATABASE_NAME: &str = "atlas.db";
+const SEARCH_DATABASE_NAME: &str = "search-index.db";
 const LOCATION_POINTER: &str = "data-location.json";
 const LOCATION_BACKUP: &str = "data-location.backup";
 
@@ -53,9 +54,26 @@ fn retire_legacy_pointer(pointer: &Path) {
     }
 }
 
+fn configure_read_connection(connection: &Connection) -> Result<(), String> {
+    connection
+        .busy_timeout(Duration::from_secs(2))
+        .map_err(|error| error.to_string())?;
+    connection
+        .execute_batch(
+            "
+            PRAGMA query_only = ON;
+            PRAGMA cache_size = -8192;
+            PRAGMA mmap_size = 67108864;
+            PRAGMA temp_store = MEMORY;
+            ",
+        )
+        .map_err(|error| error.to_string())
+}
+
 pub struct StorageManager {
     data_dir: RwLock<PathBuf>,
     operation_gate: Mutex<()>,
+    index_gate: Mutex<()>,
 }
 
 impl StorageManager {
@@ -86,8 +104,10 @@ impl StorageManager {
         let manager = Self {
             data_dir: RwLock::new(data_dir),
             operation_gate: Mutex::new(()),
+            index_gate: Mutex::new(()),
         };
         manager.initialize_database()?;
+        manager.initialize_search_database()?;
         Ok(manager)
     }
 
@@ -106,8 +126,10 @@ impl StorageManager {
         let manager = Self {
             data_dir: RwLock::new(data_dir),
             operation_gate: Mutex::new(()),
+            index_gate: Mutex::new(()),
         };
         manager.initialize_database()?;
+        manager.initialize_search_database()?;
         Ok(manager)
     }
 
@@ -119,13 +141,31 @@ impl StorageManager {
         self.data_dir().join(DATABASE_NAME)
     }
 
+    pub fn search_database_path(&self) -> PathBuf {
+        self.data_dir().join(SEARCH_DATABASE_NAME)
+    }
+
+    pub(crate) fn index_write_guard(&self) -> MutexGuard<'_, ()> {
+        self.index_gate.lock()
+    }
+
     #[cfg(test)]
-    pub fn with_connection<T>(
+    pub fn with_state_connection<T>(
         &self,
         operation: impl FnOnce(&mut Connection) -> Result<T, String>,
     ) -> Result<T, String> {
         let _operation = self.operation_gate.lock();
         let mut connection = self.open_connection()?;
+        operation(&mut connection)
+    }
+
+    #[cfg(test)]
+    pub fn with_search_connection<T>(
+        &self,
+        operation: impl FnOnce(&mut Connection) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let _operation = self.index_gate.lock();
+        let mut connection = self.open_search_connection()?;
         operation(&mut connection)
     }
 
@@ -138,22 +178,40 @@ impl StorageManager {
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
         .map_err(|error| error.to_string())?;
-        connection
-            .busy_timeout(Duration::from_secs(2))
-            .map_err(|error| error.to_string())?;
+        configure_read_connection(&connection)?;
         operation(&connection)
     }
 
-    pub fn with_background_connection<T>(
+    pub fn with_search_read_connection<T>(
         &self,
-        operation: impl FnOnce(&mut Connection) -> Result<T, String>,
+        operation: impl FnOnce(&Connection) -> Result<T, String>,
     ) -> Result<T, String> {
-        let mut connection = self.open_connection()?;
-        operation(&mut connection)
+        let connection = Connection::open_with_flags(
+            self.search_database_path(),
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|error| error.to_string())?;
+        configure_read_connection(&connection)?;
+        operation(&connection)
     }
 
     fn open_connection(&self) -> Result<Connection, String> {
         let database_path = self.database_path();
+        if let Some(parent) = database_path.parent() {
+            fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        }
+        let connection = Connection::open(database_path).map_err(|error| error.to_string())?;
+        connection
+            .busy_timeout(Duration::from_secs(8))
+            .map_err(|error| error.to_string())?;
+        connection
+            .execute_batch("PRAGMA synchronous = NORMAL;")
+            .map_err(|error| error.to_string())?;
+        Ok(connection)
+    }
+
+    fn open_search_connection(&self) -> Result<Connection, String> {
+        let database_path = self.search_database_path();
         if let Some(parent) = database_path.parent() {
             fs::create_dir_all(parent).map_err(|error| error.to_string())?;
         }
@@ -179,10 +237,33 @@ impl StorageManager {
                     value TEXT NOT NULL,
                     updated_at INTEGER NOT NULL DEFAULT (unixepoch())
                 );
+                DROP TABLE IF EXISTS search_fts;
+                DROP TABLE IF EXISTS search_entries;
+                DROP TABLE IF EXISTS search_meta;
+                DROP TABLE IF EXISTS search_build_meta;
+                ",
+            )
+            .map_err(|error| error.to_string())
+    }
+
+    fn initialize_search_database(&self) -> Result<(), String> {
+        let _operation = self.index_gate.lock();
+        let connection = self.open_search_connection()?;
+        connection
+            .execute_batch(
+                "
+                PRAGMA journal_mode = WAL;
                 CREATE TABLE IF NOT EXISTS search_meta (
                     id INTEGER PRIMARY KEY CHECK (id = 1),
                     scope TEXT NOT NULL,
                     complete INTEGER NOT NULL DEFAULT 0,
+                    updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+                );
+                CREATE TABLE IF NOT EXISTS search_build_meta (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    scope TEXT NOT NULL,
+                    completed_roots INTEGER NOT NULL DEFAULT 0,
+                    indexed_items INTEGER NOT NULL DEFAULT 0,
                     updated_at INTEGER NOT NULL DEFAULT (unixepoch())
                 );
                 DROP TABLE IF EXISTS search_entries;
@@ -217,9 +298,6 @@ impl StorageManager {
                 )
                 .map_err(|error| error.to_string())?;
         }
-        connection
-            .execute_batch("DROP TABLE IF EXISTS search_fts_next;")
-            .map_err(|error| error.to_string())?;
         Ok(())
     }
 

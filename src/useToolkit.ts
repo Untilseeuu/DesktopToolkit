@@ -7,8 +7,11 @@ import {
   type Dispatch,
   type SetStateAction,
 } from "react";
-import { mergeSnapshotDefaults, reorderItems } from "./domain";
-import { shouldSkipNativePersistence } from "./persistencePolicy";
+import { DEFAULT_SHORTCUTS, mergeSnapshotDefaults, reorderItems } from "./domain";
+import {
+  shouldReportPersistenceError,
+  shouldSkipNativePersistence,
+} from "./persistencePolicy";
 import {
   bindActivity,
   bindClipboardHistory,
@@ -52,6 +55,7 @@ export const defaultSnapshot: AppSnapshot = {
     itemIds: [],
   }],
   commandTasks: [],
+  folderGroups: [],
   folderFavorites: [],
   startupFailures: [],
   prompts: [
@@ -75,11 +79,7 @@ export const defaultSnapshot: AppSnapshot = {
     theme: "light",
     fontFamily: "system",
     fontScale: 1,
-    shortcuts: {
-      search: "Alt+Space",
-      prompts: "Alt+Shift+P",
-      clipboard: "Alt+Shift+V",
-    },
+    shortcuts: { ...DEFAULT_SHORTCUTS },
     dataDirectory: "应用目录\\data",
     indexRoots: ["*"],
     excludedPatterns: ["node_modules", ".git", "Windows\\WinSxS"],
@@ -95,6 +95,28 @@ export const defaultSnapshot: AppSnapshot = {
     ],
     launchAtLogin: true,
     loginSceneId: "default-scene",
+    branding: {
+      appName: "ATLAS",
+      appDescription: "DESKTOP KIT",
+      workspaceName: "本地工作区",
+      workspaceDescription: "所有数据仅在本机",
+      logoPath: "",
+      avatarPath: "",
+      backgroundPath: "",
+      toolNames: {
+        startup: "启动编排",
+        search: "全局搜索",
+        prompts: "提示词库",
+        clipboard: "剪贴板历史",
+        automation: "自动化命令",
+        folders: "文件夹收藏",
+      },
+    },
+    customFonts: [],
+    activeCustomFontId: "",
+    customThemes: [],
+    activeCustomThemeId: "",
+    confirmOnClose: true,
   },
 };
 
@@ -112,6 +134,7 @@ export function useToolkit() {
   const saveInFlight = useRef(false);
   const retryTimer = useRef<number | null>(null);
   const retryDelay = useRef(1_000);
+  const consecutiveSaveFailures = useRef(0);
   const nativeSnapshot = useRef<AppSnapshot | null>(null);
 
   const setSnapshot = useCallback<Dispatch<SetStateAction<AppSnapshot>>>((update) => {
@@ -143,10 +166,14 @@ export function useToolkit() {
         savingLocalRevision,
       );
       retryDelay.current = 1_000;
+      consecutiveSaveFailures.current = 0;
     } catch (error: unknown) {
-      window.dispatchEvent(
-        new CustomEvent("atlas-persistence-error", { detail: String(error) }),
-      );
+      consecutiveSaveFailures.current += 1;
+      if (shouldReportPersistenceError(error, consecutiveSaveFailures.current)) {
+        window.dispatchEvent(
+          new CustomEvent("atlas-persistence-error", { detail: String(error) }),
+        );
+      }
       const delay = retryDelay.current;
       retryDelay.current = Math.min(delay * 2, 30_000);
       retryTimer.current = window.setTimeout(() => void persistLatest(), delay);
@@ -421,7 +448,7 @@ export function useToolkit() {
   const setTheme = useCallback((theme: "light" | "dark") => {
     setSnapshot((current) => ({
       ...current,
-      settings: { ...current.settings, theme },
+      settings: { ...current.settings, theme, activeCustomThemeId: "" },
     }));
   }, []);
 

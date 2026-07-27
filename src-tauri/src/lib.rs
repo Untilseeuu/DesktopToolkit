@@ -13,11 +13,14 @@ use std::{
     collections::BTreeMap,
     fs::OpenOptions,
     hash::{DefaultHasher, Hash, Hasher},
-    io::{Cursor, Write},
+    io::{Cursor, Read, Write},
     path::{Component, Path, PathBuf},
     process::Command,
-    sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use parking_lot::{Mutex, RwLock};
@@ -26,8 +29,9 @@ use serde_json::Value;
 use storage::StorageManager;
 use tauri::{
     menu::{Menu, MenuItem},
-    tray::TrayIconBuilder,
-    AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder, WindowEvent,
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    webview::{Color, PageLoadEvent},
+    AppHandle, Emitter, LogicalSize, Manager, State, WebviewUrl, WebviewWindowBuilder, WindowEvent,
 };
 use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_clipboard_manager::ClipboardExt;
@@ -54,6 +58,9 @@ type SharedStorage = Arc<StorageManager>;
 static REGISTERED_SHORTCUTS: Mutex<BTreeMap<String, String>> = Mutex::new(BTreeMap::new());
 static RUNTIME_SHORTCUT_SNAPSHOT: RwLock<Value> = RwLock::new(Value::Null);
 static RUNTIME_SEARCH_SNAPSHOT: RwLock<Value> = RwLock::new(Value::Null);
+static SEARCH_CONFIG_GENERATION: AtomicU64 = AtomicU64::new(0);
+static SEARCH_CONFIG_GATE: Mutex<()> = Mutex::new(());
+static CURRENT_QUICK_OVERLAY_MODE: Mutex<Option<String>> = Mutex::new(None);
 #[cfg(target_os = "windows")]
 static LAST_CLIPBOARD_TARGET: Mutex<Option<usize>> = Mutex::new(None);
 
@@ -347,6 +354,215 @@ fn cleanup_clipboard_images(storage: &StorageManager, entries: &[Value]) {
     }
 }
 
+fn delete_clipboard_entry(storage: &StorageManager, id: &str) -> Result<Vec<Value>, String> {
+    let mut removed_image = None;
+    let entries = storage.update_snapshot(|snapshot| {
+        let mut entries = snapshot
+            .get("clipboardHistory")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if let Some(entry) = entries
+            .iter()
+            .find(|entry| entry.get("id").and_then(Value::as_str) == Some(id))
+        {
+            removed_image = entry
+                .get("imageFile")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+        }
+        entries.retain(|entry| entry.get("id").and_then(Value::as_str) != Some(id));
+        snapshot["clipboardHistory"] = Value::Array(entries.clone());
+        Ok(entries)
+    })?;
+    if let Some(relative) = removed_image {
+        if let Ok(path) = clipboard_file_path(storage, &relative) {
+            if path.is_file() {
+                if let Err(error) = std::fs::remove_file(path) {
+                    eprintln!("failed to remove clipboard image after deleting history: {error}");
+                }
+            }
+        }
+    }
+    cleanup_clipboard_images(storage, &entries);
+    Ok(entries)
+}
+
+#[tauri::command]
+fn delete_clipboard_history_entry(
+    app: AppHandle,
+    storage: State<'_, SharedStorage>,
+    id: String,
+) -> Result<Vec<Value>, String> {
+    let entries = delete_clipboard_entry(&storage, &id)?;
+    let _ = app.emit("atlas-clipboard-history", entries.clone());
+    Ok(entries)
+}
+
+fn appearance_asset_path(storage: &StorageManager, candidate: &str) -> Result<PathBuf, String> {
+    let root = storage.data_dir().join("appearance");
+    let canonical_root = root.canonicalize().unwrap_or(root);
+    let canonical = PathBuf::from(candidate)
+        .canonicalize()
+        .map_err(|error| error.to_string())?;
+    if !canonical.starts_with(&canonical_root) {
+        return Err("外观资源不在应用数据目录中".into());
+    }
+    Ok(canonical)
+}
+
+fn validate_appearance_file(path: &Path, font: bool) -> Result<(), String> {
+    const MAX_IMAGE_BYTES: u64 = 12 * 1024 * 1024;
+    const MAX_FONT_BYTES: u64 = 16 * 1024 * 1024;
+    let size = path.metadata().map_err(|error| error.to_string())?.len();
+    let limit = if font {
+        MAX_FONT_BYTES
+    } else {
+        MAX_IMAGE_BYTES
+    };
+    if size == 0 || size > limit {
+        return Err(format!(
+            "{}文件必须小于 {} MB",
+            if font { "字体" } else { "图片" },
+            limit / 1024 / 1024
+        ));
+    }
+    let mut header = [0u8; 12];
+    let read = std::fs::File::open(path)
+        .and_then(|mut file| file.read(&mut header))
+        .map_err(|error| error.to_string())?;
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let valid = if font {
+        match extension.as_str() {
+            "ttf" => header.starts_with(&[0, 1, 0, 0]),
+            "otf" => header.starts_with(b"OTTO"),
+            "woff" => header.starts_with(b"wOFF"),
+            "woff2" => header.starts_with(b"wOF2"),
+            _ => false,
+        }
+    } else {
+        match extension.as_str() {
+            "png" => header.starts_with(b"\x89PNG\r\n\x1a\n"),
+            "jpg" | "jpeg" => header.starts_with(&[0xff, 0xd8, 0xff]),
+            "webp" => read >= 12 && header.starts_with(b"RIFF") && &header[8..12] == b"WEBP",
+            _ => false,
+        }
+    };
+    if !valid {
+        return Err(format!(
+            "所选文件不是有效的{}",
+            if font { "字体" } else { "图片" }
+        ));
+    }
+    Ok(())
+}
+
+fn cleanup_appearance_assets(storage: &StorageManager, retained: &[PathBuf]) {
+    let directory = storage.data_dir().join("appearance");
+    let retained = retained
+        .iter()
+        .cloned()
+        .collect::<std::collections::HashSet<_>>();
+    let Ok(files) = std::fs::read_dir(directory) else {
+        return;
+    };
+    for file in files.flatten() {
+        let path = file.path();
+        if path.is_file() && !retained.contains(&path) {
+            if let Err(error) = std::fs::remove_file(&path) {
+                eprintln!(
+                    "failed to remove unused appearance asset {}: {error}",
+                    path.display()
+                );
+            }
+        }
+    }
+}
+
+#[tauri::command]
+fn import_appearance_asset(
+    app: AppHandle,
+    storage: State<'_, SharedStorage>,
+    kind: String,
+) -> Result<Option<String>, String> {
+    let extensions: &[&str] = match kind.as_str() {
+        "font" => &["ttf", "otf", "woff", "woff2"],
+        "logo" | "avatar" | "background" => &["png", "jpg", "jpeg", "webp"],
+        _ => return Err("不支持的外观资源类型".into()),
+    };
+    let selected = app
+        .dialog()
+        .file()
+        .add_filter("支持的文件", extensions)
+        .blocking_pick_file()
+        .and_then(|file| file.into_path().ok());
+    let Some(source) = selected else {
+        return Ok(None);
+    };
+    let extension = source
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if !extensions.contains(&extension.as_str()) {
+        return Err("所选文件格式不受支持".into());
+    }
+    validate_appearance_file(&source, kind == "font")?;
+    let directory = storage.data_dir().join("appearance");
+    std::fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| error.to_string())?
+        .as_millis();
+    let destination = directory.join(format!("{kind}-{nonce}.{extension}"));
+    std::fs::copy(&source, &destination).map_err(|error| error.to_string())?;
+    Ok(Some(destination.to_string_lossy().to_string()))
+}
+
+#[tauri::command]
+fn load_appearance_asset(
+    storage: State<'_, SharedStorage>,
+    path: String,
+) -> Result<String, String> {
+    let path = appearance_asset_path(&storage, &path)?;
+    validate_appearance_file(
+        &path,
+        matches!(
+            path.extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .as_str(),
+            "ttf" | "otf" | "woff" | "woff2"
+        ),
+    )?;
+    let bytes = std::fs::read(&path).map_err(|error| error.to_string())?;
+    let mime = match path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "ttf" => "font/ttf",
+        "otf" => "font/otf",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        _ => "application/octet-stream",
+    };
+    Ok(format!(
+        "data:{mime};base64,{}",
+        search::base64_encode(&bytes)
+    ))
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ClipboardActivationResult {
@@ -601,7 +817,9 @@ fn save_snapshot(
     let mut rejected_runtime: Option<(Value, Value, String)> = None;
     let mut runtime_transition: Option<(Value, Value)> = None;
     let mut retained_clipboard_entries = Vec::new();
+    let mut retained_appearance_assets = Vec::new();
     let mut search_runtime_snapshot = None;
+    let mut search_config_generation = SEARCH_CONFIG_GENERATION.load(Ordering::Acquire);
     let saved = storage.update_snapshot(|previous| {
         let previous_snapshot = previous.clone();
         let mut sanitized = snapshot;
@@ -644,6 +862,25 @@ fn save_snapshot(
             .as_array()
             .cloned()
             .unwrap_or_default();
+        retained_appearance_assets = [
+            "/settings/branding/logoPath",
+            "/settings/branding/avatarPath",
+            "/settings/branding/backgroundPath",
+        ]
+        .into_iter()
+        .filter_map(|pointer| sanitized.pointer(pointer).and_then(Value::as_str))
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .collect();
+        retained_appearance_assets.extend(
+            sanitized
+                .pointer("/settings/customFonts")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|font| font.get("path").and_then(Value::as_str))
+                .map(PathBuf::from),
+        );
         search_runtime_snapshot = Some(runtime_search_snapshot(&sanitized));
         sanitized["activity"] = previous
             .get("activity")
@@ -683,10 +920,27 @@ fn save_snapshot(
         *previous = sanitized;
         Ok(true)
     })?;
+    let mut search_enabled_now = true;
     if let Some(snapshot) = search_runtime_snapshot {
-        *RUNTIME_SEARCH_SNAPSHOT.write() = snapshot;
+        search_enabled_now = snapshot
+            .pointer("/tools/search/enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        let _coordinator = SEARCH_CONFIG_GATE.lock();
+        let mut current = RUNTIME_SEARCH_SNAPSHOT.write();
+        if *current != snapshot {
+            *current = snapshot;
+            search_config_generation = SEARCH_CONFIG_GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
+        } else {
+            search_config_generation = SEARCH_CONFIG_GENERATION.load(Ordering::Acquire);
+        }
     }
     cleanup_clipboard_images(&storage, &retained_clipboard_entries);
+    cleanup_appearance_assets(&storage, &retained_appearance_assets);
+    if !search_enabled_now {
+        search::stop_watchers();
+        rebuild_roots = None;
+    }
     if let Some((previous, proposed)) = runtime_transition {
         if let Err(error) = apply_runtime_settings(&app, &previous, &proposed, false) {
             let proposed_tools = proposed
@@ -705,19 +959,45 @@ fn save_snapshot(
     if let Some((roots, force)) = rebuild_roots {
         let storage_for_index = storage.inner().clone();
         tauri::async_runtime::spawn_blocking(move || {
-            if force || !search::has_index(&storage_for_index, &roots) {
-                if roots.iter().any(|root| root == "*") {
-                    let revision = search::revision();
-                    let bootstrap_roots = search::bootstrap_roots();
-                    if !bootstrap_roots.is_empty() {
-                        let _ = search::rebuild(&storage_for_index, bootstrap_roots);
-                        let _ =
-                            search::rebuild_if_revision(&storage_for_index, roots, revision + 1);
-                        return;
-                    }
+            let expected_revision = {
+                let _coordinator = SEARCH_CONFIG_GATE.lock();
+                if SEARCH_CONFIG_GENERATION.load(Ordering::Acquire) != search_config_generation {
+                    return;
                 }
-                let _ = search::rebuild(&storage_for_index, roots);
+                search::start_watchers(storage_for_index.clone(), roots.clone());
+                search::revision()
+            };
+            if !force && search::has_index(&storage_for_index, &roots) {
+                return;
             }
+            if roots.iter().any(|root| root == "*")
+                && !search::has_partial_index(&storage_for_index, &roots)
+            {
+                let bootstrap_roots = search::bootstrap_roots();
+                if !bootstrap_roots.is_empty()
+                    && search::rebuild_if_revision(
+                        &storage_for_index,
+                        bootstrap_roots,
+                        expected_revision,
+                    )
+                    .ok()
+                    .flatten()
+                    .is_some()
+                {
+                    let next_revision = {
+                        let _coordinator = SEARCH_CONFIG_GATE.lock();
+                        if SEARCH_CONFIG_GENERATION.load(Ordering::Acquire)
+                            != search_config_generation
+                        {
+                            return;
+                        }
+                        search::revision()
+                    };
+                    let _ = search::rebuild_if_revision(&storage_for_index, roots, next_revision);
+                    return;
+                }
+            }
+            let _ = search::rebuild_if_revision(&storage_for_index, roots, expected_revision);
         });
     }
     if let Some(filters) = changed_filters {
@@ -729,6 +1009,7 @@ fn save_snapshot(
             serde_json::json!({ "tools": tools, "shortcuts": shortcuts, "error": error }),
         );
     }
+    let _ = app.emit("atlas-snapshot-updated", ());
     Ok(saved)
 }
 
@@ -926,6 +1207,16 @@ fn get_index_status() -> String {
 }
 
 #[tauri::command]
+fn get_index_progress() -> search::IndexProgress {
+    search::progress()
+}
+
+#[tauri::command]
+fn list_search_drives() -> Vec<String> {
+    search::available_drives()
+}
+
+#[tauri::command]
 fn get_index_count(storage: State<'_, SharedStorage>) -> Result<usize, String> {
     search::count(&storage)
 }
@@ -1088,17 +1379,17 @@ fn open_target(path: String, reveal: bool) -> Result<(), String> {
 
 #[tauri::command]
 fn hide_overlay(app: AppHandle, mode: String) -> Result<bool, String> {
-    let label = match mode.as_str() {
-        "search" => "search-overlay",
-        "prompts" => "prompts-overlay",
-        "clipboard" => "clipboard-overlay",
-        _ => return Err("未知的快捷窗口".into()),
-    };
+    quick_overlay_spec(&format!("{mode}-overlay")).ok_or_else(|| "未知的快捷窗口".to_string())?;
     let window = app
-        .get_webview_window(label)
+        .get_webview_window("quick-overlay")
         .ok_or_else(|| "快捷窗口不存在".to_string())?;
     window.hide().map_err(|error| error.to_string())?;
     Ok(true)
+}
+
+#[tauri::command]
+fn get_quick_overlay_mode() -> Option<String> {
+    CURRENT_QUICK_OVERLAY_MODE.lock().clone()
 }
 
 #[tauri::command]
@@ -1386,18 +1677,16 @@ fn apply_runtime_settings(
     if shortcuts_changed {
         reconcile_shortcuts(app, snapshot)?;
     }
-    for (tool, label) in [
-        ("search", "search-overlay"),
-        ("prompts", "prompts-overlay"),
-        ("clipboard", "clipboard-overlay"),
-    ] {
+    for tool in ["search", "prompts", "clipboard"] {
         let enabled = snapshot
             .pointer(&format!("/tools/{tool}/enabled"))
             .and_then(Value::as_bool)
             .unwrap_or(true);
         if !enabled {
-            if let Some(window) = app.get_webview_window(label) {
-                let _ = window.hide();
+            if CURRENT_QUICK_OVERLAY_MODE.lock().as_deref() == Some(tool) {
+                if let Some(window) = app.get_webview_window("quick-overlay") {
+                    let _ = window.hide();
+                }
             }
         }
     }
@@ -1407,49 +1696,94 @@ fn apply_runtime_settings(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+struct QuickOverlaySpec {
+    window_label: &'static str,
+    mode: &'static str,
+    title: &'static str,
+    width: f64,
+    height: f64,
+}
+
+fn quick_overlay_spec(requested_label: &str) -> Option<QuickOverlaySpec> {
+    let (mode, title, width, height) = match requested_label {
+        "search-overlay" => ("search", "Atlas Search", 760.0, 560.0),
+        "prompts-overlay" => ("prompts", "Atlas Prompts", 700.0, 520.0),
+        "clipboard-overlay" => ("clipboard", "Atlas Clipboard", 700.0, 520.0),
+        _ => return None,
+    };
+    Some(QuickOverlaySpec {
+        window_label: "quick-overlay",
+        mode,
+        title,
+        width,
+        height,
+    })
+}
+
 fn show_quick_window(app: &AppHandle, label: &str) {
-    if let Some(window) = app.get_webview_window(label) {
+    let Some(spec) = quick_overlay_spec(label) else {
+        return;
+    };
+    if let Some(window) = app.get_webview_window(spec.window_label) {
         let visible = window.is_visible().unwrap_or(false);
-        if visible && window.is_focused().unwrap_or(false) {
+        let same_mode = CURRENT_QUICK_OVERLAY_MODE.lock().as_deref() == Some(spec.mode);
+        if visible && same_mode && window.is_focused().unwrap_or(false) {
             let _ = window.hide();
         } else {
-            if label == "clipboard-overlay" {
+            if spec.mode == "clipboard" {
                 remember_clipboard_target();
             }
+            *CURRENT_QUICK_OVERLAY_MODE.lock() = Some(spec.mode.to_string());
+            let _ = window.set_title(spec.title);
+            let _ = window.set_size(LogicalSize::new(spec.width, spec.height));
             let _ = window.center();
+            let _ = app.emit_to(spec.window_label, "atlas-overlay-mode", spec.mode);
             let _ = window.show();
             let _ = window.set_focus();
-            let _ = app.emit_to(label, "atlas-overlay-focus", ());
+            let _ = app.emit_to(spec.window_label, "atlas-overlay-focus", ());
         }
         return;
     }
-    let Some((overlay, title, width, height)) = (match label {
-        "search-overlay" => Some(("search", "Atlas Search", 760.0, 560.0)),
-        "prompts-overlay" => Some(("prompts", "Atlas Prompts", 700.0, 520.0)),
-        "clipboard-overlay" => Some(("clipboard", "Atlas Clipboard", 700.0, 520.0)),
-        _ => None,
-    }) else {
-        return;
-    };
-    if label == "clipboard-overlay" {
+    if spec.mode == "clipboard" {
         remember_clipboard_target();
     }
-    let url = WebviewUrl::App(format!("index.html?overlay={overlay}").into());
-    match WebviewWindowBuilder::new(app, label, url)
-        .title(title)
-        .inner_size(width, height)
+    *CURRENT_QUICK_OVERLAY_MODE.lock() = Some(spec.mode.to_string());
+    let url = WebviewUrl::App(format!("index.html?overlay={}", spec.mode).into());
+    let initial_mode = spec.mode.to_string();
+    match WebviewWindowBuilder::new(app, spec.window_label, url)
+        .title(spec.title)
+        .inner_size(spec.width, spec.height)
         .center()
         .decorations(false)
         .always_on_top(true)
         .skip_taskbar(true)
         .resizable(false)
+        .visible(false)
+        .background_color(Color(235, 232, 223, 255))
+        .on_page_load(move |window, payload| {
+            if payload.event() != PageLoadEvent::Finished {
+                return;
+            }
+            let _ = window.show();
+            let _ = window.set_focus();
+            let _ = window.emit("atlas-overlay-mode", initial_mode.as_str());
+            let _ = window.emit("atlas-overlay-focus", ());
+        })
         .build()
     {
-        Ok(window) => {
-            let _ = window.set_focus();
-        }
-        Err(error) => eprintln!("failed to create {label}: {error}"),
+        Ok(_) => {}
+        Err(error) => eprintln!("failed to create {}: {error}", spec.window_label),
     }
+}
+
+fn schedule_quick_overlay_blur_hide(window: tauri::Window) {
+    tauri::async_runtime::spawn_blocking(move || {
+        std::thread::sleep(Duration::from_millis(120));
+        if !window.is_focused().unwrap_or(false) {
+            let _ = window.hide();
+        }
+    });
 }
 
 #[tauri::command]
@@ -1505,7 +1839,7 @@ fn activate_clipboard_entry(
             reason: None,
         });
     }
-    if let Some(window) = app.get_webview_window("clipboard-overlay") {
+    if let Some(window) = app.get_webview_window("quick-overlay") {
         let _ = window.hide();
     }
     Ok(paste_to_remembered_target(kind))
@@ -1693,6 +2027,14 @@ fn start_clipboard_monitor(app: AppHandle, storage: SharedStorage) {
     });
 }
 
+fn show_main_window(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+
 pub fn run() -> Result<(), String> {
     let storage = Arc::new(
         StorageManager::initialize()
@@ -1700,16 +2042,13 @@ pub fn run() -> Result<(), String> {
     );
     let startup_snapshot = storage.load_snapshot().unwrap_or(Value::Null);
     *RUNTIME_SEARCH_SNAPSHOT.write() = runtime_search_snapshot(&startup_snapshot);
+    let startup_search_generation = SEARCH_CONFIG_GENERATION.load(Ordering::Acquire);
     let launched_from_autostart = std::env::args().any(|argument| argument == "--autostart");
 
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(
             |app, _arguments, _cwd| {
-                if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.unminimize();
-                    let _ = window.show();
-                    let _ = window.set_focus();
-                }
+                show_main_window(app);
             },
         ))
         .plugin(tauri_plugin_opener::init())
@@ -1751,14 +2090,19 @@ pub fn run() -> Result<(), String> {
                 .tooltip("Atlas Desktop Toolkit")
                 .menu(&tray_menu)
                 .on_menu_event(|app, event| match event.id().as_ref() {
-                    "open" => {
-                        if let Some(window) = app.get_webview_window("main") {
-                            let _ = window.show();
-                            let _ = window.set_focus();
-                        }
-                    }
+                    "open" => show_main_window(app),
                     "quit" => app.exit(0),
                     _ => {}
+                })
+                .on_tray_icon_event(|tray, event| {
+                    if let TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
+                        show_main_window(tray.app_handle());
+                    }
                 });
             if let Some(icon) = app.default_window_icon() {
                 tray = tray.icon(icon.clone());
@@ -1845,23 +2189,69 @@ pub fn run() -> Result<(), String> {
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_else(|| vec!["*".into()]);
-            if search_enabled && !search::has_index(&storage, &index_roots) {
+            if search_enabled {
                 let storage_for_index = storage.clone();
+                let roots_for_index = index_roots.clone();
                 tauri::async_runtime::spawn_blocking(move || {
-                    if index_roots.iter().any(|root| root == "*") {
-                        let revision = search::revision();
+                    {
+                        let _coordinator = SEARCH_CONFIG_GATE.lock();
+                        if SEARCH_CONFIG_GENERATION.load(Ordering::Acquire)
+                            != startup_search_generation
+                        {
+                            return;
+                        }
+                        search::start_watchers(storage_for_index.clone(), roots_for_index.clone());
+                    }
+                    if search::has_index(&storage_for_index, &roots_for_index) {
+                        return;
+                    }
+                    let expected_revision = {
+                        let _coordinator = SEARCH_CONFIG_GATE.lock();
+                        if SEARCH_CONFIG_GENERATION.load(Ordering::Acquire)
+                            != startup_search_generation
+                        {
+                            return;
+                        }
+                        search::revision()
+                    };
+                    if roots_for_index.iter().any(|root| root == "*")
+                        && !search::has_partial_index(&storage_for_index, &roots_for_index)
+                    {
                         let bootstrap_roots = search::bootstrap_roots();
                         if !bootstrap_roots.is_empty() {
-                            let _ = search::rebuild(&storage_for_index, bootstrap_roots);
+                            if search::rebuild_if_revision(
+                                &storage_for_index,
+                                bootstrap_roots,
+                                expected_revision,
+                            )
+                            .ok()
+                            .flatten()
+                            .is_none()
+                            {
+                                return;
+                            }
+                            let next_revision = {
+                                let _coordinator = SEARCH_CONFIG_GATE.lock();
+                                if SEARCH_CONFIG_GENERATION.load(Ordering::Acquire)
+                                    != startup_search_generation
+                                {
+                                    return;
+                                }
+                                search::revision()
+                            };
                             let _ = search::rebuild_if_revision(
                                 &storage_for_index,
-                                index_roots,
-                                revision + 1,
+                                roots_for_index,
+                                next_revision,
                             );
                             return;
                         }
                     }
-                    let _ = search::rebuild(&storage_for_index, index_roots);
+                    let _ = search::rebuild_if_revision(
+                        &storage_for_index,
+                        roots_for_index,
+                        expected_revision,
+                    );
                 });
             }
             Ok(())
@@ -1869,10 +2259,14 @@ pub fn run() -> Result<(), String> {
         .on_window_event(|window, event| match event {
             WindowEvent::CloseRequested { api, .. } => {
                 api.prevent_close();
-                let _ = window.hide();
+                if window.label() == "main" {
+                    let _ = window.emit("atlas-close-requested", ());
+                } else {
+                    let _ = window.hide();
+                }
             }
             WindowEvent::Focused(false) if window.label() != "main" => {
-                let _ = window.hide();
+                schedule_quick_overlay_blur_hide(window.clone());
             }
             _ => {}
         })
@@ -1887,7 +2281,9 @@ pub fn run() -> Result<(), String> {
             record_activity,
             search_index,
             get_index_status,
+            get_index_progress,
             get_index_count,
+            list_search_drives,
             rebuild_search_index,
             launch_startup_items,
             close_previous_startup_scene,
@@ -1897,7 +2293,11 @@ pub fn run() -> Result<(), String> {
             run_command_task,
             open_target,
             hide_overlay,
+            get_quick_overlay_mode,
             activate_clipboard_entry,
+            delete_clipboard_history_entry,
+            import_appearance_asset,
+            load_appearance_asset,
             load_app_icons
         ])
         .run(tauri::generate_context!())

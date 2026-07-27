@@ -7,6 +7,7 @@ const overlay = new URLSearchParams(window.location.search).get("overlay");
 
 async function bootstrap() {
   if (overlay === "search" || overlay === "prompts" || overlay === "clipboard") {
+    document.documentElement.dataset.overlay = "true";
     const { default: QuickOverlay } = await import("./QuickOverlay");
     root.render(
       <StrictMode>

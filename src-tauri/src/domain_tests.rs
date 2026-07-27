@@ -4,10 +4,10 @@ mod tests {
     use crate::domain::{default_data_directory, runtime_settings_changed};
     use crate::launcher::{launch_queue, validate_startup_item, StartupItem};
     use crate::{
-        cleanup_clipboard_images, clipboard_file_path, desired_shortcuts, folder_shortcut_target,
-        runtime_search_snapshot, runtime_shortcut_snapshot,
-        runtime_shortcut_snapshot_for_registered, search, shortcut_target, storage::StorageManager,
-        ClipboardSequenceTracker,
+        cleanup_clipboard_images, clipboard_file_path, delete_clipboard_entry, desired_shortcuts,
+        folder_shortcut_target, quick_overlay_spec, runtime_search_snapshot,
+        runtime_shortcut_snapshot, runtime_shortcut_snapshot_for_registered, search,
+        shortcut_target, storage::StorageManager, ClipboardSequenceTracker,
     };
     use serde_json::Value;
     use std::{
@@ -15,12 +15,351 @@ mod tests {
         fs,
         path::Path,
         str::FromStr,
-        sync::Mutex,
+        sync::{Arc, Mutex},
+        thread,
         time::{SystemTime, UNIX_EPOCH},
     };
     use tauri_plugin_global_shortcut::Shortcut;
 
     static SEARCH_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn quick_tools_reuse_one_webview_window() {
+        let search = quick_overlay_spec("search-overlay").unwrap();
+        let prompts = quick_overlay_spec("prompts-overlay").unwrap();
+        let clipboard = quick_overlay_spec("clipboard-overlay").unwrap();
+
+        assert_eq!(search.window_label, "quick-overlay");
+        assert_eq!(prompts.window_label, search.window_label);
+        assert_eq!(clipboard.window_label, search.window_label);
+        assert_eq!(search.mode, "search");
+        assert_eq!(prompts.mode, "prompts");
+        assert_eq!(clipboard.mode, "clipboard");
+    }
+
+    #[test]
+    fn quick_overlay_blur_is_deferred_during_a_shortcut_mode_switch() {
+        let source = include_str!("lib.rs");
+        assert!(source.contains("schedule_quick_overlay_blur_hide(window.clone())"));
+        assert!(!source.contains(
+            "WindowEvent::Focused(false) if window.label() != \"main\" => {\n                let _ = window.hide();"
+        ));
+    }
+
+    #[test]
+    fn available_drive_labels_include_only_existing_root_drives() {
+        assert_eq!(
+            search::drive_labels_from_roots([
+                Path::new(r"C:\"),
+                Path::new(r"D:\"),
+                Path::new(r"C:\Users"),
+                Path::new(r"\\server\share"),
+            ]),
+            vec!["C:", "D:"]
+        );
+    }
+
+    #[test]
+    fn completed_index_progress_reports_scanned_items_and_roots() {
+        let _search_test = SEARCH_TEST_LOCK.lock().unwrap();
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("atlas-progress-{nonce}"));
+        let root = directory.join("files");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("paper.pdf"), b"pdf").unwrap();
+        let storage =
+            StorageManager::for_test(directory.join("bootstrap"), directory.join("data")).unwrap();
+
+        search::rebuild(&storage, vec![root.to_string_lossy().to_string()]).unwrap();
+        let progress = search::progress();
+
+        assert_eq!(progress.status, "ready");
+        assert_eq!(progress.phase, "complete");
+        assert_eq!(progress.total_roots, 1);
+        assert_eq!(progress.completed_roots, 1);
+        assert!(progress.indexed_items >= 2);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn search_candidate_sql_uses_fts_optimized_bounded_ranking() {
+        let sql = search::indexed_candidate_sql();
+        let normalized = sql.to_ascii_lowercase();
+
+        assert!(!normalized.contains("bm25("));
+        assert!(normalized.contains("order by rank"));
+        assert!(normalized.contains("limit"));
+    }
+
+    #[test]
+    fn broad_search_reserves_bounded_candidates_for_each_result_kind() {
+        assert_eq!(
+            search::candidate_kind_plan(""),
+            vec![("app", 64), ("folder", 128), ("file", 256)]
+        );
+        assert_eq!(search::candidate_kind_plan("folder"), vec![("folder", 320)]);
+    }
+
+    #[test]
+    fn exact_name_is_not_lost_beyond_the_bounded_candidate_window() {
+        let _search_test = SEARCH_TEST_LOCK.lock().unwrap();
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("atlas-search-rank-{nonce}"));
+        let storage =
+            StorageManager::for_test(directory.join("bootstrap"), directory.join("data")).unwrap();
+        storage
+            .with_search_connection(|connection| {
+                let transaction = connection
+                    .transaction()
+                    .map_err(|error| error.to_string())?;
+                for index in 0..400 {
+                    transaction
+                        .execute(
+                            "INSERT INTO search_fts(name, path, kind) VALUES (?1, ?2, 'file')",
+                            [
+                                format!("atlas-noise-{index:03}.txt"),
+                                format!(r"D:\noise\atlas-noise-{index:03}.txt"),
+                            ],
+                        )
+                        .map_err(|error| error.to_string())?;
+                }
+                transaction
+                    .execute(
+                        "INSERT INTO search_fts(name, path, kind) VALUES ('atlas', 'D:\\atlas', 'file')",
+                        [],
+                    )
+                    .map_err(|error| error.to_string())?;
+                transaction.commit().map_err(|error| error.to_string())
+            })
+            .unwrap();
+
+        let results = search::query(&storage, "atlas", "file", "", "", &["*".into()]).unwrap();
+
+        assert_eq!(
+            results.first().map(|result| result.name.as_str()),
+            Some("atlas")
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_new_file_in_an_indexed_user_directory_is_searchable_before_the_next_rebuild() {
+        let _search_test = SEARCH_TEST_LOCK.lock().unwrap();
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("atlas-live-file-{nonce}"));
+        let root = directory.join("desktop");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("existing.txt"), b"old").unwrap();
+        let storage =
+            StorageManager::for_test(directory.join("bootstrap"), directory.join("data")).unwrap();
+        search::rebuild(&storage, vec![root.to_string_lossy().to_string()]).unwrap();
+
+        let expected = root.join("毕业设计课题拟定7.26.docx");
+        fs::write(&expected, b"new").unwrap();
+        let results = search::query(
+            &storage,
+            "毕业设计课题",
+            "file",
+            "docx",
+            "",
+            &[root.to_string_lossy().to_string()],
+        )
+        .unwrap();
+
+        assert!(results
+            .iter()
+            .any(|result| result.path == expected.to_string_lossy()));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn an_incremental_file_notification_updates_a_nested_index_entry() {
+        let _search_test = SEARCH_TEST_LOCK.lock().unwrap();
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("atlas-incremental-{nonce}"));
+        let root = directory.join("root");
+        let nested = root.join("deep").join("documents");
+        fs::create_dir_all(&nested).unwrap();
+        let storage =
+            StorageManager::for_test(directory.join("bootstrap"), directory.join("data")).unwrap();
+        search::rebuild(&storage, vec![root.to_string_lossy().to_string()]).unwrap();
+        let added = nested.join("新增论文.pdf");
+        fs::write(&added, b"pdf").unwrap();
+
+        search::refresh_path(&storage, &added).unwrap();
+        let results = search::query(
+            &storage,
+            "新增论文",
+            "file",
+            "pdf",
+            "",
+            &[root.to_string_lossy().to_string()],
+        )
+        .unwrap();
+
+        assert!(results
+            .iter()
+            .any(|result| result.path == added.to_string_lossy()));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn interrupted_index_resumes_after_the_last_completed_root() {
+        let _search_test = SEARCH_TEST_LOCK.lock().unwrap();
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("atlas-resume-{nonce}"));
+        let first = directory.join("a-root");
+        let second = directory.join("b-root");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        let preserved = first.join("preserved.txt");
+        fs::write(&preserved, b"first").unwrap();
+        let preserved_app = first.join("PreservedApp.exe");
+        fs::write(&preserved_app, b"app").unwrap();
+        let resumed = second.join("resumed.pdf");
+        fs::write(&resumed, b"second").unwrap();
+        let storage =
+            StorageManager::for_test(directory.join("bootstrap"), directory.join("data")).unwrap();
+        let roots = vec![
+            first.to_string_lossy().to_string(),
+            second.to_string_lossy().to_string(),
+        ];
+        let scope = search::scope_key(&roots);
+        storage
+            .with_search_connection(|connection| {
+                connection
+                    .execute_batch(
+                        "
+                        DROP TABLE IF EXISTS search_fts_next;
+                        CREATE VIRTUAL TABLE search_fts_next USING fts5(
+                            name, path UNINDEXED, kind UNINDEXED,
+                            modified_at UNINDEXED, tokenize = 'trigram'
+                        );
+                        ",
+                    )
+                    .map_err(|error| error.to_string())?;
+                connection
+                    .execute(
+                        "INSERT INTO search_fts_next(name, path, kind) VALUES (?1, ?2, 'file')",
+                        ["preserved.txt", &preserved.to_string_lossy()],
+                    )
+                    .map_err(|error| error.to_string())?;
+                connection
+                    .execute(
+                        "INSERT INTO search_fts_next(name, path, kind) VALUES (?1, ?2, 'app')",
+                        ["PreservedApp.exe", &preserved_app.to_string_lossy()],
+                    )
+                    .map_err(|error| error.to_string())?;
+                connection
+                    .execute(
+                        "
+                        INSERT INTO search_build_meta(
+                            id, scope, completed_roots, indexed_items
+                        ) VALUES (1, ?1, 1, 2)
+                        ",
+                        [&scope],
+                    )
+                    .map_err(|error| error.to_string())?;
+                Ok(())
+            })
+            .unwrap();
+
+        assert!(search::has_partial_index(&storage, &roots));
+        search::rebuild(&storage, roots.clone()).unwrap();
+        let preserved_results =
+            search::query(&storage, "preserved", "file", "", "", &roots).unwrap();
+        let resumed_results = search::query(&storage, "resumed", "file", "", "", &roots).unwrap();
+        let app_results = search::query(&storage, "PreservedApp", "app", "", "", &roots).unwrap();
+
+        assert!(preserved_results
+            .iter()
+            .any(|result| result.path == preserved.to_string_lossy()));
+        assert!(resumed_results
+            .iter()
+            .any(|result| result.path == resumed.to_string_lossy()));
+        assert!(app_results
+            .iter()
+            .any(|result| result.path == preserved_app.to_string_lossy()));
+        assert!(!search::has_partial_index(&storage, &roots));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn interrupted_index_preserves_the_partially_scanned_current_root() {
+        let _search_test = SEARCH_TEST_LOCK.lock().unwrap();
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("atlas-current-root-resume-{nonce}"));
+        let root = directory.join("root");
+        fs::create_dir_all(&root).unwrap();
+        let preserved = root.join("preserved.txt");
+        fs::write(&preserved, b"partial").unwrap();
+        let storage =
+            StorageManager::for_test(directory.join("bootstrap"), directory.join("data")).unwrap();
+        let roots = vec![root.to_string_lossy().to_string()];
+        let scope = search::scope_key(&roots);
+        storage
+            .with_search_connection(|connection| {
+                connection
+                    .execute_batch(
+                        "
+                        DROP TABLE IF EXISTS search_fts_next;
+                        CREATE VIRTUAL TABLE search_fts_next USING fts5(
+                            name, path UNINDEXED, kind UNINDEXED,
+                            modified_at UNINDEXED, tokenize = 'trigram'
+                        );
+                        ",
+                    )
+                    .map_err(|error| error.to_string())?;
+                connection
+                    .execute(
+                        "INSERT INTO search_fts_next(name, path, kind)
+                         VALUES ('checkpointalias', ?1, 'file')",
+                        [&preserved.to_string_lossy()],
+                    )
+                    .map_err(|error| error.to_string())?;
+                connection
+                    .execute(
+                        "
+                        INSERT INTO search_build_meta(
+                            id, scope, completed_roots, indexed_items
+                        ) VALUES (1, ?1, 0, 1)
+                        ",
+                        [&scope],
+                    )
+                    .map_err(|error| error.to_string())?;
+                Ok(())
+            })
+            .unwrap();
+
+        search::rebuild(&storage, roots.clone()).unwrap();
+        let results = search::query(&storage, "checkpointalias", "file", "", "", &roots).unwrap();
+
+        assert!(
+            results
+                .iter()
+                .any(|result| result.path == preserved.to_string_lossy()),
+            "results: {results:?}"
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn default_storage_is_next_to_the_executable() {
@@ -117,6 +456,124 @@ mod tests {
     }
 
     #[test]
+    fn installed_storage_reopens_an_existing_data_directory_and_preserves_state() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("atlas-existing-data-test-{nonce}"));
+        let install_dir = root.join("Atlas");
+        let executable = install_dir.join("atlas.exe");
+        let legacy_pointer = root.join("missing-legacy-pointer.json");
+
+        let first =
+            StorageManager::for_installed_test_with_legacy_pointer(&executable, &legacy_pointer)
+                .unwrap();
+        first
+            .update_snapshot(|snapshot| {
+                *snapshot = serde_json::json!({ "marker": "existing-data" });
+                Ok(())
+            })
+            .unwrap();
+        drop(first);
+
+        let reopened =
+            StorageManager::for_installed_test_with_legacy_pointer(&executable, &legacy_pointer)
+                .unwrap();
+
+        assert_eq!(reopened.data_dir(), install_dir.join("data"));
+        assert_eq!(
+            reopened
+                .load_snapshot()
+                .unwrap()
+                .get("marker")
+                .and_then(Value::as_str),
+            Some("existing-data")
+        );
+        drop(reopened);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn foreground_snapshot_writes_do_not_wait_for_the_search_index_writer() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("atlas-writer-gate-{nonce}"));
+        let storage = Arc::new(
+            StorageManager::for_test(directory.join("bootstrap"), directory.join("data")).unwrap(),
+        );
+        let gate = storage.index_write_guard();
+        let writer_storage = storage.clone();
+        let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+        let writer = thread::spawn(move || {
+            writer_storage.update_snapshot(|snapshot| {
+                *snapshot = serde_json::json!({ "saved": true });
+                Ok(())
+            })?;
+            completed_tx.send(()).map_err(|error| error.to_string())
+        });
+
+        assert!(completed_rx
+            .recv_timeout(std::time::Duration::from_millis(250))
+            .is_ok());
+        drop(gate);
+        writer.join().unwrap().unwrap();
+        assert_eq!(
+            storage
+                .load_snapshot()
+                .unwrap()
+                .get("saved")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        drop(storage);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn background_index_throttle_never_creates_visible_quarter_second_stalls() {
+        assert!(search::index_pause_millis(100, true) <= 40);
+        assert!(search::index_pause_millis(100, false) <= 40);
+    }
+
+    #[test]
+    fn deleting_one_clipboard_entry_removes_its_image_file() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("atlas-delete-clipboard-{nonce}"));
+        let storage =
+            StorageManager::for_test(directory.join("bootstrap"), directory.join("data")).unwrap();
+        let image = storage
+            .data_dir()
+            .join("clipboard-images")
+            .join("entry.png");
+        fs::create_dir_all(image.parent().unwrap()).unwrap();
+        fs::write(&image, b"png").unwrap();
+        storage
+            .update_snapshot(|snapshot| {
+                *snapshot = serde_json::json!({
+                    "clipboardHistory": [
+                        { "id": "image", "kind": "image", "imageFile": "clipboard-images/entry.png", "copiedAt": 2 },
+                        { "id": "text", "kind": "text", "text": "keep", "copiedAt": 1 }
+                    ]
+                });
+                Ok(())
+            })
+            .unwrap();
+
+        let remaining = delete_clipboard_entry(&storage, "image").unwrap();
+
+        assert!(!image.exists());
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].get("id").and_then(Value::as_str), Some("text"));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn loading_snapshot_never_runs_schema_migrations_or_mutates_tables() {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -126,7 +583,7 @@ mod tests {
         let storage =
             StorageManager::for_test(directory.join("bootstrap"), directory.join("data")).unwrap();
         storage
-            .with_connection(|connection| {
+            .with_state_connection(|connection| {
                 connection
                     .execute_batch(
                         "
@@ -856,7 +1313,7 @@ mod tests {
     }
 
     #[test]
-    fn search_index_streams_files_through_staging_database() {
+    fn search_index_streams_files_directly_into_the_next_fts_table() {
         let _search_test = SEARCH_TEST_LOCK.lock().unwrap();
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -900,7 +1357,7 @@ mod tests {
         assert_eq!(unique_results.len(), 1);
         let outside = directory.join("outside").join("quarterly-secret.txt");
         storage
-            .with_connection(|connection| {
+            .with_search_connection(|connection| {
                 connection
                     .execute(
                         "INSERT INTO search_fts(name, path, kind) VALUES (?1, ?2, ?3)",
@@ -938,7 +1395,7 @@ mod tests {
             assert_eq!(drive_results.len(), 2);
         }
         storage
-            .with_connection(|connection| {
+            .with_search_connection(|connection| {
                 connection
                     .execute(
                         "INSERT INTO search_fts(name, path, kind) VALUES (?1, ?2, ?3)",
@@ -972,7 +1429,7 @@ mod tests {
         search::rebuild(&storage, vec![files.to_string_lossy().to_string()]).unwrap();
 
         let (schema, indexed_name) = storage
-            .with_read_connection(|connection| {
+            .with_search_read_connection(|connection| {
                 let schema = connection
                     .query_row(
                         "SELECT sql FROM sqlite_master WHERE name = 'search_fts'",
@@ -996,6 +1453,43 @@ mod tests {
             "indexed name was {indexed_name:?}"
         );
         assert!(indexed_name.len() < 256);
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn chinese_document_aliases_do_not_bloat_the_full_disk_index() {
+        let _search_test = SEARCH_TEST_LOCK.lock().unwrap();
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("atlas-file-aliases-{nonce}"));
+        let files = directory.join("files");
+        fs::create_dir_all(&files).unwrap();
+        let name = format!("{}.docx", "毕业设计课题拟定与评审记录".repeat(6));
+        fs::write(files.join(&name), b"document").unwrap();
+        let storage =
+            StorageManager::for_test(directory.join("bootstrap"), directory.join("data")).unwrap();
+
+        search::rebuild(&storage, vec![files.to_string_lossy().to_string()]).unwrap();
+
+        let indexed_name = storage
+            .with_search_read_connection(|connection| {
+                connection
+                    .query_row(
+                        "SELECT name FROM search_fts WHERE kind = 'file' LIMIT 1",
+                        [],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .map_err(|error| error.to_string())
+            })
+            .unwrap();
+        assert!(
+            indexed_name.len() < 768,
+            "document aliases used {} bytes",
+            indexed_name.len()
+        );
 
         fs::remove_dir_all(directory).unwrap();
     }
@@ -1182,7 +1676,7 @@ mod tests {
         let storage =
             StorageManager::for_test(directory.join("bootstrap"), directory.join("data")).unwrap();
         storage
-            .with_connection(|connection| {
+            .with_search_connection(|connection| {
                 connection
                     .execute(
                         "INSERT INTO search_fts(name, path, kind) VALUES ('legacy', 'D:\\legacy.txt', 'file')",

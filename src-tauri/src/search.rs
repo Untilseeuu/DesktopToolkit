@@ -1,10 +1,15 @@
 #[cfg(all(target_os = "windows", not(test)))]
+use std::collections::HashMap;
+#[cfg(all(target_os = "windows", not(test)))]
 use std::sync::OnceLock;
 use std::{
-    collections::HashSet,
+    collections::{BTreeSet, HashSet},
     fs,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -25,21 +30,33 @@ struct IndexState {
     status: u8,
     running: bool,
     pending: Option<Vec<String>>,
+    phase: u8,
+    indexed_items: usize,
+    completed_roots: usize,
+    total_roots: usize,
+    current_root: Option<String>,
 }
 
 static INDEX_STATE: Mutex<IndexState> = Mutex::new(IndexState {
     status: 0,
     running: false,
     pending: None,
+    phase: 0,
+    indexed_items: 0,
+    completed_roots: 0,
+    total_roots: 0,
+    current_root: None,
 });
 static INDEX_REVISION: AtomicU64 = AtomicU64::new(0);
 static QUERY_REVISION: AtomicU64 = AtomicU64::new(0);
+#[cfg(all(target_os = "windows", not(test)))]
+static WATCH_REVISION: AtomicU64 = AtomicU64::new(0);
 static LAST_QUERY_AT_MS: AtomicU64 = AtomicU64::new(0);
 static QUERY_GATE: Mutex<()> = Mutex::new(());
-static ROOT_FOLDER_CACHE: Mutex<RootFolderCache> = Mutex::new(RootFolderCache {
+static LIVE_RESULT_CACHE: Mutex<LiveResultCache> = Mutex::new(LiveResultCache {
     scope: String::new(),
     refreshed_at: None,
-    folders: Vec::new(),
+    results: Vec::new(),
 });
 #[cfg(all(target_os = "windows", not(test)))]
 static REGISTERED_APPS: OnceLock<Vec<RegisteredApp>> = OnceLock::new();
@@ -47,14 +64,23 @@ static REGISTERED_APPS: OnceLock<Vec<RegisteredApp>> = OnceLock::new();
 const INDEXED_NAME_SEPARATOR: char = '\u{1f}';
 const RESULT_LIMIT: usize = 120;
 const CANDIDATE_LIMIT: usize = 320;
-const ROOT_FOLDER_CACHE_TTL: Duration = Duration::from_secs(5);
+const LIVE_RESULT_CACHE_TTL: Duration = Duration::from_secs(2);
+const LIVE_RESULT_CACHE_LIMIT: usize = 8_192;
+const MAX_PINYIN_ALIAS_CHARS: usize = 160;
+const MAX_FUZZY_ALIAS_TOKENS: usize = 48;
+const MAX_FILE_FUZZY_ALIAS_TOKENS: usize = 24;
 #[cfg(not(test))]
-const INTERACTIVE_QUERY_GRACE_MS: u64 = 1_500;
+const INTERACTIVE_QUERY_GRACE_MS: u64 = 2_500;
 
-struct RootFolderCache {
+pub(crate) fn index_pause_millis(work_millis: u64, interactive_query: bool) -> u64 {
+    let multiplier = if interactive_query { 2 } else { 1 };
+    work_millis.saturating_mul(multiplier).clamp(1, 40)
+}
+
+struct LiveResultCache {
     scope: String,
     refreshed_at: Option<Instant>,
-    folders: Vec<SearchResult>,
+    results: Vec<SearchResult>,
 }
 
 #[cfg(all(target_os = "windows", not(test)))]
@@ -120,14 +146,10 @@ impl IndexThrottle {
         }
         let work_time = self.work_started.elapsed();
         let since_query = epoch_millis().saturating_sub(LAST_QUERY_AT_MS.load(Ordering::Acquire));
-        let multiplier = if since_query < INTERACTIVE_QUERY_GRACE_MS {
-            5
-        } else {
-            1
-        };
-        let pause_ms = (work_time.as_millis() as u64)
-            .saturating_mul(multiplier)
-            .clamp(2, 250);
+        let pause_ms = index_pause_millis(
+            work_time.as_millis() as u64,
+            since_query < INTERACTIVE_QUERY_GRACE_MS,
+        );
         std::thread::sleep(Duration::from_millis(pause_ms));
         self.work_started = Instant::now();
     }
@@ -147,6 +169,21 @@ impl IndexThrottle {
 
 fn yield_indexer_to_interactive_work(throttle: &mut IndexThrottle) {
     throttle.pause();
+}
+
+fn update_index_progress(
+    phase: u8,
+    indexed_items: usize,
+    completed_roots: usize,
+    total_roots: usize,
+    current_root: Option<String>,
+) {
+    let mut state = INDEX_STATE.lock();
+    state.phase = phase;
+    state.indexed_items = indexed_items;
+    state.completed_roots = completed_roots;
+    state.total_roots = total_roots;
+    state.current_root = current_root;
 }
 
 const SYNONYM_GROUPS: &[&[&str]] = &[
@@ -174,6 +211,17 @@ pub struct SearchResult {
     pub path: String,
     pub kind: String,
     pub modified_at: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct IndexProgress {
+    pub status: String,
+    pub phase: String,
+    pub indexed_items: usize,
+    pub completed_roots: usize,
+    pub total_roots: usize,
+    pub current_root: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -313,14 +361,29 @@ fn expanded_search_terms(query: &str) -> Vec<String> {
 }
 
 fn encode_indexed_name(name: &str, kind: &str) -> String {
-    let mut aliases = pinyin_aliases(name);
+    let mut aliases = pinyin_aliases(name)
+        .into_iter()
+        .map(|alias| {
+            alias
+                .chars()
+                .take(MAX_PINYIN_ALIAS_CHARS)
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>();
     let mut fuzzy_sources = vec![name.to_string()];
-    if matches!(kind, "app" | "folder") || name.chars().any(|character| !character.is_ascii()) {
+    if matches!(kind, "app" | "folder") {
         fuzzy_sources.extend(aliases.iter().cloned());
     }
-    for source in fuzzy_sources {
-        aliases.extend(fuzzy_bigram_tokens(&source));
-    }
+    aliases.extend(
+        fuzzy_sources
+            .into_iter()
+            .flat_map(|source| fuzzy_bigram_tokens(&source))
+            .take(if kind == "file" {
+                MAX_FILE_FUZZY_ALIAS_TOKENS
+            } else {
+                MAX_FUZZY_ALIAS_TOKENS
+            }),
+    );
     if aliases.is_empty() {
         name.to_string()
     } else {
@@ -570,16 +633,25 @@ pub fn include_application_roots(requested_roots: &[String]) -> bool {
     requested_roots.is_empty() || requested_roots.iter().any(|root| root == "*")
 }
 
-fn immediate_folder_results(
+#[cfg(not(test))]
+fn live_user_roots() -> Vec<PathBuf> {
+    let home = std::env::var_os("USERPROFILE")
+        .map(PathBuf::from)
+        .unwrap_or_default();
+    ["Desktop", "Documents", "Downloads"]
+        .into_iter()
+        .map(|folder| home.join(folder))
+        .filter(|root| root.is_dir())
+        .collect()
+}
+
+fn immediate_live_results(
     query: &str,
     kind: &str,
     extension: &str,
     drive: &str,
     requested_roots: &[String],
 ) -> Vec<SearchResult> {
-    if (!kind.trim().is_empty() && kind != "folder") || !extension.trim().is_empty() {
-        return Vec::new();
-    }
     let scope = if include_application_roots(requested_roots) {
         "*".to_string()
     } else {
@@ -587,14 +659,14 @@ fn immediate_folder_results(
     };
     let now = Instant::now();
     let cached = {
-        let cache = ROOT_FOLDER_CACHE.lock();
+        let cache = LIVE_RESULT_CACHE.lock();
         (cache.scope == scope
             && cache
                 .refreshed_at
-                .is_some_and(|refreshed| now.duration_since(refreshed) < ROOT_FOLDER_CACHE_TTL))
-        .then(|| cache.folders.clone())
+                .is_some_and(|refreshed| now.duration_since(refreshed) < LIVE_RESULT_CACHE_TTL))
+        .then(|| cache.results.clone())
     };
-    let folders = cached.unwrap_or_else(|| {
+    let live_results = cached.unwrap_or_else(|| {
         let roots = if include_application_roots(requested_roots) {
             #[cfg(test)]
             {
@@ -602,15 +674,15 @@ fn immediate_folder_results(
             }
             #[cfg(not(test))]
             {
-                default_roots()
+                live_user_roots()
             }
         } else {
             requested_roots.iter().map(PathBuf::from).collect()
         };
         let mut seen = HashSet::new();
-        let mut folders = Vec::new();
+        let mut results = Vec::new();
         for root in roots {
-            let candidates = std::iter::once(root.clone()).chain(
+            let candidates = std::iter::once((root.clone(), true)).chain(
                 fs::read_dir(&root)
                     .into_iter()
                     .flatten()
@@ -619,11 +691,12 @@ fn immediate_folder_results(
                         entry
                             .file_type()
                             .ok()
-                            .filter(|file_type| file_type.is_dir())
-                            .map(|_| entry.path())
+                            .map(|file_type| (entry.path(), file_type.is_dir()))
                     }),
             );
-            for path in candidates {
+            for (path, is_dir) in
+                candidates.take(LIVE_RESULT_CACHE_LIMIT.saturating_sub(results.len()))
+            {
                 let name = path
                     .file_name()
                     .and_then(|value| value.to_str())
@@ -646,27 +719,48 @@ fn immediate_folder_results(
                 if !seen.insert(path_key) || !path_matches_roots(&path, requested_roots) {
                     continue;
                 }
-                folders.push(SearchResult {
-                    id: format!("live-folder-{}", folders.len()),
+                let result_kind = kind_for_path(&path, is_dir);
+                if result_kind == "app" && is_noisy_application(&path) {
+                    continue;
+                }
+                results.push(SearchResult {
+                    id: format!("live-{result_kind}-{}", results.len()),
                     name,
                     path: display,
-                    kind: "folder".into(),
+                    kind: result_kind.into(),
                     modified_at: None,
                 });
             }
+            if results.len() >= LIVE_RESULT_CACHE_LIMIT {
+                break;
+            }
         }
-        let mut cache = ROOT_FOLDER_CACHE.lock();
+        let mut cache = LIVE_RESULT_CACHE.lock();
         cache.scope = scope;
         cache.refreshed_at = Some(now);
-        cache.folders = folders.clone();
-        folders
+        cache.results = results.clone();
+        results
     });
     let terms = expanded_search_terms(query);
     let normalized_drive = drive.trim().to_lowercase();
-    let mut matches = folders
+    let normalized_extension = extension
+        .trim()
+        .trim_start_matches('.')
+        .to_ascii_lowercase();
+    let mut matches = live_results
         .into_iter()
         .filter(|result| {
-            normalized_drive.is_empty() || result.path.to_lowercase().starts_with(&normalized_drive)
+            (kind.trim().is_empty() || result.kind == kind)
+                && (normalized_drive.is_empty()
+                    || result.path.to_lowercase().starts_with(&normalized_drive))
+                && (normalized_extension.is_empty()
+                    || (result.kind == "file"
+                        && Path::new(&result.path)
+                            .extension()
+                            .and_then(|value| value.to_str())
+                            .is_some_and(|value| {
+                                value.eq_ignore_ascii_case(&normalized_extension)
+                            })))
         })
         .filter_map(|result| {
             let quality = match_quality(&result.name, &result.path, &terms)?;
@@ -687,7 +781,7 @@ fn immediate_folder_results(
     });
     matches
         .into_iter()
-        .take(64)
+        .take(RESULT_LIMIT)
         .map(|(_, result)| result)
         .collect()
 }
@@ -729,12 +823,14 @@ fn should_descend(entry: &DirEntry) -> bool {
 }
 
 fn kind_for_entry(entry: &DirEntry) -> &'static str {
-    if entry.file_type().is_dir() {
+    kind_for_path(entry.path(), entry.file_type().is_dir())
+}
+
+fn kind_for_path(path: &Path, is_dir: bool) -> &'static str {
+    if is_dir {
         "folder"
     } else if matches!(
-        entry
-            .path()
-            .extension()
+        path.extension()
             .and_then(|value| value.to_str())
             .unwrap_or_default()
             .to_ascii_lowercase()
@@ -746,6 +842,246 @@ fn kind_for_entry(entry: &DirEntry) -> &'static str {
         "file"
     }
 }
+
+pub fn refresh_path(storage: &StorageManager, path: &Path) -> Result<(), String> {
+    let display = display_path(path);
+    let metadata = path.metadata().ok();
+    let is_dir = metadata.as_ref().is_some_and(|value| value.is_dir());
+    let exists = metadata.is_some();
+    let _writer = storage.index_write_guard();
+    let mut connection =
+        Connection::open(storage.search_database_path()).map_err(|error| error.to_string())?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
+    let next_exists = transaction
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='search_fts_next')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .unwrap_or(false);
+    let tables = if next_exists {
+        vec!["search_fts", "search_fts_next"]
+    } else {
+        vec!["search_fts"]
+    };
+    let child_prefix = format!("{}\\", display.trim_end_matches(['\\', '/']));
+    for table in &tables {
+        if exists {
+            transaction
+                .execute(&format!("DELETE FROM {table} WHERE path = ?1"), [&display])
+                .map_err(|error| error.to_string())?;
+        } else {
+            transaction
+                .execute(
+                    &format!(
+                        "DELETE FROM {table} WHERE path = ?1 OR substr(path, 1, length(?2)) = ?2"
+                    ),
+                    params![display, child_prefix],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    if exists {
+        let kind = kind_for_path(path, is_dir);
+        if !(kind == "app" && is_noisy_application(path)) {
+            let name = if kind == "app" {
+                application_display_name(path)
+            } else {
+                path.file_name()
+                    .map(|value| value.to_string_lossy().to_string())
+                    .unwrap_or_else(|| display.clone())
+            };
+            if !name.is_empty() {
+                let indexed = encode_indexed_name(&name, kind);
+                for table in tables {
+                    transaction
+                        .execute(
+                            &format!(
+                                "INSERT INTO {table}(name, path, kind, modified_at) VALUES (?1, ?2, ?3, NULL)"
+                            ),
+                            params![indexed, display, kind],
+                        )
+                        .map_err(|error| error.to_string())?;
+                }
+            }
+        }
+    }
+    transaction.commit().map_err(|error| error.to_string())
+}
+
+#[cfg(all(target_os = "windows", not(test)))]
+pub fn start_watchers(storage: Arc<StorageManager>, requested_roots: Vec<String>) {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::{
+        Foundation::{
+            CloseHandle, GetLastError, ERROR_IO_PENDING, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
+            WAIT_TIMEOUT,
+        },
+        Storage::FileSystem::{
+            CreateFileW, ReadDirectoryChangesW, FILE_ACTION_ADDED, FILE_ACTION_RENAMED_NEW_NAME,
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OVERLAPPED, FILE_LIST_DIRECTORY,
+            FILE_NOTIFY_CHANGE_CREATION, FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME,
+            FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE, FILE_NOTIFY_INFORMATION,
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+        },
+        System::{
+            Threading::{CreateEventW, ResetEvent, WaitForSingleObject},
+            IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED},
+        },
+    };
+
+    let revision = WATCH_REVISION.fetch_add(1, Ordering::AcqRel) + 1;
+    let watcher_scope = if requested_roots.is_empty() {
+        vec!["*".to_string()]
+    } else {
+        requested_roots.clone()
+    };
+    let roots = if requested_roots.is_empty() || requested_roots.iter().any(|root| root == "*") {
+        default_roots()
+    } else {
+        requested_roots.into_iter().map(PathBuf::from).collect()
+    };
+    for root in distinct_roots(roots) {
+        let storage = storage.clone();
+        let watcher_scope = watcher_scope.clone();
+        std::thread::spawn(move || {
+            let mut wide = root.as_os_str().encode_wide().collect::<Vec<_>>();
+            wide.push(0);
+            let handle = unsafe {
+                CreateFileW(
+                    wide.as_ptr(),
+                    FILE_LIST_DIRECTORY,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    std::ptr::null(),
+                    OPEN_EXISTING,
+                    FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED,
+                    std::ptr::null_mut(),
+                )
+            };
+            if handle == INVALID_HANDLE_VALUE {
+                return;
+            }
+            let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+            if event.is_null() {
+                unsafe {
+                    CloseHandle(handle);
+                }
+                return;
+            }
+            let mut buffer = vec![0u8; 64 * 1024];
+            'watch: while WATCH_REVISION.load(Ordering::Acquire) == revision {
+                let mut returned = 0u32;
+                let mut overlapped = unsafe { std::mem::zeroed::<OVERLAPPED>() };
+                overlapped.hEvent = event;
+                unsafe {
+                    ResetEvent(event);
+                }
+                let ok = unsafe {
+                    ReadDirectoryChangesW(
+                        handle,
+                        buffer.as_mut_ptr().cast(),
+                        buffer.len() as u32,
+                        1,
+                        FILE_NOTIFY_CHANGE_FILE_NAME
+                            | FILE_NOTIFY_CHANGE_DIR_NAME
+                            | FILE_NOTIFY_CHANGE_SIZE
+                            | FILE_NOTIFY_CHANGE_LAST_WRITE
+                            | FILE_NOTIFY_CHANGE_CREATION,
+                        std::ptr::null_mut(),
+                        &mut overlapped,
+                        None,
+                    )
+                };
+                if ok == 0 && unsafe { GetLastError() } != ERROR_IO_PENDING {
+                    break;
+                }
+                loop {
+                    match unsafe { WaitForSingleObject(event, 500) } {
+                        WAIT_OBJECT_0 => {
+                            if unsafe { GetOverlappedResult(handle, &overlapped, &mut returned, 0) }
+                                == 0
+                            {
+                                break 'watch;
+                            }
+                            break;
+                        }
+                        WAIT_TIMEOUT => {
+                            if WATCH_REVISION.load(Ordering::Acquire) != revision {
+                                unsafe {
+                                    CancelIoEx(handle, &overlapped);
+                                    GetOverlappedResult(handle, &overlapped, &mut returned, 1);
+                                }
+                                break 'watch;
+                            }
+                        }
+                        _ => break 'watch,
+                    }
+                }
+                if returned == 0 {
+                    // A zero-byte completion means notifications overflowed. Rebuild
+                    // the configured scope once, then keep the subscription alive.
+                    let _ = rebuild(&storage, watcher_scope.clone());
+                    continue;
+                }
+                let mut offset = 0usize;
+                let mut changed_paths = HashMap::new();
+                while offset < returned as usize {
+                    let info = unsafe {
+                        &*(buffer
+                            .as_ptr()
+                            .add(offset)
+                            .cast::<FILE_NOTIFY_INFORMATION>())
+                    };
+                    let name = unsafe {
+                        std::slice::from_raw_parts(
+                            info.FileName.as_ptr(),
+                            info.FileNameLength as usize / 2,
+                        )
+                    };
+                    let relative = String::from_utf16_lossy(name);
+                    changed_paths.insert(root.join(relative), info.Action);
+                    if info.NextEntryOffset == 0 {
+                        break;
+                    }
+                    offset += info.NextEntryOffset as usize;
+                }
+                for (path, action) in changed_paths {
+                    let _ = refresh_path(&storage, &path);
+                    if path.is_dir()
+                        && matches!(action, FILE_ACTION_ADDED | FILE_ACTION_RENAMED_NEW_NAME)
+                    {
+                        for entry in WalkDir::new(&path)
+                            .follow_links(false)
+                            .into_iter()
+                            .filter_entry(should_descend)
+                            .filter_map(Result::ok)
+                            .skip(1)
+                        {
+                            let _ = refresh_path(&storage, entry.path());
+                        }
+                    }
+                }
+            }
+            unsafe {
+                CloseHandle(event);
+                CloseHandle(handle);
+            }
+        });
+    }
+}
+
+#[cfg(all(target_os = "windows", not(test)))]
+pub fn stop_watchers() {
+    WATCH_REVISION.fetch_add(1, Ordering::AcqRel);
+}
+
+#[cfg(any(not(target_os = "windows"), test))]
+pub fn start_watchers(_storage: Arc<StorageManager>, _requested_roots: Vec<String>) {}
+
+#[cfg(any(not(target_os = "windows"), test))]
+pub fn stop_watchers() {}
 
 fn normalized_app_name(value: &str) -> String {
     value
@@ -786,7 +1122,7 @@ pub fn is_noisy_application(path: &Path) -> bool {
         .is_some_and(is_noisy_app_name)
 }
 
-pub fn png_data_url(bytes: &[u8]) -> String {
+pub fn base64_encode(bytes: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
@@ -806,7 +1142,11 @@ pub fn png_data_url(bytes: &[u8]) -> String {
             '='
         });
     }
-    format!("data:image/png;base64,{encoded}")
+    encoded
+}
+
+pub fn png_data_url(bytes: &[u8]) -> String {
+    format!("data:image/png;base64,{}", base64_encode(bytes))
 }
 
 pub fn application_display_name(path: &Path) -> String {
@@ -864,6 +1204,25 @@ pub fn default_roots() -> Vec<PathBuf> {
         roots.push(PathBuf::from("/"));
     }
     roots
+}
+
+pub fn drive_labels_from_roots<'a>(roots: impl IntoIterator<Item = &'a Path>) -> Vec<String> {
+    roots
+        .into_iter()
+        .filter_map(|root| {
+            let value = root.to_string_lossy();
+            let bytes = value.as_bytes();
+            (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
+                .then(|| format!("{}:", (bytes[0] as char).to_ascii_uppercase()))
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+pub fn available_drives() -> Vec<String> {
+    let roots = default_roots();
+    drive_labels_from_roots(roots.iter().map(PathBuf::as_path))
 }
 
 pub fn bootstrap_roots_from(home: &Path, roaming: &Path, program_data: &Path) -> Vec<PathBuf> {
@@ -937,9 +1296,9 @@ fn distinct_roots(roots: Vec<PathBuf>) -> Vec<PathBuf> {
     distinct
 }
 
-fn scope_key(requested_roots: &[String]) -> String {
+pub(crate) fn scope_key(requested_roots: &[String]) -> String {
     if requested_roots.is_empty() || requested_roots.iter().any(|root| root == "*") {
-        return "[\"v8\",\"*\"]".to_string();
+        return "[\"v9\",\"*\"]".to_string();
     }
     let mut roots = distinct_roots(requested_roots.iter().map(PathBuf::from).collect())
         .iter()
@@ -953,7 +1312,7 @@ fn scope_key(requested_roots: &[String]) -> String {
         })
         .collect::<Vec<_>>();
     roots.sort();
-    roots.insert(0, "v8".to_string());
+    roots.insert(0, "v9".to_string());
     serde_json::to_string(&roots).unwrap_or_else(|_| "[]".to_string())
 }
 
@@ -999,6 +1358,11 @@ fn rebuild_at_revision(
         }
         state.running = true;
         state.status = 1;
+        state.phase = 1;
+        state.indexed_items = 0;
+        state.completed_roots = 0;
+        state.total_roots = 0;
+        state.current_root = None;
     }
 
     let mut roots = requested_roots;
@@ -1014,39 +1378,51 @@ fn rebuild_at_revision(
         }
         state.running = false;
         state.status = if result.is_ok() { 2 } else { 3 };
+        state.phase = if result.is_ok() { 2 } else { 3 };
+        state.current_root = None;
+        if let Ok(count) = result.as_ref() {
+            state.indexed_items = *count;
+            state.completed_roots = state.total_roots;
+        }
+        drop(state);
         return result;
     }
 }
 
-const INDEX_BATCH_SIZE: usize = 2_048;
-const INDEX_COPY_BATCH_SIZE: usize = 16_384;
-
-struct StagingFileGuard(PathBuf);
-
-impl Drop for StagingFileGuard {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
-    }
-}
+const INDEX_BATCH_SIZE: usize = 512;
 
 fn flush_index_batch(
+    storage: &StorageManager,
     connection: &mut Connection,
     records: &mut Vec<(String, String, &'static str)>,
+    preserve_existing: bool,
 ) -> Result<(), String> {
     if records.is_empty() {
         return Ok(());
     }
+    let _writer = storage.index_write_guard();
     let transaction = connection
         .transaction()
         .map_err(|error| error.to_string())?;
     {
         let mut statement = transaction
             .prepare(
-                "INSERT INTO search_entries(name, path, kind, modified_at)
+                "INSERT INTO search_fts_next(name, path, kind, modified_at)
                  VALUES (?1, ?2, ?3, ?4)",
             )
             .map_err(|error| error.to_string())?;
         for (name, path, kind) in records.drain(..) {
+            if !preserve_existing {
+                transaction
+                    .execute("DELETE FROM search_fts_next WHERE path = ?1", [&path])
+                    .map_err(|error| error.to_string())?;
+            }
+            let filesystem_path = path.starts_with(r"\\")
+                || (path.as_bytes().get(1) == Some(&b':')
+                    && path.as_bytes().first().is_some_and(u8::is_ascii_alphabetic));
+            if filesystem_path && !Path::new(&path).exists() {
+                continue;
+            }
             statement
                 .execute(params![name, path, kind, Option::<u64>::None])
                 .map_err(|error| error.to_string())?;
@@ -1082,32 +1458,101 @@ fn rebuild_inner(
         roots
     };
     let roots = distinct_roots(roots);
-    let staging_path = storage.data_dir().join("search-index-staging.db");
-    if staging_path.exists() {
-        fs::remove_file(&staging_path).map_err(|error| error.to_string())?;
+    let total_roots = roots.len();
+    let legacy_staging = storage.data_dir().join("search-index-staging.db");
+    if legacy_staging.exists() {
+        fs::remove_file(legacy_staging).map_err(|error| error.to_string())?;
     }
-    let _staging_guard = StagingFileGuard(staging_path.clone());
-    let mut staging = Connection::open(&staging_path).map_err(|error| error.to_string())?;
-    staging
+    let mut index_connection =
+        Connection::open(storage.search_database_path()).map_err(|error| error.to_string())?;
+    index_connection
+        .busy_timeout(Duration::from_secs(8))
+        .map_err(|error| error.to_string())?;
+    let writer = storage.index_write_guard();
+    index_connection
         .execute_batch(
             "
-            PRAGMA journal_mode = OFF;
-            PRAGMA synchronous = OFF;
-            PRAGMA temp_store = FILE;
+            PRAGMA synchronous = NORMAL;
+            PRAGMA temp_store = MEMORY;
             PRAGMA cache_size = -8192;
-            PRAGMA mmap_size = 0;
-            CREATE TABLE search_entries(
-                rowid INTEGER PRIMARY KEY,
-                name TEXT NOT NULL,
-                path TEXT NOT NULL,
-                kind TEXT NOT NULL,
-                modified_at INTEGER
-            );
             ",
         )
         .map_err(|error| error.to_string())?;
+    let resumable = index_connection
+        .query_row(
+            "
+            SELECT EXISTS(
+                SELECT 1 FROM sqlite_master
+                WHERE type = 'table' AND name = 'search_fts_next'
+            ) AND EXISTS(
+                SELECT 1 FROM search_build_meta
+                WHERE id = 1 AND scope = ?1
+            )
+            ",
+            [&scope],
+            |row| row.get::<_, bool>(0),
+        )
+        .unwrap_or(false);
+    if !resumable {
+        index_connection
+            .execute_batch(
+                "
+                DROP TABLE IF EXISTS search_fts_next;
+                CREATE VIRTUAL TABLE search_fts_next USING fts5(
+                    name,
+                    path UNINDEXED,
+                    kind UNINDEXED,
+                    modified_at UNINDEXED,
+                    tokenize = 'trigram'
+                );
+                DELETE FROM search_build_meta;
+                ",
+            )
+            .map_err(|error| error.to_string())?;
+        index_connection
+            .execute(
+                "
+                INSERT INTO search_build_meta(
+                    id, scope, completed_roots, indexed_items, updated_at
+                ) VALUES (1, ?1, 0, 0, unixepoch())
+                ",
+                [&scope],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    let completed_roots = if resumable {
+        index_connection
+            .query_row(
+                "SELECT completed_roots FROM search_build_meta WHERE id = 1",
+                [],
+                |row| row.get::<_, usize>(0),
+            )
+            .unwrap_or(0)
+            .min(total_roots)
+    } else {
+        0
+    };
+    // Application discovery is cheap and may change independently of a disk root.
+    // Refresh registered application paths one by one. Deleting every app row here
+    // would also remove .exe/.lnk entries from roots already completed before a
+    // restart, while those roots are intentionally skipped during resume.
+    for app in system_apps {
+        index_connection
+            .execute("DELETE FROM search_fts_next WHERE path = ?1", [&app.path])
+            .map_err(|error| error.to_string())?;
+    }
+    // Keep the rows already committed for the interrupted root. On restart the
+    // current root is scanned again and the final compaction removes exact
+    // duplicates. This makes progress immediately searchable and avoids
+    // throwing away a long-running drive scan whenever Atlas exits.
+    let mut count = index_connection
+        .query_row("SELECT COUNT(*) FROM search_fts_next", [], |row| {
+            row.get::<_, usize>(0)
+        })
+        .unwrap_or(0);
+    drop(writer);
+    update_index_progress(1, count, completed_roots, total_roots, None);
     let mut batch = Vec::with_capacity(INDEX_BATCH_SIZE);
-    let mut count = 0usize;
     let mut indexed_app_paths = HashSet::new();
 
     for app in system_apps {
@@ -1130,7 +1575,8 @@ fn rebuild_inner(
         ));
         count += 1;
         if batch.len() >= INDEX_BATCH_SIZE {
-            flush_index_batch(&mut staging, &mut batch)?;
+            flush_index_batch(storage, &mut index_connection, &mut batch, resumable)?;
+            update_index_progress(1, count, completed_roots, total_roots, None);
             yield_indexer_to_interactive_work(&mut throttle);
             if INDEX_REVISION.load(Ordering::Acquire) != revision {
                 return Err("索引范围已更新，正在切换到最新目录".into());
@@ -1138,8 +1584,16 @@ fn rebuild_inner(
         }
     }
 
-    for root in roots {
-        for entry in WalkDir::new(root)
+    for (root_index, root) in roots.into_iter().enumerate().skip(completed_roots) {
+        let current_root = display_path(&root);
+        update_index_progress(
+            1,
+            count,
+            root_index,
+            total_roots,
+            Some(current_root.clone()),
+        );
+        for entry in WalkDir::new(&root)
             .follow_links(false)
             .into_iter()
             .filter_entry(should_descend)
@@ -1176,102 +1630,91 @@ fn rebuild_inner(
             batch.push((encode_indexed_name(&name, kind), display_path, kind));
             count += 1;
             if batch.len() >= INDEX_BATCH_SIZE {
-                flush_index_batch(&mut staging, &mut batch)?;
+                flush_index_batch(storage, &mut index_connection, &mut batch, resumable)?;
+                update_index_progress(
+                    1,
+                    count,
+                    root_index,
+                    total_roots,
+                    Some(current_root.clone()),
+                );
                 yield_indexer_to_interactive_work(&mut throttle);
                 if INDEX_REVISION.load(Ordering::Acquire) != revision {
                     return Err("索引范围已更新，正在切换到最新目录".into());
                 }
             }
         }
+        flush_index_batch(storage, &mut index_connection, &mut batch, resumable)?;
+        {
+            let _writer = storage.index_write_guard();
+            index_connection
+                .execute(
+                    "
+                    UPDATE search_build_meta
+                    SET completed_roots = ?1, indexed_items = ?2, updated_at = unixepoch()
+                    WHERE id = 1
+                    ",
+                    params![root_index + 1, count],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        update_index_progress(1, count, root_index + 1, total_roots, None);
     }
-    flush_index_batch(&mut staging, &mut batch)?;
-    drop(staging);
+    flush_index_batch(storage, &mut index_connection, &mut batch, resumable)?;
     if INDEX_REVISION.load(Ordering::Acquire) != revision {
         return Err("索引范围已更新，正在切换到最新目录".into());
     }
-
-    let staging_display = staging_path.to_string_lossy().to_string();
-    let swap_result = storage.with_background_connection(|connection| {
-        connection
-            .execute("ATTACH DATABASE ?1 AS staging", [&staging_display])
-            .map_err(|error| error.to_string())?;
-        let operation = (|| -> Result<usize, String> {
-            connection
-                .execute_batch(
-                    "
-                    DROP TABLE IF EXISTS search_fts_next;
-                    CREATE VIRTUAL TABLE search_fts_next USING fts5(
-                        name,
-                        path UNINDEXED,
-                        kind UNINDEXED,
-                        modified_at UNINDEXED,
-                        tokenize = 'trigram'
-                    );
-                    ",
-                )
-                .map_err(|error| error.to_string())?;
-            let mut copied = 0usize;
-            while copied < count {
-                if INDEX_REVISION.load(Ordering::Acquire) != revision {
-                    return Err("索引范围已更新，正在切换到最新目录".into());
-                }
-                let transaction = connection
-                    .transaction()
-                    .map_err(|error| error.to_string())?;
-                transaction
-                    .execute(
-                        "
-                INSERT INTO search_fts_next(rowid, name, path, kind, modified_at)
-                SELECT rowid, name, path, kind, modified_at
-                        FROM staging.search_entries
-                        WHERE rowid > ?1 AND rowid <= ?2
-                        ",
-                        params![copied, copied + INDEX_COPY_BATCH_SIZE],
-                    )
-                    .map_err(|error| error.to_string())?;
-                transaction.commit().map_err(|error| error.to_string())?;
-                copied += INDEX_COPY_BATCH_SIZE;
-                yield_indexer_to_interactive_work(&mut throttle);
-            }
-            if INDEX_REVISION.load(Ordering::Acquire) != revision {
-                return Err("索引范围已更新，正在切换到最新目录".into());
-            }
-            let transaction = connection
-                .transaction()
-                .map_err(|error| error.to_string())?;
-            transaction
-                .execute_batch(
-                    "
-                    DROP TABLE search_fts;
-                    ALTER TABLE search_fts_next RENAME TO search_fts;
-                    ",
-                )
-                .map_err(|error| error.to_string())?;
-            transaction
-                .execute(
-                    "
-                INSERT INTO search_meta(id, scope, complete, updated_at)
-                VALUES (1, ?1, 1, unixepoch())
-                ON CONFLICT(id) DO UPDATE SET
-                    scope = excluded.scope,
-                    complete = 1,
-                    updated_at = excluded.updated_at
-                ",
-                    [&scope],
-                )
-                .map_err(|error| error.to_string())?;
-            transaction.commit().map_err(|error| error.to_string())?;
-            Ok(count)
-        })();
-        let detach_result = connection
-            .execute_batch("DETACH DATABASE staging")
-            .map_err(|error| error.to_string());
-        if operation.is_err() {
-            let _ = connection.execute_batch("DROP TABLE IF EXISTS search_fts_next;");
-        }
-        operation.and(detach_result.map(|_| count))
-    });
-    swap_result
+    let _writer = storage.index_write_guard();
+    let transaction = index_connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute_batch(
+            "
+            DROP TABLE IF EXISTS search_fts_compact;
+            CREATE VIRTUAL TABLE search_fts_compact USING fts5(
+                name,
+                path UNINDEXED,
+                kind UNINDEXED,
+                modified_at UNINDEXED,
+                tokenize = 'trigram'
+            );
+            INSERT INTO search_fts_compact(name, path, kind, modified_at)
+            SELECT group_concat(name, ' '), path, kind, MAX(modified_at)
+            FROM (
+                SELECT DISTINCT name, path, kind, modified_at
+                FROM search_fts_next
+            )
+            GROUP BY path, kind;
+            DROP TABLE search_fts;
+            DROP TABLE search_fts_next;
+            ALTER TABLE search_fts_compact RENAME TO search_fts;
+            ",
+        )
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute(
+            "
+        INSERT INTO search_meta(id, scope, complete, updated_at)
+        VALUES (1, ?1, 1, unixepoch())
+        ON CONFLICT(id) DO UPDATE SET
+            scope = excluded.scope,
+            complete = 1,
+            updated_at = excluded.updated_at
+        ",
+            [&scope],
+        )
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute("DELETE FROM search_build_meta", [])
+        .map_err(|error| error.to_string())?;
+    transaction.commit().map_err(|error| error.to_string())?;
+    let compacted_count = index_connection
+        .query_row("SELECT COUNT(*) FROM search_fts", [], |row| {
+            row.get::<_, usize>(0)
+        })
+        .unwrap_or(count);
+    Ok(compacted_count)
 }
 
 pub fn status() -> &'static str {
@@ -1283,10 +1726,34 @@ pub fn status() -> &'static str {
     }
 }
 
+pub fn progress() -> IndexProgress {
+    let state = INDEX_STATE.lock();
+    let status = match state.status {
+        1 => "indexing",
+        2 => "ready",
+        3 => "failed",
+        _ => "idle",
+    };
+    let phase = match state.phase {
+        1 => "scanning",
+        2 => "complete",
+        3 => "failed",
+        _ => "idle",
+    };
+    IndexProgress {
+        status: status.into(),
+        phase: phase.into(),
+        indexed_items: state.indexed_items,
+        completed_roots: state.completed_roots,
+        total_roots: state.total_roots,
+        current_root: state.current_root.clone(),
+    }
+}
+
 pub fn has_index(storage: &StorageManager, requested_roots: &[String]) -> bool {
     let expected_scope = scope_key(requested_roots);
     let exists = storage
-        .with_read_connection(|connection| {
+        .with_search_read_connection(|connection| {
             connection
                 .query_row(
                     "
@@ -1308,13 +1775,38 @@ pub fn has_index(storage: &StorageManager, requested_roots: &[String]) -> bool {
         })
         .unwrap_or(false);
     if exists {
-        INDEX_STATE.lock().status = 2;
+        let mut state = INDEX_STATE.lock();
+        state.status = 2;
+        state.phase = 2;
     }
     exists
 }
 
+pub fn has_partial_index(storage: &StorageManager, requested_roots: &[String]) -> bool {
+    let expected_scope = scope_key(requested_roots);
+    storage
+        .with_search_read_connection(|connection| {
+            connection
+                .query_row(
+                    "
+                    SELECT EXISTS(
+                        SELECT 1 FROM sqlite_master
+                        WHERE type = 'table' AND name = 'search_fts_next'
+                    ) AND EXISTS(
+                        SELECT 1 FROM search_build_meta
+                        WHERE id = 1 AND scope = ?1
+                    )
+                    ",
+                    [&expected_scope],
+                    |row| row.get::<_, bool>(0),
+                )
+                .map_err(|error| error.to_string())
+        })
+        .unwrap_or(false)
+}
+
 pub fn count(storage: &StorageManager) -> Result<usize, String> {
-    storage.with_read_connection(|connection| {
+    storage.with_search_read_connection(|connection| {
         connection
             .query_row("SELECT count(*) FROM search_fts", [], |row| row.get(0))
             .map_err(|error| error.to_string())
@@ -1360,15 +1852,83 @@ pub fn query_latest(
 
 fn indexed_candidates(
     connection: &Connection,
+    table: &str,
+    expression: &str,
+    kind: &str,
+    limit: usize,
+    extension_pattern: &str,
+    drive_pattern: &str,
+    root_filter: &str,
+) -> Result<Vec<SearchResult>, String> {
+    let sql = if table == "search_fts" {
+        indexed_candidate_sql().to_string()
+    } else {
+        indexed_candidate_sql().replace("search_fts", "search_fts_next")
+    };
+    let mut statement = connection
+        .prepare(&sql)
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map(
+            params![
+                expression,
+                kind,
+                extension_pattern,
+                drive_pattern,
+                root_filter,
+                limit as i64
+            ],
+            |row| {
+                let indexed_name = row.get::<_, String>(1)?;
+                Ok(SearchResult {
+                    id: format!("{table}-{}", row.get::<_, i64>(0)?),
+                    name: indexed_display_name(&indexed_name).to_string(),
+                    path: row.get(2)?,
+                    kind: row.get(3)?,
+                    modified_at: row.get(4)?,
+                })
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())
+}
+
+pub(crate) fn candidate_kind_plan(kind: &str) -> Vec<(&str, usize)> {
+    if kind.is_empty() {
+        vec![("app", 64), ("folder", 128), ("file", 256)]
+    } else {
+        vec![(kind, CANDIDATE_LIMIT)]
+    }
+}
+
+fn indexed_candidates_by_kind(
+    connection: &Connection,
+    table: &str,
     expression: &str,
     kind: &str,
     extension_pattern: &str,
     drive_pattern: &str,
     root_filter: &str,
 ) -> Result<Vec<SearchResult>, String> {
-    let mut statement = connection
-        .prepare(
-            "
+    let mut results = Vec::new();
+    for (planned_kind, limit) in candidate_kind_plan(kind) {
+        results.extend(indexed_candidates(
+            connection,
+            table,
+            expression,
+            planned_kind,
+            limit,
+            extension_pattern,
+            drive_pattern,
+            root_filter,
+        )?);
+    }
+    Ok(results)
+}
+
+pub(crate) fn indexed_candidate_sql() -> &'static str {
+    "
             SELECT rowid, name, path, kind, modified_at
             FROM search_fts
             WHERE search_fts MATCH ?1
@@ -1400,45 +1960,11 @@ fn indexed_candidates(
                     OR lower(path) LIKE '%reporter%'
                     OR lower(path) LIKE '%minidump%'
                     OR lower(path) LIKE '%helper%'
-                )
+                  )
               )
-            ORDER BY
-                CASE kind
-                    WHEN 'app' THEN 0
-                    WHEN 'folder' THEN 1
-                    ELSE 2
-                END,
-                bm25(search_fts),
-                length(name),
-                name
+            ORDER BY rank
             LIMIT ?6
-            ",
-        )
-        .map_err(|error| error.to_string())?;
-    let rows = statement
-        .query_map(
-            params![
-                expression,
-                kind,
-                extension_pattern,
-                drive_pattern,
-                root_filter,
-                CANDIDATE_LIMIT as i64
-            ],
-            |row| {
-                let indexed_name = row.get::<_, String>(1)?;
-                Ok(SearchResult {
-                    id: format!("index-{}", row.get::<_, i64>(0)?),
-                    name: indexed_display_name(&indexed_name).to_string(),
-                    path: row.get(2)?,
-                    kind: row.get(3)?,
-                    modified_at: row.get(4)?,
-                })
-            },
-        )
-        .map_err(|error| error.to_string())?;
-    rows.collect::<Result<Vec<_>, _>>()
-        .map_err(|error| error.to_string())
+            "
 }
 
 fn query_inner(
@@ -1497,26 +2023,76 @@ fn query_inner(
     let indexed_results = if exact_expression.is_none() {
         Vec::new()
     } else {
-        storage.with_read_connection(|connection| {
-            let exact = indexed_candidates(
-                connection,
-                exact_expression.as_deref().unwrap_or_default(),
-                kind,
-                &extension_pattern,
-                &drive_pattern,
-                &root_filter,
-            )?;
-            if !exact.is_empty() || fuzzy_expression == exact_expression {
-                return Ok(exact);
+        storage.with_search_read_connection(|connection| {
+            if let Some(revision) = query_revision {
+                connection.progress_handler(
+                    1_000,
+                    Some(move || QUERY_REVISION.load(Ordering::Acquire) != revision),
+                );
             }
-            indexed_candidates(
-                connection,
-                fuzzy_expression.as_deref().unwrap_or_default(),
-                kind,
-                &extension_pattern,
-                &drive_pattern,
-                &root_filter,
-            )
+            let result = (|| {
+                let next_exists = status() == "indexing"
+                    && connection
+                        .query_row(
+                            "SELECT EXISTS(
+                                SELECT 1 FROM sqlite_master
+                                WHERE type = 'table' AND name = 'search_fts_next'
+                            )",
+                            [],
+                            |row| row.get::<_, bool>(0),
+                        )
+                        .unwrap_or(false);
+                let tables = if next_exists {
+                    vec!["search_fts", "search_fts_next"]
+                } else {
+                    vec!["search_fts"]
+                };
+                let mut exact = Vec::new();
+                for table in &tables {
+                    let candidates = indexed_candidates_by_kind(
+                        connection,
+                        table,
+                        exact_expression.as_deref().unwrap_or_default(),
+                        kind,
+                        &extension_pattern,
+                        &drive_pattern,
+                        &root_filter,
+                    );
+                    match candidates {
+                        Ok(candidates) => exact.extend(candidates),
+                        Err(_) if *table == "search_fts_next" => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+                if !exact.is_empty() || fuzzy_expression == exact_expression {
+                    return Ok(exact);
+                }
+                let mut fuzzy = Vec::new();
+                for table in tables {
+                    let candidates = indexed_candidates_by_kind(
+                        connection,
+                        table,
+                        fuzzy_expression.as_deref().unwrap_or_default(),
+                        kind,
+                        &extension_pattern,
+                        &drive_pattern,
+                        &root_filter,
+                    );
+                    match candidates {
+                        Ok(candidates) => fuzzy.extend(candidates),
+                        Err(_) if table == "search_fts_next" => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+                Ok(fuzzy)
+            })();
+            connection.progress_handler::<fn() -> bool>(0, None);
+            if query_revision
+                .is_some_and(|revision| QUERY_REVISION.load(Ordering::Acquire) != revision)
+            {
+                return Ok(Vec::new());
+            }
+            result
         })?
     };
     if query_revision.is_some_and(|revision| QUERY_REVISION.load(Ordering::Acquire) != revision) {
@@ -1530,7 +2106,7 @@ fn query_inner(
         })
         .collect::<Vec<_>>();
     indexed_results.extend(
-        immediate_folder_results(normalized, kind, extension, drive, roots)
+        immediate_live_results(normalized, kind, extension, drive, roots)
             .into_iter()
             .filter_map(|result| {
                 let quality = match_quality(&result.name, &result.path, &terms)?;

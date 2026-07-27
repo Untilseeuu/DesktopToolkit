@@ -1,7 +1,8 @@
-import { Clipboard, FileText, Image as ImageIcon, Search, Sparkles, X } from "lucide-react";
+import { Clipboard, FileText, Image as ImageIcon, Search, Sparkles, Trash2, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { ResultGlyph } from "./components";
 import { SearchQueryInput } from "./SearchQueryInput";
+import { SearchFilterControls } from "./SearchFilterControls";
 import {
   buildQuickLinkResults,
   clipboardEntryKind,
@@ -15,7 +16,9 @@ import {
   activateClipboardEntry,
   bindClipboardHistory,
   bindSearchFilters,
+  bindSnapshotUpdated,
   copyText,
+  deleteClipboardEntry,
   getAppIcons,
   hideOverlay,
   invokeNative,
@@ -39,7 +42,8 @@ const modeMeta = {
   clipboard: { title: "剪贴板历史", placeholder: "搜索最近复制的内容", icon: Clipboard },
 } as const;
 
-export default function QuickOverlay({ mode }: { mode: OverlayMode }) {
+export default function QuickOverlay({ mode: initialMode }: { mode: OverlayMode }) {
+  const [mode, setMode] = useState<OverlayMode>(initialMode);
   const [snapshot, setSnapshot] = useState<AppSnapshot | null>(null);
   const [query, setQuery] = useState("");
   const [inputResetSignal, setInputResetSignal] = useState(0);
@@ -52,46 +56,150 @@ export default function QuickOverlay({ mode }: { mode: OverlayMode }) {
   const inputRef = useRef<HTMLInputElement>(null);
   const lastRecordedQuery = useRef("");
   const requestSequence = useRef(0);
+  const snapshotRequestSequence = useRef(0);
+  const clipboardRevision = useRef(0);
+  const pendingClipboardHistory = useRef<ClipboardEntry[] | null>(null);
   const meta = modeMeta[mode];
   const Icon = meta.icon;
 
   useEffect(() => {
     document.documentElement.dataset.overlay = "true";
-    const refreshSnapshot = () => void loadSnapshot().then((stored) => {
-      if (!stored) return;
-      const next = mergeSnapshotDefaults(stored);
-      setSnapshot(next);
-      setFilters(next.settings.searchFilters);
-    });
-    refreshSnapshot();
+    let disposed = false;
+    let snapshotRetryTimer: number | undefined;
+    let snapshotRetryDelay = 120;
+    const refreshSnapshot = () => {
+      const requestId = ++snapshotRequestSequence.current;
+      const revisionBeforeRead = clipboardRevision.current;
+      void loadSnapshot()
+        .then((stored) => {
+          if (
+            !stored ||
+            disposed ||
+            requestId !== snapshotRequestSequence.current
+          ) {
+            return;
+          }
+          let next = mergeSnapshotDefaults(stored);
+          if (
+            revisionBeforeRead !== clipboardRevision.current &&
+            pendingClipboardHistory.current
+          ) {
+            next = {
+              ...next,
+              clipboardHistory: pendingClipboardHistory.current,
+            };
+          }
+          pendingClipboardHistory.current = null;
+          setSnapshot(next);
+          setFilters(next.settings.searchFilters);
+          snapshotRetryDelay = 120;
+          if (snapshotRetryTimer !== undefined) {
+            window.clearTimeout(snapshotRetryTimer);
+            snapshotRetryTimer = undefined;
+          }
+        })
+        .catch(() => {
+          if (disposed || requestId !== snapshotRequestSequence.current) return;
+          if (snapshotRetryTimer !== undefined) {
+            window.clearTimeout(snapshotRetryTimer);
+          }
+          snapshotRetryTimer = window.setTimeout(() => {
+            snapshotRetryTimer = undefined;
+            refreshSnapshot();
+          }, snapshotRetryDelay);
+          snapshotRetryDelay = Math.min(snapshotRetryDelay * 2, 1_500);
+        });
+    };
     let unlistenFocus: (() => void) | undefined;
+    let unlistenMode: (() => void) | undefined;
     let unlistenClipboard: (() => void) | undefined;
     let unlistenFilters: (() => void) | undefined;
-    void import("@tauri-apps/api/event").then(({ listen }) =>
-      listen("atlas-overlay-focus", () => {
-        setQuery("");
-        setInputResetSignal((value) => value + 1);
-        setResults([]);
-        lastRecordedQuery.current = "";
-        refreshSnapshot();
-        window.setTimeout(() => inputRef.current?.focus(), 30);
-      }).then((dispose) => {
-        unlistenFocus = dispose;
-      }),
-    );
+    let unlistenSnapshot: (() => void) | undefined;
+    let focusTimer: number | undefined;
+    let receivedModeEvent = false;
+    let modeRequestSequence = 0;
+    const applyMode = (nextMode: unknown) => {
+      if (!["search", "prompts", "clipboard"].includes(String(nextMode))) return;
+      modeRequestSequence += 1;
+      setMode(nextMode as OverlayMode);
+      setQuery("");
+      setInputResetSignal((value) => value + 1);
+      setResults([]);
+      lastRecordedQuery.current = "";
+    };
+    const reconcileMode = async () => {
+      const requestId = ++modeRequestSequence;
+      const latestMode = await invokeNative<OverlayMode>("get_quick_overlay_mode");
+      if (!disposed && requestId === modeRequestSequence && latestMode) {
+        applyMode(latestMode);
+      }
+    };
+    const handleBrowserFocus = () => {
+      void reconcileMode();
+      refreshSnapshot();
+    };
+    window.addEventListener("focus", handleBrowserFocus);
+    void import("@tauri-apps/api/event").then(({ listen }) => {
+      void Promise.all([
+        listen("atlas-overlay-focus", () => {
+          void reconcileMode();
+          setQuery("");
+          setInputResetSignal((value) => value + 1);
+          setResults([]);
+          lastRecordedQuery.current = "";
+          refreshSnapshot();
+          if (focusTimer !== undefined) window.clearTimeout(focusTimer);
+          focusTimer = window.setTimeout(() => inputRef.current?.focus(), 30);
+        }),
+        listen<string>("atlas-overlay-mode", (event) => {
+          receivedModeEvent = true;
+          applyMode(event.payload);
+        }),
+      ]).then(async ([disposeFocus, disposeMode]) => {
+        if (disposed) {
+          disposeFocus();
+          disposeMode();
+          return;
+        }
+        unlistenFocus = disposeFocus;
+        unlistenMode = disposeMode;
+        const latestMode = await invokeNative<OverlayMode>("get_quick_overlay_mode");
+        if (!disposed && !receivedModeEvent && latestMode) applyMode(latestMode);
+      });
+    });
     void bindClipboardHistory((clipboardHistory) => {
+      clipboardRevision.current += 1;
+      pendingClipboardHistory.current = clipboardHistory;
       setSnapshot((current) => (current ? { ...current, clipboardHistory } : current));
     }).then((dispose) => {
-      unlistenClipboard = dispose;
+      if (disposed) dispose();
+      else {
+        unlistenClipboard = dispose;
+        refreshSnapshot();
+      }
     });
     void bindSearchFilters(setFilters).then((dispose) => {
-      unlistenFilters = dispose;
+      if (disposed) dispose();
+      else unlistenFilters = dispose;
+    });
+    void bindSnapshotUpdated(refreshSnapshot).then((dispose) => {
+      if (disposed) dispose();
+      else {
+        unlistenSnapshot = dispose;
+        refreshSnapshot();
+      }
     });
     return () => {
+      disposed = true;
+      window.removeEventListener("focus", handleBrowserFocus);
       delete document.documentElement.dataset.overlay;
       unlistenFocus?.();
+      unlistenMode?.();
       unlistenClipboard?.();
       unlistenFilters?.();
+      unlistenSnapshot?.();
+      if (focusTimer !== undefined) window.clearTimeout(focusTimer);
+      if (snapshotRetryTimer !== undefined) window.clearTimeout(snapshotRetryTimer);
     };
   }, []);
 
@@ -232,32 +340,16 @@ export default function QuickOverlay({ mode }: { mode: OverlayMode }) {
         />
       </label>
       {mode === "search" ? (
-        <div className="quick-filter-row">
-          <select
-            value={filters.kind}
-            onChange={(event) =>
-              updateFilters({ ...filters, kind: event.target.value as SearchFilters["kind"] })
-            }
-          >
-            <option value="all">全部类型</option>
-            <option value="link">快捷链接</option>
-            <option value="app">应用</option>
-            <option value="folder">文件夹</option>
-            <option value="file">文件</option>
-          </select>
-          <input
-            value={filters.extension}
-            onChange={(event) => updateFilters({ ...filters, extension: event.target.value })}
-            placeholder="扩展名，如 pdf"
-          />
-          <input
-            value={filters.drive}
-            onChange={(event) => updateFilters({ ...filters, drive: event.target.value })}
-            placeholder="磁盘，如 D:"
-          />
-        </div>
+        <SearchFilterControls
+          className="quick-filter-row"
+          filters={filters}
+          onChange={updateFilters}
+        />
       ) : null}
       <section className="quick-results">
+        {!snapshot && mode !== "search" ? (
+          <div className="quick-empty">正在同步最新内容…</div>
+        ) : null}
         {mode === "search"
           ? displayedResults.map((result) => (
               <button
@@ -290,8 +382,9 @@ export default function QuickOverlay({ mode }: { mode: OverlayMode }) {
             : displayedClipboard.map((entry: ClipboardEntry) => {
                 const kind = clipboardEntryKind(entry);
                 return (
-                  <button key={entry.id} onClick={() => void restoreClipboardAndClose(entry)}>
-                    <span className={`quick-kind clipboard ${kind}`}>
+                  <div className="quick-clipboard-row" key={entry.id}>
+                    <button onClick={() => void restoreClipboardAndClose(entry)}>
+                      <span className={`quick-kind clipboard ${kind}`}>
                       {kind === "image" ? <ImageIcon size={17} /> : <FileText size={17} />}
                     </span>
                     {kind === "image" ? (
@@ -312,12 +405,37 @@ export default function QuickOverlay({ mode }: { mode: OverlayMode }) {
                         <small>{new Date(entry.copiedAt).toLocaleString("zh-CN")}</small>
                       </span>
                     )}
-                    <em>{kind === "image" ? "图片" : "文字"}</em>
-                  </button>
+                      <em>{kind === "image" ? "图片" : "文字"}</em>
+                    </button>
+                    <button
+                      type="button"
+                      className="quick-delete"
+                      aria-label="删除这条剪贴板记录"
+                      onClick={() => {
+                        void deleteClipboardEntry(entry.id).then((clipboardHistory) => {
+                          setSnapshot((current) =>
+                            current ? { ...current, clipboardHistory } : current,
+                          );
+                        });
+                      }}
+                    >
+                      <Trash2 size={14} />
+                    </button>
+                  </div>
                 );
               })}
         {query && mode === "search" && !results.length ? (
           <div className="quick-empty">未找到匹配内容，索引可能仍在构建中。</div>
+        ) : null}
+        {snapshot && mode === "prompts" && !displayedPrompts.length ? (
+          <div className="quick-empty">
+            {query ? "没有匹配的提示词。" : "还没有提示词。"}
+          </div>
+        ) : null}
+        {snapshot && mode === "clipboard" && !displayedClipboard.length ? (
+          <div className="quick-empty">
+            {query ? "没有匹配的剪贴板记录。" : "还没有剪贴板记录。"}
+          </div>
         ) : null}
       </section>
     </main>

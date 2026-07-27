@@ -1,29 +1,60 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import QuickOverlay from "./QuickOverlay";
 import { defaultSnapshot } from "./useToolkit";
 
-const { hideOverlay, openTarget, recordActivity, searchNative } = vi.hoisted(() => ({
+const {
+  clipboardHistoryHandler,
+  hideOverlay,
+  invokeNative,
+  loadSnapshot,
+  openTarget,
+  recordActivity,
+  searchNative,
+  snapshotUpdatedHandler,
+} = vi.hoisted(() => ({
+  clipboardHistoryHandler: { current: undefined as undefined | ((entries: unknown[]) => void) },
   hideOverlay: vi.fn(async () => undefined),
+  invokeNative: vi.fn<(command: string) => Promise<unknown>>(async () => null),
+  loadSnapshot: vi.fn(),
   openTarget: vi.fn(async () => undefined),
   recordActivity: vi.fn(async () => undefined),
   searchNative: vi.fn(async () => []),
+  snapshotUpdatedHandler: { current: undefined as undefined | (() => void) },
 }));
+const overlayEventHandlers = vi.hoisted(
+  () => new Map<string, (event: { payload: unknown }) => void>(),
+);
 
 vi.mock("@tauri-apps/api/event", () => ({
-  listen: vi.fn(async () => () => undefined),
+  listen: vi.fn(async (event: string, handler: (event: { payload: unknown }) => void) => {
+    overlayEventHandlers.set(event, handler);
+    return () => overlayEventHandlers.delete(event);
+  }),
 }));
 
 vi.mock("./native", () => ({
   activateClipboardEntry: vi.fn(async () => ({ pasted: false, kind: "image" })),
-  bindClipboardHistory: vi.fn(async () => () => undefined),
+  bindClipboardHistory: vi.fn(async (handler: (entries: unknown[]) => void) => {
+    clipboardHistoryHandler.current = handler;
+    return () => {
+      clipboardHistoryHandler.current = undefined;
+    };
+  }),
   bindSearchFilters: vi.fn(async () => () => undefined),
+  bindSnapshotUpdated: vi.fn(async (handler: () => void) => {
+    snapshotUpdatedHandler.current = handler;
+    return () => {
+      snapshotUpdatedHandler.current = undefined;
+    };
+  }),
   copyText: vi.fn(async () => undefined),
   getAppIcons: vi.fn(async () => ({})),
   hideOverlay,
-  invokeNative: vi.fn(async () => null),
-  loadSnapshot: vi.fn(async () => defaultSnapshot),
+  invokeNative,
+  listSearchDrives: vi.fn(async () => ["C:", "D:"]),
+  loadSnapshot,
   openTarget,
   recordActivity,
   searchNative,
@@ -31,11 +62,207 @@ vi.mock("./native", () => ({
 
 describe("QuickOverlay", () => {
   beforeEach(() => {
+    overlayEventHandlers.clear();
+    clipboardHistoryHandler.current = undefined;
+    snapshotUpdatedHandler.current = undefined;
     hideOverlay.mockClear();
     openTarget.mockClear();
     recordActivity.mockClear();
+    invokeNative.mockReset();
+    invokeNative.mockResolvedValue(null);
+    loadSnapshot.mockReset();
+    loadSnapshot.mockResolvedValue(defaultSnapshot);
     searchNative.mockReset();
     searchNative.mockResolvedValue([]);
+  });
+
+  it("switches tool modes inside one reusable overlay webview", async () => {
+    render(<QuickOverlay mode="search" />);
+    await screen.findByPlaceholderText("搜索所有磁盘中的应用、文件或文件夹");
+    await waitFor(() =>
+      expect(overlayEventHandlers.has("atlas-overlay-mode")).toBe(true),
+    );
+
+    act(() => {
+      overlayEventHandlers.get("atlas-overlay-mode")?.({ payload: "prompts" });
+    });
+
+    expect(
+      screen.getByPlaceholderText("模糊搜索标题、内容、分类或标签"),
+    ).toBeInTheDocument();
+  });
+
+  it("reads the latest mode after event listeners are ready", async () => {
+    invokeNative.mockImplementation(async (command: string) =>
+      command === "get_quick_overlay_mode" ? "clipboard" : null
+    );
+
+    render(<QuickOverlay mode="search" />);
+
+    expect(await screen.findByPlaceholderText(/最近复制/)).toBeInTheDocument();
+    expect(invokeNative).toHaveBeenCalledWith("get_quick_overlay_mode");
+  });
+
+  it("does not let a stale startup mode overwrite a newer shortcut event", async () => {
+    let resolveMode: (mode: unknown) => void = () => undefined;
+    invokeNative.mockImplementation(
+      (command: string) =>
+        command === "get_quick_overlay_mode"
+          ? new Promise((resolve) => {
+              resolveMode = resolve;
+            })
+          : Promise.resolve(null),
+    );
+    render(<QuickOverlay mode="search" />);
+    await waitFor(() =>
+      expect(overlayEventHandlers.has("atlas-overlay-mode")).toBe(true),
+    );
+
+    act(() => {
+      overlayEventHandlers.get("atlas-overlay-mode")?.({ payload: "prompts" });
+    });
+    expect(
+      screen.getByPlaceholderText("模糊搜索标题、内容、分类或标签"),
+    ).toBeInTheDocument();
+
+    await act(async () => resolveMode("search"));
+
+    expect(
+      screen.getByPlaceholderText("模糊搜索标题、内容、分类或标签"),
+    ).toBeInTheDocument();
+  });
+
+  it("reconciles the tool mode after a hidden overlay regains browser focus", async () => {
+    let mode = "search";
+    invokeNative.mockImplementation(async (command: string) =>
+      command === "get_quick_overlay_mode" ? mode : null
+    );
+    render(<QuickOverlay mode="search" />);
+    await waitFor(() =>
+      expect(overlayEventHandlers.has("atlas-overlay-mode")).toBe(true),
+    );
+    await waitFor(() =>
+      expect(invokeNative).toHaveBeenCalledWith("get_quick_overlay_mode"),
+    );
+    mode = "prompts";
+
+    act(() => {
+      window.dispatchEvent(new Event("focus"));
+    });
+
+    expect(
+      await screen.findByPlaceholderText("模糊搜索标题、内容、分类或标签"),
+    ).toBeInTheDocument();
+    expect(invokeNative).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not let a stale focus reconciliation overwrite a newer shortcut mode", async () => {
+    let modeReads = 0;
+    let resolveFocusedMode: (mode: unknown) => void = () => undefined;
+    invokeNative.mockImplementation((command: string) => {
+      if (command !== "get_quick_overlay_mode") return Promise.resolve(null);
+      modeReads += 1;
+      if (modeReads === 1) return Promise.resolve("search");
+      return new Promise((resolve) => {
+        resolveFocusedMode = resolve;
+      });
+    });
+    render(<QuickOverlay mode="search" />);
+    await waitFor(() => expect(overlayEventHandlers.has("atlas-overlay-mode")).toBe(true));
+    await waitFor(() => expect(modeReads).toBe(1));
+
+    act(() => window.dispatchEvent(new Event("focus")));
+    await waitFor(() => expect(modeReads).toBe(2));
+    act(() => {
+      overlayEventHandlers.get("atlas-overlay-mode")?.({ payload: "clipboard" });
+    });
+    await act(async () => resolveFocusedMode("search"));
+
+    expect(screen.getByPlaceholderText(/最近复制/)).toBeInTheDocument();
+  });
+
+  it("shows explicit empty states for prompt and clipboard overlays", async () => {
+    loadSnapshot.mockResolvedValue({
+      ...defaultSnapshot,
+      prompts: [],
+      clipboardHistory: [],
+    });
+    const { unmount } = render(<QuickOverlay mode="prompts" />);
+    expect(await screen.findByText("还没有提示词。")).toBeInTheDocument();
+    unmount();
+
+    render(<QuickOverlay mode="clipboard" />);
+    expect(await screen.findByText("还没有剪贴板记录。")).toBeInTheDocument();
+  });
+
+  it("reloads hidden clipboard and prompt data when the overlay regains focus", async () => {
+    render(<QuickOverlay mode="clipboard" />);
+    await screen.findByPlaceholderText(/最近复制/);
+    loadSnapshot.mockResolvedValue({
+      ...defaultSnapshot,
+      clipboardHistory: [{
+        id: "hidden-copy",
+        kind: "text",
+        text: "隐藏期间复制的内容",
+        copiedAt: Date.now(),
+      }],
+      prompts: [{
+        id: "hidden-prompt",
+        title: "隐藏期间新增的提示词",
+        content: "同步内容",
+        category: "测试",
+        tags: [],
+        note: "",
+        favorite: false,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      }],
+    });
+
+    act(() => {
+      window.dispatchEvent(new Event("focus"));
+    });
+
+    expect(await screen.findByText("隐藏期间复制的内容")).toBeInTheDocument();
+    act(() => {
+      overlayEventHandlers.get("atlas-overlay-mode")?.({ payload: "prompts" });
+    });
+    expect(await screen.findByText("隐藏期间新增的提示词")).toBeInTheDocument();
+  });
+
+  it("retries a transient snapshot read so the first clipboard opening is not blank", async () => {
+    loadSnapshot
+      .mockRejectedValueOnce(new Error("database temporarily busy"))
+      .mockRejectedValueOnce(new Error("database temporarily busy"))
+      .mockRejectedValueOnce(new Error("database temporarily busy"))
+      .mockResolvedValue({
+        ...defaultSnapshot,
+        clipboardHistory: [{
+          id: "retry-copy",
+          kind: "text",
+          text: "首次打开也能显示",
+          copiedAt: Date.now(),
+        }],
+      });
+
+    render(<QuickOverlay mode="clipboard" />);
+
+    expect(await screen.findByText("首次打开也能显示")).toBeInTheDocument();
+    expect(loadSnapshot.mock.calls.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("uses dropdowns for extension and drive filters", async () => {
+    const { container } = render(<QuickOverlay mode="search" />);
+
+    expect(
+      await screen.findByRole("combobox", { name: "文件扩展名" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("combobox", { name: "所在磁盘" }),
+    ).toBeInTheDocument();
+    expect(
+      container.querySelector('input[aria-label="文件扩展名"]'),
+    ).not.toBeInTheDocument();
   });
 
   it("closes the search overlay with Escape", async () => {
@@ -57,7 +284,7 @@ describe("QuickOverlay", () => {
   });
 
   it("shows image previews in clipboard history", async () => {
-    vi.mocked((await import("./native")).loadSnapshot).mockResolvedValueOnce({
+    loadSnapshot.mockResolvedValue({
       ...defaultSnapshot,
       clipboardHistory: [{
         id: "image-1",
@@ -73,6 +300,47 @@ describe("QuickOverlay", () => {
 
     expect(await screen.findByRole("img", { name: "剪贴板图片预览" })).toBeInTheDocument();
     expect(screen.getAllByText("图片")).toHaveLength(2);
+  });
+
+  it("updates clipboard results when native history changes after opening", async () => {
+    render(<QuickOverlay mode="clipboard" />);
+    await screen.findByPlaceholderText(/最近复制/);
+    await waitFor(() => expect(clipboardHistoryHandler.current).toBeTypeOf("function"));
+
+    act(() => {
+      clipboardHistoryHandler.current?.([{
+        id: "fresh-text",
+        kind: "text",
+        text: "刚刚复制的新内容",
+        copiedAt: Date.now(),
+      }]);
+    });
+
+    expect(screen.getByText("刚刚复制的新内容")).toBeInTheDocument();
+  });
+
+  it("refreshes prompt data after another window saves the snapshot", async () => {
+    render(<QuickOverlay mode="prompts" />);
+    await screen.findByPlaceholderText(/模糊搜索/);
+    await waitFor(() => expect(snapshotUpdatedHandler.current).toBeTypeOf("function"));
+    loadSnapshot.mockResolvedValue({
+      ...defaultSnapshot,
+      prompts: [{
+        id: "new-prompt",
+        title: "新提示词",
+        content: "新内容",
+        category: "测试",
+        tags: [],
+        note: "",
+        favorite: false,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      }],
+    });
+
+    act(() => snapshotUpdatedHandler.current?.());
+
+    expect(await screen.findByText("新提示词")).toBeInTheDocument();
   });
 
   it("ignores a slow stale search after a newer query has completed", async () => {

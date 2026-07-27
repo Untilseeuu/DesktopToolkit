@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import App from "./App";
 import { defaultSnapshot } from "./useToolkit";
@@ -71,7 +71,7 @@ describe("Atlas desktop toolkit", () => {
     expect(screen.queryByRole("button", { name: "更改位置" })).not.toBeInTheDocument();
     expect(screen.getByText("存储位置跟随软件安装目录")).toBeInTheDocument();
     expect(screen.getByText("全局快捷键")).toBeInTheDocument();
-    expect(screen.getByText("字体与外观")).toBeInTheDocument();
+    expect(screen.getByText("全局个性化")).toBeInTheDocument();
     expect(screen.getByText("全盘索引")).toBeInTheDocument();
     expect(screen.getByRole("switch", { name: "开机自启动 Atlas" })).toBeInTheDocument();
     const bootScene = screen.getByRole("combobox", { name: "开机启动场景" });
@@ -80,6 +80,23 @@ describe("Atlas desktop toolkit", () => {
     expect(screen.getByRole("option", { name: "无" })).toBeInTheDocument();
     expect(bootScene.closest(".settings-section")).toHaveClass("boot-settings-section");
     expect(screen.queryByText("登录启动")).not.toBeInTheDocument();
+  });
+
+  it("applies global branding and custom tool names immediately", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole("button", { name: "设置" }));
+    await user.click(screen.getByRole("button", { name: "打开配置" }));
+
+    const appName = screen.getByRole("textbox", { name: "软件名称" });
+    await user.clear(appName);
+    await user.type(appName, "NOVA");
+    const startupName = screen.getByRole("textbox", { name: "启动编排" });
+    await user.clear(startupName);
+    await user.type(startupName, "开工场景");
+
+    expect(screen.getAllByText("NOVA").length).toBeGreaterThan(0);
+    expect(screen.getByRole("button", { name: "开工场景" })).toBeInTheDocument();
   });
 
   it("lets the user pause clipboard capture and configure privacy retention", async () => {
@@ -134,7 +151,7 @@ describe("Atlas desktop toolkit", () => {
     const user = userEvent.setup();
     render(<App />);
     await user.click(await screen.findByRole("button", { name: "设置" }));
-    await screen.findByText("字体与外观");
+    await user.click(await screen.findByRole("button", { name: "打开配置" }));
 
     const font = screen.getByRole("combobox", { name: "界面字体" });
     expect(font).toHaveTextContent("微软雅黑");
@@ -186,7 +203,8 @@ describe("Atlas desktop toolkit", () => {
     const { container } = render(<App />);
     await user.click(await screen.findByRole("button", { name: "设置" }));
     await screen.findByRole("heading", { name: "设置", level: 1 });
-    await user.click(screen.getByRole("button", { name: "深色" }));
+    await user.click(screen.getByRole("button", { name: "打开配置" }));
+    await user.selectOptions(screen.getByRole("combobox", { name: "界面主题" }), "builtin:dark");
 
     expect(document.documentElement).toHaveAttribute("data-theme", "dark");
     expect(container.querySelector(".brand-mark")).toHaveClass(
@@ -430,10 +448,74 @@ describe("Atlas desktop toolkit", () => {
     expect(container.querySelector(".number-setting")).toHaveClass("no-native-spinner");
   });
 
-  it("keeps settings form controls at the same compact type scale as their labels", () => {
+  it("keeps every settings control at the boot scene selector type scale", () => {
     expect(stylesheet).toMatch(
-      /\.settings-section\s+:is\(select,\s*input:not\(\[type="range"\]\),\s*textarea\)\s*\{[\s\S]*?font-size:\s*calc\(9px\s*\*\s*var\(--font-scale\)\)/,
+      /\.settings-section\s+:is\(button,\s*select,\s*input:not\(\[type="range"\]\),\s*textarea,\s*kbd\)\s*\{[\s\S]*?font-size:\s*calc\(11px\s*\*\s*var\(--font-scale\)\)/,
     );
+  });
+
+  it("aligns the font-size thumb with both visual track endpoints", async () => {
+    const user = userEvent.setup();
+    const { container } = render(<App />);
+    await user.click(await screen.findByRole("button", { name: "设置" }));
+    await user.click(await screen.findByRole("button", { name: "打开配置" }));
+    await screen.findByText("文字大小");
+
+    const slider = container.querySelector<HTMLElement>(".font-scale-slider");
+    expect(slider?.querySelector("input[type='range']")).toBeInTheDocument();
+    expect(slider?.style.getPropertyValue("--font-scale-progress")).toBe("37.5%");
+    expect(stylesheet).toMatch(
+      /\.font-scale-slider::before\s*\{[\s\S]*?inset:\s*50%\s+8px\s+auto/,
+    );
+    expect(stylesheet).toMatch(
+      /\.font-scale-slider input\[type="range"\]\s*\{[\s\S]*?min-height:\s*24px/,
+    );
+  });
+
+  it("uses dropdowns for extension and drive search filters", async () => {
+    const user = userEvent.setup();
+    const { container } = render(<App />);
+    await user.click(await screen.findByRole("button", { name: "全局搜索" }));
+
+    expect(
+      container.querySelector('select[aria-label="文件扩展名"]'),
+    ).toBeInTheDocument();
+    expect(
+      container.querySelector('select[aria-label="所在磁盘"]'),
+    ).toBeInTheDocument();
+    expect(
+      container.querySelector('input[aria-label="文件扩展名"]'),
+    ).not.toBeInTheDocument();
+    expect(
+      container.querySelector('input[aria-label="所在磁盘"]'),
+    ).not.toBeInTheDocument();
+  });
+
+  it("restores every global shortcut to its default combination", async () => {
+    localStorage.setItem(
+      "atlas-toolkit-state-v1",
+      JSON.stringify({
+        ...defaultSnapshot,
+        settings: {
+          ...defaultSnapshot.settings,
+          shortcuts: {
+            search: "Ctrl+Alt+S",
+            prompts: "Ctrl+Alt+P",
+            clipboard: "Ctrl+Alt+V",
+          },
+        },
+      }),
+    );
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole("button", { name: "设置" }));
+    await user.click(
+      await screen.findByRole("button", { name: "恢复默认快捷键" }),
+    );
+
+    expect(screen.getByRole("button", { name: "Alt+Space" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Alt+Shift+P" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Alt+Shift+V" })).toBeInTheDocument();
   });
 
   it("shows folder favorites with groups, aliases, tags and shortcuts", async () => {
@@ -462,6 +544,194 @@ describe("Atlas desktop toolkit", () => {
     expect(screen.getByText("论文仓库")).toBeInTheDocument();
     expect(screen.getByText("论文")).toBeInTheDocument();
     expect(screen.getByText("Ctrl+Alt+D")).toBeInTheDocument();
+  });
+
+  it("creates an empty folder group and shows descriptions on cards", async () => {
+    localStorage.setItem(
+      "atlas-toolkit-state-v1",
+      JSON.stringify({
+        ...defaultSnapshot,
+        folderFavorites: [{
+          id: "folder-described",
+          name: "论文",
+          path: "D:\\论文",
+          description: "保存毕业论文、参考文献和每周备份",
+          group: "学习",
+          tags: ["论文"],
+          createdAt: 1,
+        }],
+      }),
+    );
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole("button", { name: "文件夹收藏" }));
+
+    expect(await screen.findByText("保存毕业论文、参考文献和每周备份")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "新建分组" }));
+    await user.type(screen.getByRole("textbox", { name: "分组名称" }), "客户项目");
+    await user.click(screen.getByRole("button", { name: "创建" }));
+
+    expect(screen.getAllByText("客户项目").length).toBeGreaterThan(0);
+  });
+
+  it("edits a folder group and confirms deleting its contained favorites", async () => {
+    localStorage.setItem(
+      "atlas-toolkit-state-v1",
+      JSON.stringify({
+        ...defaultSnapshot,
+        folderGroups: ["学习"],
+        folderFavorites: [{
+          id: "folder-in-group",
+          name: "论文",
+          path: "D:\\论文",
+          description: "",
+          group: "学习",
+          tags: [],
+          createdAt: 1,
+        }],
+      }),
+    );
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole("button", { name: "文件夹收藏" }));
+
+    await user.click(screen.getByRole("button", { name: "编辑分组 学习" }));
+    const name = screen.getByRole("textbox", { name: "编辑分组名称" });
+    await user.clear(name);
+    await user.type(name, "研究");
+    await user.click(screen.getByRole("button", { name: "保存分组" }));
+    expect(screen.getAllByText("研究").length).toBeGreaterThan(0);
+
+    await user.click(screen.getByRole("button", { name: "删除分组 研究" }));
+    expect(screen.getByText("该分组中的 1 个文件夹收藏也会被删除。")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "删除分组和收藏" }));
+    expect(screen.queryByText("论文")).not.toBeInTheDocument();
+  });
+
+  it("uses the same centered empty-state treatment for prompts and clipboard", async () => {
+    localStorage.setItem(
+      "atlas-toolkit-state-v1",
+      JSON.stringify({
+        ...defaultSnapshot,
+        prompts: [],
+        clipboardHistory: [],
+      }),
+    );
+    const user = userEvent.setup();
+    const { container } = render(<App />);
+
+    await user.click(await screen.findByRole("button", { name: "提示词库" }));
+    expect(await screen.findByText("还没有提示词")).toBeInTheDocument();
+    expect(container.querySelector(".prompt-grid > .empty-state")).toHaveClass("full-span-empty");
+
+    await user.click(screen.getByRole("button", { name: "剪贴板历史" }));
+    expect(await screen.findByText("还没有剪贴板记录")).toBeInTheDocument();
+    expect(container.querySelector(".clipboard-list > .empty-state")).toHaveClass("full-span-empty");
+    expect(container.querySelector(".clipboard-list")).toHaveClass("is-empty");
+    expect(stylesheet).toMatch(
+      /\.clipboard-list\.is-empty\s*\{[^}]*border:\s*0[^}]*background:\s*transparent/,
+    );
+  });
+
+  it("consolidates built-in and imported fonts and themes under global personalization", async () => {
+    localStorage.setItem(
+      "atlas-toolkit-state-v1",
+      JSON.stringify({
+        ...defaultSnapshot,
+        settings: {
+          ...defaultSnapshot.settings,
+          customFonts: [{ id: "font-user", name: "霞鹜文楷", path: "data/font.ttf" }],
+          customThemes: [{
+            id: "theme-user",
+            name: "雾蓝",
+            mode: "light",
+            colors: {
+              paper: "#eef2f3",
+              panel: "#f7f9f9",
+              card: "#ffffff",
+              ink: "#20282a",
+              muted: "#68777a",
+              accent: "#d85b3f",
+              moss: "#557269",
+            },
+          }],
+        },
+      }),
+    );
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole("button", { name: "设置" }));
+
+    expect(screen.queryByRole("heading", { name: "字体与外观" })).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "打开配置" }));
+    const font = screen.getByRole("combobox", { name: "界面字体" });
+    const theme = screen.getByRole("combobox", { name: "界面主题" });
+    expect(within(font).getByRole("option", { name: "霞鹜文楷" })).toBeInTheDocument();
+    expect(within(theme).getByRole("option", { name: "雾蓝" })).toBeInTheDocument();
+  });
+
+  it("removes duplicate master controls and can delete an imported theme", async () => {
+    localStorage.setItem(
+      "atlas-toolkit-state-v1",
+      JSON.stringify({
+        ...defaultSnapshot,
+        settings: {
+          ...defaultSnapshot.settings,
+          theme: "light",
+          activeCustomThemeId: "theme-review",
+          customThemes: [{
+            id: "theme-review",
+            name: "验收主题",
+            mode: "dark",
+            colors: {
+              paper: "#ffffff",
+              panel: "#eeeeee",
+              card: "#f8f8f8",
+              ink: "#111111",
+              muted: "#666666",
+              accent: "#cc5500",
+              moss: "#557755",
+            },
+          }],
+        },
+      }),
+    );
+    const user = userEvent.setup();
+    render(<App />);
+    await waitFor(() =>
+      expect(document.documentElement).toHaveAttribute("data-theme", "dark"),
+    );
+    await user.click(await screen.findByRole("button", { name: "设置" }));
+    expect(screen.queryByText("功能总控")).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "打开配置" }));
+    await user.click(screen.getByRole("button", { name: "删除所选主题" }));
+    expect(screen.queryByRole("option", { name: "验收主题" })).not.toBeInTheDocument();
+    await waitFor(() =>
+      expect(document.documentElement).toHaveAttribute("data-theme", "light"),
+    );
+  });
+
+  it("deletes one clipboard history entry from its card", async () => {
+    localStorage.setItem(
+      "atlas-toolkit-state-v1",
+      JSON.stringify({
+        ...defaultSnapshot,
+        clipboardHistory: [{
+          id: "clipboard-delete",
+          kind: "text",
+          text: "这条记录需要删除",
+          copiedAt: 1,
+        }],
+      }),
+    );
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole("button", { name: "剪贴板历史" }));
+    expect(await screen.findByText("这条记录需要删除")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "删除这条剪贴板记录" }));
+
+    expect(screen.queryByText("这条记录需要删除")).not.toBeInTheDocument();
   });
 
   it("renders persisted clipboard image previews with an image marker", async () => {

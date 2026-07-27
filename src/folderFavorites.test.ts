@@ -24,6 +24,21 @@ function favorite(
   };
 }
 
+describe("folder favorite display limits", () => {
+  it("limits card metadata to readable lengths", () => {
+    const normalized = normalizeFolderFavorite(favorite("limits", {
+      description: "描".repeat(180),
+      group: "组".repeat(40),
+      tags: ["一".repeat(20), "二", "三", "四", "五", "六"],
+    }));
+
+    expect(normalized.description).toHaveLength(120);
+    expect(normalized.group).toHaveLength(24);
+    expect(normalized.tags).toHaveLength(5);
+    expect(normalized.tags[0]).toHaveLength(12);
+  });
+});
+
 describe("normalizeFolderTags", () => {
   it("trims tags, removes blanks and deduplicates without losing display casing", () => {
     expect(normalizeFolderTags([" 工作 ", "work", "工作", "", "WORK"])).toEqual([

@@ -52,10 +52,10 @@ export function normalizeFolderTags(
     const key = comparisonKey(displayValue);
     if (key && !seen.has(key)) {
       seen.add(key);
-      normalized.push(displayValue);
+      normalized.push(displayValue.slice(0, 12));
     }
     return normalized;
-  }, []);
+  }, []).slice(0, 5);
 }
 
 function normalizeShortcutKey(key: string): string {
@@ -117,9 +117,11 @@ export function normalizeFolderFavorite(
 ): NormalizedFolderFavorite {
   return {
     ...favorite,
-    group: favorite.group?.trim().normalize("NFKC") || DEFAULT_FOLDER_GROUP,
+    name: favorite.name.trim().slice(0, 48),
+    description: favorite.description.trim().slice(0, 120),
+    group: favorite.group?.trim().normalize("NFKC").slice(0, 24) || DEFAULT_FOLDER_GROUP,
     tags: normalizeFolderTags(favorite.tags),
-    alias: favorite.alias?.trim().normalize("NFKC") ?? "",
+    alias: favorite.alias?.trim().normalize("NFKC").slice(0, 32) ?? "",
     shortcut: normalizeFolderShortcut(favorite.shortcut),
   };
 }
@@ -173,12 +175,17 @@ export function filterFolderFavorites(
 
 export function groupFolderFavorites(
   favorites: readonly FolderFavorite[],
+  groupNames: readonly string[] = [],
 ): FolderFavoriteGroup[] {
   const collator = new Intl.Collator("zh-CN", {
     numeric: true,
     sensitivity: "base",
   });
   const grouped = new Map<string, NormalizedFolderFavorite[]>();
+  for (const group of groupNames) {
+    const normalized = group.trim().normalize("NFKC").slice(0, 24);
+    if (normalized) grouped.set(normalized, []);
+  }
 
   for (const favorite of normalizeFolderFavorites(favorites)) {
     const items = grouped.get(favorite.group) ?? [];

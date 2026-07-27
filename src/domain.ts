@@ -11,6 +11,12 @@ import type {
 } from "./types";
 import { normalizeFolderFavorites } from "./folderFavorites";
 
+export const DEFAULT_SHORTCUTS = {
+  search: "Alt+Space",
+  prompts: "Alt+Shift+P",
+  clipboard: "Alt+Shift+V",
+} as const;
+
 export type DataMigrationPlan =
   | { kind: "noop"; target: string }
   | { kind: "initialize"; target: string }
@@ -304,6 +310,7 @@ export function mergeSnapshotDefaults(snapshot: AppSnapshot): AppSnapshot {
       showTerminal: task.showTerminal ?? true,
       closeTerminalOnFinish: task.closeTerminalOnFinish ?? true,
     })),
+    folderGroups: snapshot.folderGroups ?? [],
     folderFavorites: normalizeFolderFavorites(snapshot.folderFavorites ?? []),
     startupFailures: snapshot.startupFailures ?? [],
     prompts: snapshot.prompts ?? [],
@@ -328,9 +335,8 @@ export function mergeSnapshotDefaults(snapshot: AppSnapshot): AppSnapshot {
           : snapshot.settings?.fontFamily ?? "system",
       fontScale: snapshot.settings?.fontScale ?? 1,
       shortcuts: snapshot.settings?.shortcuts ?? {
-        search: legacyShortcut ?? "Alt+Space",
-        prompts: "Alt+Shift+P",
-        clipboard: "Alt+Shift+V",
+        ...DEFAULT_SHORTCUTS,
+        search: legacyShortcut ?? DEFAULT_SHORTCUTS.search,
       },
       dataDirectory: snapshot.settings?.dataDirectory ?? "",
       indexRoots,
@@ -356,6 +362,31 @@ export function mergeSnapshotDefaults(snapshot: AppSnapshot): AppSnapshot {
       launchAtLogin: snapshot.settings?.launchAtLogin ?? true,
       loginSceneId:
         snapshot.settings?.loginSceneId ?? startupScenes[0]?.id ?? "default-scene",
+      branding: {
+        appName: snapshot.settings?.branding?.appName ?? "ATLAS",
+        appDescription: snapshot.settings?.branding?.appDescription ?? "DESKTOP KIT",
+        workspaceName: snapshot.settings?.branding?.workspaceName ?? "本地工作区",
+        workspaceDescription:
+          snapshot.settings?.branding?.workspaceDescription ?? "所有数据仅在本机",
+        logoPath: snapshot.settings?.branding?.logoPath ?? "",
+        avatarPath: snapshot.settings?.branding?.avatarPath ?? "",
+        backgroundPath: snapshot.settings?.branding?.backgroundPath ?? "",
+        toolNames: {
+          startup: snapshot.settings?.branding?.toolNames?.startup ?? "启动编排",
+          search: snapshot.settings?.branding?.toolNames?.search ?? "全局搜索",
+          prompts: snapshot.settings?.branding?.toolNames?.prompts ?? "提示词库",
+          clipboard:
+            snapshot.settings?.branding?.toolNames?.clipboard ?? "剪贴板历史",
+          automation:
+            snapshot.settings?.branding?.toolNames?.automation ?? "自动化命令",
+          folders: snapshot.settings?.branding?.toolNames?.folders ?? "文件夹收藏",
+        },
+      },
+      customFonts: snapshot.settings?.customFonts ?? [],
+      activeCustomFontId: snapshot.settings?.activeCustomFontId ?? "",
+      customThemes: snapshot.settings?.customThemes ?? [],
+      activeCustomThemeId: snapshot.settings?.activeCustomThemeId ?? "",
+      confirmOnClose: snapshot.settings?.confirmOnClose ?? true,
     },
   };
 }

@@ -1,6 +1,7 @@
 import type {
   AppSnapshot,
   ClipboardEntry,
+  IndexProgress,
   SearchFilters,
   SearchResult,
   StartupItem,
@@ -158,6 +159,22 @@ export async function activateClipboardEntry(
   );
 }
 
+export async function deleteClipboardEntry(id: string): Promise<ClipboardEntry[]> {
+  return (
+    (await invokeNative<ClipboardEntry[]>("delete_clipboard_history_entry", { id })) ?? []
+  );
+}
+
+export async function importAppearanceAsset(
+  kind: "font" | "logo" | "avatar" | "background",
+): Promise<string | null> {
+  return invokeNative<string | null>("import_appearance_asset", { kind });
+}
+
+export async function loadAppearanceAsset(path: string): Promise<string> {
+  return (await invokeNative<string>("load_appearance_asset", { path })) ?? "";
+}
+
 export async function searchNative(
   query: string,
   filters?: SearchFilters,
@@ -221,6 +238,23 @@ export async function rebuildSearchIndex(roots: string[]): Promise<number> {
 
 export async function getSearchIndexStatus(): Promise<string> {
   return (await invokeNative<string>("get_index_status")) ?? "ready";
+}
+
+export async function getSearchIndexProgress(): Promise<IndexProgress> {
+  return (
+    (await invokeNative<IndexProgress>("get_index_progress"))
+    ?? {
+      status: "ready",
+      phase: "complete",
+      indexedItems: 0,
+      completedRoots: 0,
+      totalRoots: 0,
+    }
+  );
+}
+
+export async function listSearchDrives(): Promise<string[]> {
+  return (await invokeNative<string[]>("list_search_drives")) ?? [];
 }
 
 export async function getSearchIndexCount(): Promise<number> {
@@ -328,6 +362,14 @@ export async function bindClipboardHistory(
   return listen<ClipboardEntry[]>("atlas-clipboard-history", (event) => {
     handler(event.payload);
   });
+}
+
+export async function bindSnapshotUpdated(
+  handler: () => void,
+): Promise<() => void> {
+  if (!hasTauriRuntime()) return () => undefined;
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen("atlas-snapshot-updated", handler);
 }
 
 export async function bindSearchFilters(

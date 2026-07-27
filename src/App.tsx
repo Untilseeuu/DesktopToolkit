@@ -8,6 +8,7 @@ import {
   Box,
   Check,
   ChevronDown,
+  ChevronUp,
   Clipboard,
   Clock3,
   Command,
@@ -29,7 +30,6 @@ import {
   LayoutGrid,
   Link2,
   ListFilter,
-  Moon,
   Monitor,
   MoreHorizontal,
   Pencil,
@@ -37,20 +37,19 @@ import {
   Power,
   Play,
   Rocket,
+  RotateCcw,
   Save,
   Search,
   Settings,
   Sparkles,
   Terminal,
-  Sun,
   Tag,
   Trash2,
   X,
   Zap,
 } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import {
-  ArrowButton,
   EmptyState,
   ResultGlyph,
   SectionHeading,
@@ -59,6 +58,7 @@ import {
 } from "./components";
 import {
   calculateOverviewMetrics,
+  DEFAULT_SHORTCUTS,
   buildQuickLinkResults,
   clipboardEntryKind,
   clipboardEntrySearchText,
@@ -86,23 +86,26 @@ import {
   chooseExecutable,
   closePreviousStartupScene,
   copyText,
-  getSearchIndexCount,
-  getSearchIndexStatus,
+  deleteClipboardEntry,
+  getSearchIndexProgress,
   getAppIcons,
+  importAppearanceAsset,
   invokeNative,
   launchStartupItems,
   listStartupSceneMonitors,
+  loadAppearanceAsset,
   openTarget,
-  rebuildSearchIndex,
   restoreStartupSceneLayout,
   runCommandTask,
   searchNative,
 } from "./native";
 import { SearchQueryInput } from "./SearchQueryInput";
+import { SearchFilterControls } from "./SearchFilterControls";
 import WindowChrome from "./WindowChrome";
 import type {
   CommandTask,
   FolderFavorite,
+  IndexProgress,
   NavId,
   PromptEntry,
   QuickLink,
@@ -197,19 +200,116 @@ const demoSearchResults: SearchResult[] = [
 ];
 
 export default function App() {
+  const model = useToolkit();
   return (
     <div className="desktop-frame">
-      <WindowChrome />
-      <MainApp />
+      <WindowChrome
+        title={model.snapshot.settings.branding.appName}
+        description={model.snapshot.settings.branding.appDescription}
+        confirmOnClose={model.snapshot.settings.confirmOnClose}
+        onDisableCloseReminder={() => model.setSetting("confirmOnClose", false)}
+      />
+      <MainApp model={model} />
     </div>
   );
 }
 
-function MainApp() {
-  const model = useToolkit();
+function MainApp({ model }: { model: ToolkitModel }) {
   const [activeNav, setActiveNav] = useState<NavId>("overview");
   const [toast, setToast] = useState<string | null>(null);
+  const [indexProgress, setIndexProgress] = useState<IndexProgress | null>(null);
   const mainPanelRef = useRef<HTMLElement>(null);
+  const [appearanceAssets, setAppearanceAssets] = useState({
+    logo: "",
+    avatar: "",
+    background: "",
+  });
+  const branding = model.snapshot.settings.branding;
+  const customTheme = model.snapshot.settings.customThemes.find(
+    (theme) => theme.id === model.snapshot.settings.activeCustomThemeId,
+  );
+  const customFont = model.snapshot.settings.customFonts.find(
+    (font) => font.id === model.snapshot.settings.activeCustomFontId,
+  );
+
+  useEffect(() => {
+    void import("@tauri-apps/api/window")
+      .then(({ getCurrentWindow }) =>
+        getCurrentWindow().setTitle(
+          [branding.appName, branding.appDescription].filter(Boolean).join(" · "),
+        ),
+      )
+      .catch(() => undefined);
+  }, [branding.appDescription, branding.appName]);
+
+  useEffect(() => {
+    let active = true;
+    const paths = [
+      ["logo", branding.logoPath],
+      ["avatar", branding.avatarPath],
+      ["background", branding.backgroundPath],
+    ] as const;
+    void Promise.all(
+      paths.map(async ([key, path]) => [
+        key,
+        path ? await loadAppearanceAsset(path).catch(() => "") : "",
+      ] as const),
+    ).then((loaded) => {
+      if (active) {
+        setAppearanceAssets(Object.fromEntries(loaded) as typeof appearanceAssets);
+      }
+    });
+    return () => {
+      active = false;
+    };
+  }, [branding.avatarPath, branding.backgroundPath, branding.logoPath]);
+
+  useEffect(() => {
+    const root = document.documentElement;
+    const colors = customTheme?.colors;
+    root.dataset.theme = customTheme?.mode ?? model.snapshot.settings.theme;
+    const variables = {
+      "--paper": colors?.paper,
+      "--panel": colors?.panel,
+      "--card": colors?.card,
+      "--ink": colors?.ink,
+      "--muted": colors?.muted,
+      "--vermillion": colors?.accent,
+      "--moss": colors?.moss,
+    };
+    Object.entries(variables).forEach(([key, value]) => {
+      if (value) root.style.setProperty(key, value);
+      else root.style.removeProperty(key);
+    });
+    return () => {
+      Object.keys(variables).forEach((key) => root.style.removeProperty(key));
+    };
+  }, [customTheme, model.snapshot.settings.theme]);
+
+  useEffect(() => {
+    const root = document.documentElement;
+    if (!customFont) {
+      root.style.removeProperty("--custom-font");
+      delete root.dataset.customFont;
+      return;
+    }
+    let active = true;
+    void loadAppearanceAsset(customFont.path).then((source) => {
+      if (!active) return;
+      let style = document.getElementById("atlas-custom-font") as HTMLStyleElement | null;
+      if (!style) {
+        style = document.createElement("style");
+        style.id = "atlas-custom-font";
+        document.head.append(style);
+      }
+      style.textContent = `@font-face{font-family:"Atlas Custom";src:url("${source}")}`;
+      root.style.setProperty("--custom-font", '"Atlas Custom"');
+      root.dataset.customFont = "true";
+    });
+    return () => {
+      active = false;
+    };
+  }, [customFont]);
 
   useEffect(() => {
     const showSearch = () => setActiveNav("search");
@@ -249,6 +349,25 @@ function MainApp() {
   }, [toast]);
 
   useEffect(() => {
+    let active = true;
+    let timer: number | undefined;
+    const refresh = async () => {
+      const next = await getSearchIndexProgress();
+      if (!active) return;
+      setIndexProgress(next);
+      timer = window.setTimeout(
+        refresh,
+        next.status === "indexing" || next.status === "idle" ? 750 : 5_000,
+      );
+    };
+    void refresh();
+    return () => {
+      active = false;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, []);
+
+  useEffect(() => {
     if (mainPanelRef.current) mainPanelRef.current.scrollTop = 0;
   }, [activeNav]);
 
@@ -270,6 +389,7 @@ function MainApp() {
       return (
         <PausedToolPage
           tool={activeNav}
+          title={branding.toolNames[activeNav]}
           onEnable={() => model.setToolEnabled(activeNav, true)}
         />
       );
@@ -278,7 +398,13 @@ function MainApp() {
       case "startup":
         return <StartupPage model={model} notify={setToast} />;
       case "search":
-        return <SearchPage model={model} notify={setToast} />;
+        return (
+          <SearchPage
+            model={model}
+            notify={setToast}
+            indexProgress={indexProgress}
+          />
+        );
       case "prompts":
         return <PromptsPage model={model} notify={setToast} />;
       case "clipboard":
@@ -297,13 +423,13 @@ function MainApp() {
   return (
     <div className="app-shell">
       <aside className="sidebar">
-        <button className="brand" onClick={() => setActiveNav("overview")} aria-label="Atlas 首页">
+        <button className="brand" onClick={() => setActiveNav("overview")} aria-label={`${branding.appName} 首页`}>
           <span className="brand-mark brand-mark--fixed-contrast">
-            <Layers3 size={20} />
+            {appearanceAssets.logo ? <img src={appearanceAssets.logo} alt="" /> : <Layers3 size={20} />}
           </span>
           <span>
-            <strong>ATLAS</strong>
-            <small>DESKTOP KIT</small>
+            <strong>{branding.appName}</strong>
+            <small>{branding.appDescription}</small>
           </span>
         </button>
 
@@ -320,7 +446,7 @@ function MainApp() {
                 onClick={() => setActiveNav(item.id)}
               >
                 <Icon size={18} />
-                <span>{item.label}</span>
+                <span>{item.id === "overview" ? item.label : branding.toolNames[item.id as ToolId]}</span>
                 {item.id !== "overview" ? (
                   <i className={model.snapshot.tools[item.id as ToolId].enabled ? "on" : ""} />
                 ) : null}
@@ -340,18 +466,30 @@ function MainApp() {
           <span>设置</span>
         </button>
         <div className="profile-chip">
-          <span className="profile-glyph">A</span>
+          <span className="profile-glyph">
+            {appearanceAssets.avatar ? <img src={appearanceAssets.avatar} alt="" /> : "A"}
+          </span>
           <span>
-            <strong>本地工作区</strong>
-            <small>所有数据仅在本机</small>
+            <strong>{branding.workspaceName}</strong>
+            <small>{branding.workspaceDescription}</small>
           </span>
           <MoreHorizontal size={17} />
         </div>
       </aside>
 
-      <main className="main-panel" ref={mainPanelRef}>
+      <main
+        className="main-panel"
+        ref={mainPanelRef}
+        style={appearanceAssets.background ? {
+          backgroundImage: `linear-gradient(var(--appearance-wash), var(--appearance-wash)), url("${appearanceAssets.background}")`,
+        } : undefined}
+      >
         <div className="page">{page}</div>
       </main>
+
+      {indexProgress?.status === "indexing" ? (
+        <IndexProgressBanner progress={indexProgress} />
+      ) : null}
 
       <AnimatePresence>
         {toast ? (
@@ -371,6 +509,59 @@ function MainApp() {
 }
 
 type ToolkitModel = ReturnType<typeof useToolkit>;
+
+export function IndexProgressBanner({ progress }: { progress: IndexProgress }) {
+  const [collapsed, setCollapsed] = useState(false);
+  const max = Math.max(progress.totalRoots, 1);
+  if (collapsed) {
+    return (
+      <aside
+        className="index-progress-banner collapsed"
+        aria-live="polite"
+      >
+        <span className="index-progress-pulse" aria-hidden="true" />
+        <strong>索引中</strong>
+        <button
+          type="button"
+          aria-label="展开索引详情"
+          onClick={() => setCollapsed(false)}
+        >
+          <ChevronUp size={14} />
+        </button>
+      </aside>
+    );
+  }
+  return (
+    <aside className="index-progress-banner" aria-live="polite">
+      <div>
+        <strong>正在建立全盘索引</strong>
+        <small>
+          {progress.currentRoot ? `${progress.currentRoot} · ` : ""}
+          已发现 {progress.indexedItems.toLocaleString("zh-CN")} 项
+        </small>
+      </div>
+      <progress
+        aria-label="全盘索引进度"
+        max={max}
+        {...(progress.completedRoots > 0
+          ? { value: progress.completedRoots }
+          : {})}
+      />
+      <span>
+        {progress.completedRoots > 0
+          ? `${progress.completedRoots} / ${progress.totalRoots} 个位置`
+          : `正在扫描第 ${Math.min(1, progress.totalRoots)} / ${progress.totalRoots} 个位置`}
+      </span>
+      <button
+        type="button"
+        aria-label="隐藏索引详情"
+        onClick={() => setCollapsed(true)}
+      >
+        <ChevronDown size={15} />
+      </button>
+    </aside>
+  );
+}
 
 function OverviewPage({
   model,
@@ -415,6 +606,7 @@ function OverviewPage({
       <section className="tool-grid" aria-label="工具列表">
         {(Object.keys(toolMeta) as ToolId[]).map((id) => {
           const meta = toolMeta[id];
+          const displayTitle = model.snapshot.settings.branding.toolNames[id];
           const Icon = meta.icon;
           const enabled = model.snapshot.tools[id].enabled;
           const resolvedStat = {
@@ -433,21 +625,21 @@ function OverviewPage({
               <button
                 type="button"
                 className="tool-card-hit-target"
-                aria-label={`打开${meta.title}`}
+                aria-label={`打开${displayTitle}`}
                 onClick={() => navigate(id)}
               />
               <div className="tool-card-top">
                 <span className="tool-number">{meta.number}</span>
                 <Switch
                   checked={enabled}
-                  label={meta.title}
+                  label={displayTitle}
                   onChange={(value) => model.setToolEnabled(id, value)}
                 />
               </div>
               <div className="tool-icon">
                 <Icon size={25} strokeWidth={1.7} />
               </div>
-              <h2>{meta.title}</h2>
+              <h2>{displayTitle}</h2>
               <p>{meta.caption}</p>
               <footer>
                 <ToolBadge enabled={enabled}>{enabled ? "运行中" : "已暂停"}</ToolBadge>
@@ -634,9 +826,9 @@ function StartupPage({
     <>
       <SectionHeading
         eyebrow="TOOL 01 · STARTUP"
-        title="启动编排"
+        title={model.snapshot.settings.branding.toolNames.startup}
         description="为工作、学习或自定义场景安排不同的应用组合，并按顺序启动。"
-        action={<Switch checked={enabled} onChange={(value) => model.setToolEnabled("startup", value)} label="启动编排" />}
+        action={<Switch checked={enabled} onChange={(value) => model.setToolEnabled("startup", value)} label={model.snapshot.settings.branding.toolNames.startup} />}
       />
       <section className="scene-switcher">
         <div className="scene-tabs" role="tablist" aria-label="启动场景">
@@ -981,9 +1173,11 @@ function StartupPage({
 function SearchPage({
   model,
   notify,
+  indexProgress,
 }: {
   model: ToolkitModel;
   notify: (message: string) => void;
+  indexProgress: IndexProgress | null;
 }) {
   const enabled = model.snapshot.tools.search.enabled;
   const filters = model.snapshot.settings.searchFilters;
@@ -994,28 +1188,9 @@ function SearchPage({
   const [selected, setSelected] = useState(0);
   const requestSequence = useRef(0);
   const lastRecordedQuery = useRef("");
-  const [indexStatus, setIndexStatus] = useState("idle");
+  const indexStatus = indexProgress?.status ?? "ready";
   const displayedResults = results.slice(0, 60);
   const active = displayedResults[selected];
-
-  useEffect(() => {
-    let active = true;
-    let timer: number | undefined;
-    const refresh = async () => {
-      const status = (await invokeNative<string>("get_index_status")) ?? "demo";
-      if (!active) return;
-      setIndexStatus(status);
-      timer = window.setTimeout(
-        refresh,
-        status === "indexing" || status === "idle" ? 1200 : 10_000,
-      );
-    };
-    void refresh();
-    return () => {
-      active = false;
-      if (timer !== undefined) window.clearTimeout(timer);
-    };
-  }, []);
 
   useEffect(() => {
     const requestId = ++requestSequence.current;
@@ -1077,13 +1252,13 @@ function SearchPage({
     <>
       <SectionHeading
         eyebrow="TOOL 02 · FINDER"
-        title="全局搜索"
+        title={model.snapshot.settings.branding.toolNames.search}
         description="搜索应用、文件与文件夹；支持拼音、首字母、常见错拼和同义词。"
         action={
           <Switch
             checked={enabled}
             onChange={(value) => model.setToolEnabled("search", value)}
-            label="全局搜索"
+            label={model.snapshot.settings.branding.toolNames.search}
           />
         }
       />
@@ -1116,41 +1291,12 @@ function SearchPage({
             }}
           />
         </div>
-        <div className="search-filter-bar">
-          <select
-            aria-label="搜索类型"
-            value={filters.kind}
-            onChange={(event) =>
-              model.setSearchFilters({
-                ...filters,
-                kind: event.target.value as typeof filters.kind,
-              })
-            }
-          >
-            <option value="all">全部类型</option>
-            <option value="link">快捷链接</option>
-            <option value="app">应用</option>
-            <option value="folder">文件夹</option>
-            <option value="file">文件</option>
-          </select>
-          <input
-            aria-label="文件扩展名"
-            value={filters.extension}
-            onChange={(event) =>
-              model.setSearchFilters({ ...filters, extension: event.target.value })
-            }
-            placeholder="扩展名：pdf"
-          />
-          <input
-            aria-label="所在磁盘"
-            value={filters.drive}
-            onChange={(event) =>
-              model.setSearchFilters({ ...filters, drive: event.target.value })
-            }
-            placeholder="磁盘：D:"
-          />
-          <span>筛选条件会同步到快捷搜索浮窗</span>
-        </div>
+        <SearchFilterControls
+          className="search-filter-bar"
+          filters={filters}
+          onChange={model.setSearchFilters}
+          showHint
+        />
 
         <div className="search-layout">
           <div className="results-panel">
@@ -1268,9 +1414,7 @@ function SearchPage({
             ? "正在建立索引"
             : indexStatus === "failed"
               ? "索引建立失败"
-              : indexStatus === "demo"
-                ? "浏览器演示模式"
-                : indexStatus === "idle"
+              : indexStatus === "idle"
                   ? "等待索引任务"
                   : "索引服务正常"}
         </span>
@@ -1281,9 +1425,11 @@ function SearchPage({
 
 function PausedToolPage({
   tool,
+  title,
   onEnable,
 }: {
   tool: ToolId;
+  title: string;
   onEnable: () => void;
 }) {
   const meta = toolMeta[tool];
@@ -1294,7 +1440,7 @@ function PausedToolPage({
         <Icon size={31} />
       </span>
       <span className="eyebrow">TOOL PAUSED</span>
-      <h1>{meta.title}已暂停</h1>
+      <h1>{title}已暂停</h1>
       <p>这个工具不会执行后台任务，也不会响应相关操作。已有配置和数据仍会安全保留。</p>
       <button className="button primary" onClick={onEnable}>
         <Power size={16} /> 重新启用
@@ -1330,14 +1476,14 @@ function PromptsPage({
     <>
       <SectionHeading
         eyebrow="TOOL 03 · PROMPTS"
-        title="提示词库"
+        title={model.snapshot.settings.branding.toolNames.prompts}
         description="收藏那些真正有效的表达，在需要时一键带走。"
         action={
           <div className="heading-actions">
             <Switch
               checked={model.snapshot.tools.prompts.enabled}
               onChange={(enabled) => model.setToolEnabled("prompts", enabled)}
-              label="提示词库"
+              label={model.snapshot.settings.branding.toolNames.prompts}
             />
             <button className="button primary" onClick={() => setEditing("new")}>
               <Plus size={17} /> 新建提示词
@@ -1418,11 +1564,28 @@ function PromptsPage({
             </footer>
           </motion.article>
         ))}
-        <button className="new-prompt-card" onClick={() => setEditing("new")}>
-          <span><Plus size={22} /></span>
-          <strong>新建提示词</strong>
-          <small>把刚刚奏效的表达保存下来</small>
-        </button>
+        {model.snapshot.prompts.length ? (
+          <button className="new-prompt-card" onClick={() => setEditing("new")}>
+            <span><Plus size={22} /></span>
+            <strong>新建提示词</strong>
+            <small>把刚刚奏效的表达保存下来</small>
+          </button>
+        ) : (
+          <EmptyState
+            icon={<BookOpenText size={28} />}
+            title="还没有提示词"
+            description="保存常用表达后，可在主界面或快捷小窗中随时搜索并复制。"
+            fullSpan
+          />
+        )}
+        {model.snapshot.prompts.length > 0 && prompts.length === 0 ? (
+          <EmptyState
+            icon={<Search size={28} />}
+            title="没有匹配的提示词"
+            description="换个关键词、分类或取消“只看收藏”后再试。"
+            fullSpan
+          />
+        ) : null}
       </section>
       {editing ? (
         <PromptEditor
@@ -1523,65 +1686,6 @@ function PromptEditor({
   );
 }
 
-function SettingsPage({
-  model,
-  notify,
-}: {
-  model: ToolkitModel;
-  notify: (message: string) => void;
-}) {
-  return (
-    <>
-      <SectionHeading
-        eyebrow="PREFERENCES"
-        title="设置"
-        description="决定 Atlas 如何融入你的电脑与日常习惯。"
-      />
-      <div className="settings-layout">
-        <section className="settings-section">
-          <header><Database size={19} /><div><h2>数据与存储</h2><p>选择数据库、提示词与搜索索引的保存位置。</p></div></header>
-          <div className="setting-row storage-row">
-            <span className="drive-icon"><HardDrive size={22} /></span>
-            <div>
-              <strong>当前存储位置</strong>
-              <code>{model.snapshot.settings.dataDirectory}</code>
-              <small>存储位置跟随软件安装目录</small>
-            </div>
-          </div>
-        </section>
-
-        <section className="settings-section">
-          <header><Keyboard size={19} /><div><h2>搜索与快捷键</h2><p>控制全局搜索的呼出方式和索引范围。</p></div></header>
-          <div className="setting-row">
-            <div><strong>全局快捷键</strong><small>在任何应用中呼出搜索浮窗</small></div>
-            <button className="shortcut-editor"><kbd>ALT</kbd><b>+</b><kbd>SPACE</kbd></button>
-          </div>
-          <div className="setting-row">
-            <div><strong>索引位置</strong><small>{model.snapshot.settings.indexRoots.join("、")}</small></div>
-            <button className="button secondary"><Plus size={16} /> 添加目录</button>
-          </div>
-          <div className="setting-row">
-            <div><strong>排除规则</strong><small>{model.snapshot.settings.excludedPatterns.join(" · ")}</small></div>
-            <ArrowButton>管理规则</ArrowButton>
-          </div>
-        </section>
-
-        <section className="settings-section">
-          <header><Sparkles size={19} /><div><h2>外观</h2><p>选择适合当前环境的界面明暗。</p></div></header>
-          <div className="theme-picker">
-            <button className={model.snapshot.settings.theme === "light" ? "selected" : ""} onClick={() => model.setTheme("light")}>
-              <span className="theme-preview light"><i /><i /><i /></span><Sun size={16} /> 浅色
-            </button>
-            <button className={model.snapshot.settings.theme === "dark" ? "selected" : ""} onClick={() => model.setTheme("dark")}>
-              <span className="theme-preview dark"><i /><i /><i /></span><Moon size={16} /> 深色
-            </button>
-          </div>
-        </section>
-      </div>
-    </>
-  );
-}
-
 function ClipboardPage({
   model,
   notify,
@@ -1601,13 +1705,13 @@ function ClipboardPage({
     <>
       <SectionHeading
         eyebrow="TOOL 04 · CLIPBOARD"
-        title="剪贴板历史"
+        title={model.snapshot.settings.branding.toolNames.clipboard}
         description={`最近 ${model.snapshot.settings.clipboardLimit} 条文字或图片会保存在本地，点击任意记录即可重新复制。`}
         action={
           <Switch
             checked={model.snapshot.tools.clipboard.enabled}
             onChange={(enabled) => model.setToolEnabled("clipboard", enabled)}
-            label="剪贴板历史"
+            label={model.snapshot.settings.branding.toolNames.clipboard}
           />
         }
       />
@@ -1619,45 +1723,65 @@ function ClipboardPage({
           placeholder="搜索复制过的文字或图片"
         />
       </label>
-      <section className="clipboard-list">
+      <section className={`clipboard-list ${entries.length ? "" : "is-empty"}`}>
         {entries.length ? (
           entries.map((entry) => {
             const kind = clipboardEntryKind(entry);
             const text = entry.text ?? "";
             return (
-              <button
+              <article
                 key={entry.id}
                 className={`clipboard-entry ${kind}`}
-                onClick={() => {
-                  void activateClipboardEntry(entry.id, false).then(() => {
-                    model.recordCopy("clipboard");
-                    notify(kind === "image" ? "图片已恢复到剪贴板" : "已复制这条历史内容");
-                  });
-                }}
               >
-                <span className={`clipboard-entry-icon ${kind}`}>
-                  {kind === "image" ? <ImageIcon size={17} /> : <FileText size={17} />}
-                </span>
-                {kind === "image" ? (
-                  <span className="clipboard-image-content">
-                    {entry.previewDataUrl ? (
-                      <img src={entry.previewDataUrl} alt="剪贴板图片预览" />
-                    ) : (
-                      <span className="clipboard-image-placeholder"><ImageIcon size={22} /></span>
-                    )}
+                <button
+                  type="button"
+                  className="clipboard-entry-main"
+                  onClick={() => {
+                    void activateClipboardEntry(entry.id, false).then(() => {
+                      model.recordCopy("clipboard");
+                      notify(kind === "image" ? "图片已恢复到剪贴板" : "已复制这条历史内容");
+                    });
+                  }}
+                >
+                  <span className={`clipboard-entry-icon ${kind}`}>
+                    {kind === "image" ? <ImageIcon size={17} /> : <FileText size={17} />}
+                  </span>
+                  {kind === "image" ? (
+                    <span className="clipboard-image-content">
+                      {entry.previewDataUrl ? (
+                        <img src={entry.previewDataUrl} alt="剪贴板图片预览" />
+                      ) : (
+                        <span className="clipboard-image-placeholder"><ImageIcon size={22} /></span>
+                      )}
+                      <span>
+                        <strong>{entry.width ?? 0} × {entry.height ?? 0}</strong>
+                        <small>{new Date(entry.copiedAt).toLocaleString("zh-CN")}</small>
+                      </span>
+                    </span>
+                  ) : (
                     <span>
-                      <strong>{entry.width ?? 0} × {entry.height ?? 0}</strong>
+                      <strong>{text.length > 180 ? `${text.slice(0, 180)}…` : text}</strong>
                       <small>{new Date(entry.copiedAt).toLocaleString("zh-CN")}</small>
                     </span>
-                  </span>
-                ) : (
-                  <span>
-                    <strong>{text.length > 180 ? `${text.slice(0, 180)}…` : text}</strong>
-                    <small>{new Date(entry.copiedAt).toLocaleString("zh-CN")}</small>
-                  </span>
-                )}
-                <Copy size={16} />
-              </button>
+                  )}
+                  <Copy size={16} />
+                </button>
+                <button
+                  type="button"
+                  className="clipboard-entry-delete"
+                  aria-label="删除这条剪贴板记录"
+                  onClick={() => {
+                    void deleteClipboardEntry(entry.id)
+                      .then((clipboardHistory) => {
+                        model.setClipboardHistory(clipboardHistory);
+                        notify("剪贴板记录已删除");
+                      })
+                      .catch((error: unknown) => notify(`删除失败：${String(error)}`));
+                  }}
+                >
+                  <Trash2 size={15} />
+                </button>
+              </article>
             );
           })
         ) : (
@@ -1665,6 +1789,7 @@ function ClipboardPage({
             icon={<Clipboard size={28} />}
             title="还没有剪贴板记录"
             description="启用工具后，新复制的文字和图片会自动出现在这里。"
+            fullSpan
           />
         )}
       </section>
@@ -1684,6 +1809,7 @@ function ShortcutRecorder({
     <button
       type="button"
       className={`shortcut-recorder ${recording ? "recording" : ""}`}
+      aria-label={recording ? "请按下组合键" : value}
       onClick={() => setRecording(true)}
       onBlur={() => setRecording(false)}
       onKeyDown={(event) => {
@@ -1754,13 +1880,13 @@ function AutomationPage({
     <>
       <SectionHeading
         eyebrow="TOOL 05 · AUTOMATION"
-        title="自动化命令"
+        title={model.snapshot.settings.branding.toolNames.automation}
         description="把重复的终端步骤保存为任务。每条命令结束后，下一条才会开始。"
         action={
           <Switch
             checked={enabled}
             onChange={(value) => model.setToolEnabled("automation", value)}
-            label="自动化命令"
+            label={model.snapshot.settings.branding.toolNames.automation}
           />
         }
       />
@@ -1973,14 +2099,21 @@ function FolderFavoritesPage({
   const enabled = model.snapshot.tools.folders.enabled;
   const [query, setQuery] = useState("");
   const [groupFilter, setGroupFilter] = useState("");
+  const [creatingGroup, setCreatingGroup] = useState(false);
+  const [newGroupName, setNewGroupName] = useState("");
+  const [editingGroup, setEditingGroup] = useState<string | null>(null);
+  const [deletingGroup, setDeletingGroup] = useState<string | null>(null);
   const [draft, setDraft] = useState<FolderFavorite | null>(null);
   const allFavorites = useMemo(
     () => model.snapshot.folderFavorites.map(normalizeFolderFavorite),
     [model.snapshot.folderFavorites],
   );
   const availableGroups = useMemo(
-    () => groupFolderFavorites(allFavorites).map((group) => group.name),
-    [allFavorites],
+    () =>
+      groupFolderFavorites(allFavorites, model.snapshot.folderGroups).map(
+        (group) => group.name,
+      ),
+    [allFavorites, model.snapshot.folderGroups],
   );
   const visibleGroups = useMemo(
     () =>
@@ -1989,9 +2122,77 @@ function FolderFavoritesPage({
           query,
           group: groupFilter,
         }),
+        !query ? model.snapshot.folderGroups.filter(
+          (group) => !groupFilter || group === groupFilter,
+        ) : [],
       ),
-    [allFavorites, groupFilter, query],
+    [allFavorites, groupFilter, model.snapshot.folderGroups, query],
   );
+  const createGroup = () => {
+    const name = newGroupName.trim().normalize("NFKC").slice(0, 24);
+    if (!name) {
+      notify("请输入分组名称");
+      return;
+    }
+    if (availableGroups.some((group) => group.toLocaleLowerCase() === name.toLocaleLowerCase())) {
+      notify("这个分组已经存在");
+      return;
+    }
+    model.setSnapshot((current) => ({
+      ...current,
+      folderGroups: [...current.folderGroups, name],
+    }));
+    setNewGroupName("");
+    setCreatingGroup(false);
+    setGroupFilter(name);
+    notify("分组已创建");
+  };
+  const saveGroupName = () => {
+    if (!editingGroup) return;
+    const name = newGroupName.trim().normalize("NFKC").slice(0, 24);
+    if (!name) {
+      notify("请输入分组名称");
+      return;
+    }
+    if (
+      availableGroups.some(
+        (group) =>
+          group !== editingGroup &&
+          group.toLocaleLowerCase() === name.toLocaleLowerCase(),
+      )
+    ) {
+      notify("这个分组已经存在");
+      return;
+    }
+    model.setSnapshot((current) => ({
+      ...current,
+      folderGroups: current.folderGroups.map((group) =>
+        group === editingGroup ? name : group,
+      ),
+      folderFavorites: current.folderFavorites.map((favorite) =>
+        normalizeFolderFavorite(favorite).group === editingGroup
+          ? { ...favorite, group: name }
+          : favorite,
+      ),
+    }));
+    if (groupFilter === editingGroup) setGroupFilter(name);
+    setEditingGroup(null);
+    setNewGroupName("");
+    notify("分组名称已更新");
+  };
+  const confirmDeleteGroup = () => {
+    if (!deletingGroup) return;
+    model.setSnapshot((current) => ({
+      ...current,
+      folderGroups: current.folderGroups.filter((group) => group !== deletingGroup),
+      folderFavorites: current.folderFavorites.filter(
+        (favorite) => normalizeFolderFavorite(favorite).group !== deletingGroup,
+      ),
+    }));
+    if (groupFilter === deletingGroup) setGroupFilter("");
+    setDeletingGroup(null);
+    notify("分组和其中的收藏已删除");
+  };
   const addFolder = async () => {
     const path = await chooseDirectory();
     if (!path) return;
@@ -2059,13 +2260,13 @@ function FolderFavoritesPage({
     <>
       <SectionHeading
         eyebrow="TOOL 06 · PLACES"
-        title="文件夹收藏"
+        title={model.snapshot.settings.branding.toolNames.folders}
         description="收藏经常使用的项目、资料和下载目录，随时一键打开。"
         action={
           <Switch
             checked={enabled}
             onChange={(value) => model.setToolEnabled("folders", value)}
-            label="文件夹收藏"
+            label={model.snapshot.settings.branding.toolNames.folders}
           />
         }
       />
@@ -2092,10 +2293,62 @@ function FolderFavoritesPage({
           </select>
           <span>{allFavorites.length} 个常用位置</span>
         </div>
-        <button className="button primary" disabled={!enabled} onClick={() => void addFolder()}>
-          <Plus size={17} /> 收藏文件夹
-        </button>
+        <div className="folder-toolbar-actions">
+          <button className="button ghost" disabled={!enabled} onClick={() => setCreatingGroup(true)}>
+            <Layers3 size={16} /> 新建分组
+          </button>
+          <button className="button primary" disabled={!enabled} onClick={() => void addFolder()}>
+            <Plus size={17} /> 收藏文件夹
+          </button>
+        </div>
       </div>
+      {creatingGroup || editingGroup ? (
+        <section
+          className="content-card folder-group-creator"
+          aria-label={editingGroup ? "编辑文件夹分组" : "新建文件夹分组"}
+        >
+          <label>
+            <span>{editingGroup ? "编辑分组名称" : "分组名称"}</span>
+            <input
+              aria-label={editingGroup ? "编辑分组名称" : "分组名称"}
+              autoFocus
+              maxLength={24}
+              value={newGroupName}
+              onChange={(event) => setNewGroupName(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") {
+                  if (editingGroup) saveGroupName();
+                  else createGroup();
+                }
+                if (event.key === "Escape") {
+                  setCreatingGroup(false);
+                  setEditingGroup(null);
+                }
+              }}
+              placeholder="例如：项目、学习资料"
+            />
+          </label>
+          <button
+            type="button"
+            className="button ghost"
+            onClick={() => {
+              setCreatingGroup(false);
+              setEditingGroup(null);
+              setNewGroupName("");
+            }}
+          >
+            取消
+          </button>
+          <button
+            type="button"
+            className="button primary"
+            aria-label={editingGroup ? "保存分组" : "创建"}
+            onClick={editingGroup ? saveGroupName : createGroup}
+          >
+            {editingGroup ? "保存" : "创建"}
+          </button>
+        </section>
+      ) : null}
       {draft ? (
         <section className="content-card folder-favorite-editor" aria-label="编辑文件夹收藏">
           <header>
@@ -2111,17 +2364,45 @@ function FolderFavoritesPage({
               <input aria-label="文件夹分组" list="folder-groups" value={draft.group ?? ""} onChange={(event) => setDraft({ ...draft, group: event.target.value })} />
               <datalist id="folder-groups">{availableGroups.map((group) => <option value={group} key={group} />)}</datalist>
             </label>
-            <label><span>标签</span><input aria-label="文件夹标签" placeholder="项目，常用" value={(draft.tags ?? []).join("，")} onChange={(event) => setDraft({ ...draft, tags: event.target.value.split(/[,，]/) })} /></label>
+            <label><span>标签（最多 5 个，每个 12 字）</span><input aria-label="文件夹标签" placeholder="项目，常用" value={(draft.tags ?? []).join("，")} onChange={(event) => setDraft({ ...draft, tags: event.target.value.split(/[,，]/) })} /></label>
             <label className="folder-shortcut-field"><span>快捷键</span><ShortcutRecorder value={draft.shortcut || "点击录制"} onChange={(shortcut) => setDraft({ ...draft, shortcut })} /></label>
           </div>
-          <label className="folder-description-field"><span>描述</span><input aria-label="文件夹描述" placeholder="这个文件夹用于什么" value={draft.description} onChange={(event) => setDraft({ ...draft, description: event.target.value })} /></label>
+          <label className="folder-description-field"><span>描述（最多 120 字）</span><input maxLength={120} aria-label="文件夹描述" placeholder="这个文件夹用于什么" value={draft.description} onChange={(event) => setDraft({ ...draft, description: event.target.value })} /></label>
           <footer><button type="button" className="button ghost" onClick={() => setDraft(null)}>取消</button><button type="button" className="button primary" onClick={saveDraft}>保存设置</button></footer>
         </section>
       ) : null}
       <section className="folder-groups">
         {visibleGroups.map((group) => (
           <div className="folder-group" key={group.name}>
-            <header><span><Folder size={15} /></span><strong>{group.name}</strong><small>{group.items.length}</small></header>
+            <header>
+              <span><Folder size={15} /></span>
+              <strong>{group.name}</strong>
+              <small>{group.items.length}</small>
+              {group.name !== DEFAULT_FOLDER_GROUP ? (
+                <div className="folder-group-actions">
+                  <button
+                    type="button"
+                    className="icon-button"
+                    aria-label={`编辑分组 ${group.name}`}
+                    onClick={() => {
+                      setCreatingGroup(false);
+                      setEditingGroup(group.name);
+                      setNewGroupName(group.name);
+                    }}
+                  >
+                    <Pencil size={14} />
+                  </button>
+                  <button
+                    type="button"
+                    className="icon-button danger"
+                    aria-label={`删除分组 ${group.name}`}
+                    onClick={() => setDeletingGroup(group.name)}
+                  >
+                    <Trash2 size={14} />
+                  </button>
+                </div>
+              ) : null}
+            </header>
             <div className="folder-favorites-grid">
               {group.items.map((favorite) => (
                 <article className="content-card folder-favorite-card" key={favorite.id}>
@@ -2129,6 +2410,11 @@ function FolderFavoritesPage({
                     <span className="folder-icon"><FolderOpen size={24} /></span>
                     <strong>{favorite.alias || favorite.name}</strong>
                     {favorite.alias ? <em>{favorite.name}</em> : null}
+                    {favorite.description ? (
+                      <p className="folder-description" title={favorite.description}>
+                        {favorite.description}
+                      </p>
+                    ) : null}
                     <small title={favorite.path}>{favorite.path}</small>
                     {favorite.tags.length ? <span className="folder-tags">{favorite.tags.map((tag) => <i key={tag}><Tag size={11} />{tag}</i>)}</span> : null}
                     {favorite.shortcut ? <kbd className="folder-shortcut">{favorite.shortcut}</kbd> : null}
@@ -2171,6 +2457,36 @@ function FolderFavoritesPage({
           </div>
         ) : null}
       </section>
+      {deletingGroup ? (
+        <div className="modal-backdrop">
+          <section
+            className="confirm-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="delete-folder-group-title"
+          >
+            <span className="confirm-dialog-icon danger"><Trash2 size={20} /></span>
+            <div>
+              <h2 id="delete-folder-group-title">删除“{deletingGroup}”分组？</h2>
+              <p>
+                该分组中的{" "}
+                {allFavorites.filter((favorite) => favorite.group === deletingGroup).length}{" "}
+                个文件夹收藏也会被删除。
+              </p>
+            </div>
+            <footer>
+              <button className="button ghost" onClick={() => setDeletingGroup(null)}>取消</button>
+              <button
+                className="button danger"
+                aria-label="删除分组和收藏"
+                onClick={confirmDeleteGroup}
+              >
+                删除分组和收藏
+              </button>
+            </footer>
+          </section>
+        </div>
+      ) : null}
     </>
   );
 }
@@ -2305,14 +2621,17 @@ function EnhancedSettingsPage({
   model: ToolkitModel;
   notify: (message: string) => void;
 }) {
-  const [indexing, setIndexing] = useState(false);
   const [linkDraft, setLinkDraft] = useState<QuickLink | null>(null);
+  const [personalizationOpen, setPersonalizationOpen] = useState(false);
   const [excludedAppsText, setExcludedAppsText] = useState(
     model.snapshot.settings.clipboardExcludedApps.join(", "),
   );
   const [retentionDaysText, setRetentionDaysText] = useState(
     String(model.snapshot.settings.clipboardRetentionDays),
   );
+  const fontScaleProgress = `${Number(
+    (((model.snapshot.settings.fontScale - 0.85) / 0.4) * 100).toFixed(1),
+  )}%`;
 
   useEffect(() => {
     setExcludedAppsText(model.snapshot.settings.clipboardExcludedApps.join(", "));
@@ -2321,29 +2640,6 @@ function EnhancedSettingsPage({
   useEffect(() => {
     setRetentionDaysText(String(model.snapshot.settings.clipboardRetentionDays));
   }, [model.snapshot.settings.clipboardRetentionDays]);
-
-  const rebuild = async (roots: string[]) => {
-    setIndexing(true);
-    try {
-      const quickCount = await rebuildSearchIndex(roots);
-      if (roots.includes("*")) {
-        notify(`快速索引已收录 ${quickCount} 项，全盘扫描将在后台继续`);
-        return;
-      }
-      let status = await getSearchIndexStatus();
-      while (status === "indexing") {
-        await new Promise((resolve) => window.setTimeout(resolve, 500));
-        status = await getSearchIndexStatus();
-      }
-      if (status === "failed") throw new Error("索引任务执行失败");
-      const count = await getSearchIndexCount();
-      notify(`索引完成，共收录 ${count} 项`);
-    } catch (error) {
-      notify(`索引失败：${String(error)}`);
-    } finally {
-      setIndexing(false);
-    }
-  };
 
   const addRoot = async () => {
     const root = await chooseDirectory();
@@ -2355,7 +2651,7 @@ function EnhancedSettingsPage({
       ]),
     );
     model.addIndexRoot(root);
-    await rebuild(roots);
+    notify(`索引范围已更新，将只扫描 ${roots.length} 个指定位置`);
   };
 
   const updateShortcut = (
@@ -2374,6 +2670,61 @@ function EnhancedSettingsPage({
       ...model.snapshot.settings.shortcuts,
       [key]: value,
     });
+  };
+  const updateBranding = (
+    patch: Partial<typeof model.snapshot.settings.branding>,
+  ) => {
+    model.setSetting("branding", {
+      ...model.snapshot.settings.branding,
+      ...patch,
+    });
+  };
+  const chooseAppearanceAsset = async (
+    kind: "font" | "logo" | "avatar" | "background",
+  ) => {
+    try {
+      const path = await importAppearanceAsset(kind);
+      if (!path) return;
+      if (kind === "font") {
+        const name = path.split(/[\\/]/).at(-1)?.replace(/\.[^.]+$/, "") ?? "自定义字体";
+        const font = { id: `font-${Date.now()}`, name, path };
+        model.setSetting("customFonts", [
+          ...model.snapshot.settings.customFonts,
+          font,
+        ]);
+        model.setSetting("activeCustomFontId", font.id);
+      } else {
+        updateBranding({ [`${kind}Path`]: path });
+      }
+      notify("外观资源已导入");
+    } catch (error) {
+      notify(`导入失败：${String(error)}`);
+    }
+  };
+  const importTheme = async (file: File | undefined) => {
+    if (!file) return;
+    try {
+      const parsed = JSON.parse(await file.text()) as {
+        name?: string;
+        mode?: "light" | "dark";
+        colors?: Record<string, string>;
+      };
+      const required = ["paper", "panel", "card", "ink", "muted", "accent", "moss"];
+      if (!parsed.name || !parsed.colors || required.some((key) => !/^#[0-9a-f]{6}$/i.test(parsed.colors?.[key] ?? ""))) {
+        throw new Error("主题需要名称及 paper、panel、card、ink、muted、accent、moss 七个十六进制颜色");
+      }
+      const theme = {
+        id: `theme-${Date.now()}`,
+        name: parsed.name.slice(0, 32),
+        mode: parsed.mode === "dark" ? "dark" as const : "light" as const,
+        colors: parsed.colors as typeof model.snapshot.settings.customThemes[number]["colors"],
+      };
+      model.setSetting("customThemes", [...model.snapshot.settings.customThemes, theme]);
+      model.setSetting("activeCustomThemeId", theme.id);
+      notify("主题已导入并启用");
+    } catch (error) {
+      notify(`主题导入失败：${String(error)}`);
+    }
   };
 
   return (
@@ -2583,9 +2934,20 @@ function EnhancedSettingsPage({
         </section>
 
         <section className="settings-section">
-          <header>
+          <header className="settings-section-header-with-action">
             <Keyboard size={19} />
             <div><h2>全局快捷键</h2><p>修改后自动重新注册，并在下一次启动时恢复。</p></div>
+            <button
+              type="button"
+              className="button secondary settings-header-action"
+              aria-label="恢复默认快捷键"
+              onClick={() => {
+                model.setSetting("shortcuts", { ...DEFAULT_SHORTCUTS });
+                notify("已恢复默认快捷键");
+              }}
+            >
+              <RotateCcw size={14} /> 恢复默认
+            </button>
           </header>
           {([
             ["search", "全局搜索", "只弹出搜索浮窗"],
@@ -2600,6 +2962,233 @@ function EnhancedSettingsPage({
               />
             </label>
           ))}
+        </section>
+
+        <section className="settings-section personalization-settings">
+          <header className="settings-section-header-with-action">
+            <Sparkles size={19} />
+            <div>
+              <h2>全局个性化</h2>
+              <p>统一配置品牌文字、工具名称、头像、字体、主题和背景。</p>
+            </div>
+            <button
+              type="button"
+              className="button secondary settings-header-action"
+              onClick={() => setPersonalizationOpen((value) => !value)}
+              aria-expanded={personalizationOpen}
+            >
+              {personalizationOpen ? "收起配置" : "打开配置"}
+            </button>
+          </header>
+          {personalizationOpen ? (
+            <div className="personalization-panel">
+              <div className="personalization-grid">
+                {([
+                  ["appName", "软件名称"],
+                  ["appDescription", "软件描述"],
+                  ["workspaceName", "工作区名称"],
+                  ["workspaceDescription", "工作区描述"],
+                ] as const).map(([key, label]) => (
+                  <label key={key}>
+                    <span>{label}</span>
+                    <input
+                      maxLength={48}
+                      value={model.snapshot.settings.branding[key]}
+                      onChange={(event) => updateBranding({ [key]: event.target.value })}
+                    />
+                  </label>
+                ))}
+              </div>
+              <div className="personalization-subsection">
+                <strong>工具名称</strong>
+                <div className="personalization-grid tool-name-grid">
+                  {(Object.keys(model.snapshot.settings.branding.toolNames) as ToolId[]).map((tool) => (
+                    <label key={tool}>
+                      <span>{toolMeta[tool].title}</span>
+                      <input
+                        maxLength={16}
+                        value={model.snapshot.settings.branding.toolNames[tool]}
+                        onChange={(event) => updateBranding({
+                          toolNames: {
+                            ...model.snapshot.settings.branding.toolNames,
+                            [tool]: event.target.value,
+                          },
+                        })}
+                      />
+                    </label>
+                  ))}
+                </div>
+              </div>
+              <div className="appearance-asset-actions">
+                <button type="button" className="button secondary" onClick={() => void chooseAppearanceAsset("logo")}>导入软件图标</button>
+                <button type="button" className="button secondary" onClick={() => void chooseAppearanceAsset("avatar")}>导入工作区头像</button>
+                <button type="button" className="button secondary" onClick={() => void chooseAppearanceAsset("background")}>导入背景图片</button>
+              </div>
+              <div className="appearance-control-grid">
+                <section className="appearance-control-card">
+                  <div>
+                    <strong>界面字体</strong>
+                    <small>内置字体与导入字体统一管理</small>
+                  </div>
+                  <select
+                    aria-label="界面字体"
+                    value={
+                      model.snapshot.settings.activeCustomFontId
+                        ? `custom:${model.snapshot.settings.activeCustomFontId}`
+                        : `builtin:${model.snapshot.settings.fontFamily}`
+                    }
+                    onChange={(event) => {
+                      if (event.target.value.startsWith("custom:")) {
+                        model.setSetting("activeCustomFontId", event.target.value.slice(7));
+                        return;
+                      }
+                      model.setSetting("activeCustomFontId", "");
+                      model.setSetting(
+                        "fontFamily",
+                        event.target.value.slice(8) as typeof model.snapshot.settings.fontFamily,
+                      );
+                    }}
+                  >
+                    <option value="builtin:system">系统黑体</option>
+                    <option value="builtin:serif">人文宋体</option>
+                    <option value="builtin:yahei">微软雅黑</option>
+                    {model.snapshot.settings.customFonts.map((font) => (
+                      <option key={font.id} value={`custom:${font.id}`}>{font.name}</option>
+                    ))}
+                  </select>
+                  <div className="appearance-control-actions">
+                   <button type="button" className="button secondary" onClick={() => void chooseAppearanceAsset("font")}>
+                     导入字体
+                   </button>
+                  <button
+                    type="button"
+                    className="button ghost danger"
+                    aria-label="删除所选字体"
+                    disabled={!model.snapshot.settings.activeCustomFontId}
+                    onClick={() => {
+                      const font = model.snapshot.settings.customFonts.find(
+                        (item) => item.id === model.snapshot.settings.activeCustomFontId,
+                      );
+                      if (!font) return;
+                      model.setSetting("customFonts", model.snapshot.settings.customFonts.filter((item) => item.id !== font.id));
+                      model.setSetting("activeCustomFontId", "");
+                    }}
+                   >
+                    <Trash2 size={14} /> 删除导入字体
+                   </button>
+                  </div>
+                </section>
+                <section className="appearance-control-card">
+                  <div>
+                    <strong>文字大小</strong>
+                    <small>{Math.round(model.snapshot.settings.fontScale * 100)}%，界面会同步自适应</small>
+                  </div>
+                  <div
+                    className="font-scale-slider"
+                    style={{ "--font-scale-progress": fontScaleProgress } as CSSProperties}
+                  >
+                    <input
+                      aria-label="文字大小"
+                      type="range"
+                      min="0.85"
+                      max="1.25"
+                      step="0.05"
+                      value={model.snapshot.settings.fontScale}
+                      onChange={(event) => model.setSetting("fontScale", Number(event.target.value))}
+                    />
+                  </div>
+                </section>
+                <section className="appearance-control-card">
+                  <div>
+                    <strong>界面主题</strong>
+                    <small>内置明暗模式与导入主题统一管理</small>
+                  </div>
+                  <select
+                    aria-label="界面主题"
+                    value={
+                      model.snapshot.settings.activeCustomThemeId
+                        ? `custom:${model.snapshot.settings.activeCustomThemeId}`
+                        : `builtin:${model.snapshot.settings.theme}`
+                    }
+                    onChange={(event) => {
+                      if (event.target.value.startsWith("custom:")) {
+                        model.setSetting("activeCustomThemeId", event.target.value.slice(7));
+                        return;
+                      }
+                      model.setSetting("activeCustomThemeId", "");
+                      model.setTheme(event.target.value.slice(8) as "light" | "dark");
+                    }}
+                  >
+                    <option value="builtin:light">浅色</option>
+                    <option value="builtin:dark">深色</option>
+                    {model.snapshot.settings.customThemes.map((theme) => (
+                      <option key={theme.id} value={`custom:${theme.id}`}>{theme.name}</option>
+                    ))}
+                  </select>
+                  <div className="appearance-control-actions">
+                   <label className="theme-file-button button secondary">
+                     导入主题 JSON
+                    <input type="file" accept=".json,application/json" onChange={(event) => {
+                      void importTheme(event.target.files?.[0]);
+                      event.currentTarget.value = "";
+                    }} />
+                  </label>
+                  <button
+                    type="button"
+                    className="button ghost danger"
+                    aria-label="删除所选主题"
+                    disabled={!model.snapshot.settings.activeCustomThemeId}
+                    onClick={() => {
+                      const themeId = model.snapshot.settings.activeCustomThemeId;
+                      if (!themeId) return;
+                      model.setSetting(
+                        "customThemes",
+                        model.snapshot.settings.customThemes.filter((theme) => theme.id !== themeId),
+                      );
+                      model.setSetting("activeCustomThemeId", "");
+                    }}
+                   >
+                    <Trash2 size={14} /> 删除导入主题
+                   </button>
+                  </div>
+                </section>
+              </div>
+              <div className="personalization-footer">
+                <small>默认字体不可删除。主题 JSON 中需提供 name、mode 和 colors。</small>
+                <button
+                  type="button"
+                  className="button ghost"
+                  onClick={() => {
+                    model.setSetting("branding", {
+                      appName: "ATLAS",
+                      appDescription: "DESKTOP KIT",
+                      workspaceName: "本地工作区",
+                      workspaceDescription: "所有数据仅在本机",
+                      logoPath: "",
+                      avatarPath: "",
+                      backgroundPath: "",
+                      toolNames: {
+                        startup: "启动编排",
+                        search: "全局搜索",
+                        prompts: "提示词库",
+                        clipboard: "剪贴板历史",
+                        automation: "自动化命令",
+                        folders: "文件夹收藏",
+                      },
+                    });
+                    model.setSetting("activeCustomFontId", "");
+                    model.setSetting("activeCustomThemeId", "");
+                    model.setTheme("light");
+                    model.setSetting("fontFamily", "system");
+                    model.setSetting("fontScale", 1);
+                    notify("已恢复默认外观与品牌文字");
+                  }}
+                >
+                  <RotateCcw size={14} /> 恢复默认外观
+                </button>
+              </div>
+            </div>
+          ) : null}
         </section>
 
         <section className="settings-section">
@@ -2619,67 +3208,17 @@ function EnhancedSettingsPage({
             <div className="setting-actions">
               <button
                 className="button secondary"
-                disabled={indexing}
                 onClick={() => {
                   model.setSetting("indexRoots", ["*"]);
-                  void rebuild(["*"]);
+                  notify("索引范围已更新为所有可用磁盘");
                 }}
               >
                 <HardDrive size={16} /> 全部磁盘
               </button>
-              <button className="button secondary" disabled={indexing} onClick={() => void addRoot()}>
+              <button className="button secondary" onClick={() => void addRoot()}>
                 <Plus size={16} /> 添加目录
               </button>
             </div>
-          </div>
-        </section>
-
-        <section className="settings-section">
-          <header>
-            <Sparkles size={19} />
-            <div><h2>字体与外观</h2><p>字体、字号和明暗主题会自动保存。</p></div>
-          </header>
-          <div className="setting-row">
-            <div><strong>界面字体</strong><small>选择更适合阅读或编程的字体风格</small></div>
-            <select
-              aria-label="界面字体"
-              value={model.snapshot.settings.fontFamily}
-              onChange={(event) =>
-                model.setSetting(
-                  "fontFamily",
-                  event.target.value as typeof model.snapshot.settings.fontFamily,
-                )
-              }
-            >
-              <option value="system">系统黑体</option>
-              <option value="serif">人文宋体</option>
-              <option value="yahei">微软雅黑</option>
-            </select>
-          </div>
-          <div className="setting-row">
-            <div><strong>文字大小</strong><small>{Math.round(model.snapshot.settings.fontScale * 100)}%</small></div>
-            <input
-              type="range"
-              min="0.85"
-              max="1.25"
-              step="0.05"
-              value={model.snapshot.settings.fontScale}
-              onChange={(event) => model.setSetting("fontScale", Number(event.target.value))}
-            />
-          </div>
-          <div className="theme-picker">
-            <button
-              className={model.snapshot.settings.theme === "light" ? "selected" : ""}
-              onClick={() => model.setTheme("light")}
-            >
-              <span className="theme-preview light"><i /><i /><i /></span><Sun size={16} /> 浅色
-            </button>
-            <button
-              className={model.snapshot.settings.theme === "dark" ? "selected" : ""}
-              onClick={() => model.setTheme("dark")}
-            >
-              <span className="theme-preview dark"><i /><i /><i /></span><Moon size={16} /> 深色
-            </button>
           </div>
         </section>
 
@@ -2766,6 +3305,24 @@ function EnhancedSettingsPage({
               }
             />
           </label>
+        </section>
+
+        <section className="settings-section">
+          <header>
+            <AppWindow size={19} />
+            <div><h2>窗口行为</h2><p>控制关闭主窗口时是否需要再次确认。</p></div>
+          </header>
+          <div className="setting-row">
+            <div>
+              <strong>关闭前确认</strong>
+              <small>避免误触关闭；确认框中也可以选择以后不再提醒。</small>
+            </div>
+            <Switch
+              checked={model.snapshot.settings.confirmOnClose}
+              label="关闭窗口前确认"
+              onChange={(confirmOnClose) => model.setSetting("confirmOnClose", confirmOnClose)}
+            />
+          </div>
         </section>
       </div>
     </>
