@@ -339,6 +339,7 @@ export function mergeSnapshotDefaults(snapshot: AppSnapshot): AppSnapshot {
         search: legacyShortcut ?? DEFAULT_SHORTCUTS.search,
       },
       dataDirectory: snapshot.settings?.dataDirectory ?? "",
+      indexSetup: snapshot.settings?.indexSetup ?? "ready",
       indexRoots,
       excludedPatterns: snapshot.settings?.excludedPatterns ?? [
         "node_modules",

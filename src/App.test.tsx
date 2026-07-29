@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { vi } from "vitest";
 import App from "./App";
 import { defaultSnapshot } from "./useToolkit";
 import stylesheet from "./styles.css?inline";
@@ -8,6 +9,37 @@ import stylesheet from "./styles.css?inline";
 afterEach(() => localStorage.clear());
 
 describe("Atlas desktop toolkit", () => {
+  it("never blocks first use with an index initialization dialog", async () => {
+    localStorage.setItem(
+      "atlas-toolkit-state-v1",
+      JSON.stringify({
+        ...defaultSnapshot,
+        settings: { ...defaultSnapshot.settings, indexSetup: "pending" },
+      }),
+    );
+    render(<App />);
+
+    await screen.findByRole("button", { name: "总览" });
+    expect(screen.queryByRole("dialog", { name: /初始化全局搜索|正在建立搜索索引/ })).not.toBeInTheDocument();
+  });
+
+  it("shows a persistent search-page warning when setup was deferred", async () => {
+    localStorage.setItem(
+      "atlas-toolkit-state-v1",
+      JSON.stringify({
+        ...defaultSnapshot,
+        settings: { ...defaultSnapshot.settings, indexSetup: "deferred" },
+      }),
+    );
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole("button", { name: "全局搜索" }));
+
+    expect(
+      await screen.findByText("尚未建立文件索引"),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "现在建立索引" })).toBeInTheDocument();
+  });
   it("shows all three tools and lets the user disable one independently", async () => {
     const user = userEvent.setup();
     render(<App />);
@@ -70,6 +102,8 @@ describe("Atlas desktop toolkit", () => {
     expect(await screen.findByText("数据与存储")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "更改位置" })).not.toBeInTheDocument();
     expect(screen.getByText("存储位置跟随软件安装目录")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "查看日志" })).toBeInTheDocument();
+    expect(screen.getByText(/data\\logs/)).toBeInTheDocument();
     expect(screen.getByText("全局快捷键")).toBeInTheDocument();
     expect(screen.getByText("全局个性化")).toBeInTheDocument();
     expect(screen.getByText("全盘索引")).toBeInTheDocument();
@@ -80,6 +114,42 @@ describe("Atlas desktop toolkit", () => {
     expect(screen.getByRole("option", { name: "无" })).toBeInTheDocument();
     expect(bootScene.closest(".settings-section")).toHaveClass("boot-settings-section");
     expect(screen.queryByText("登录启动")).not.toBeInTheDocument();
+  });
+
+  it("shows whether an index exists and confirms before building the selected scope", async () => {
+    localStorage.setItem(
+      "atlas-toolkit-state-v1",
+      JSON.stringify({
+        ...defaultSnapshot,
+        settings: {
+          ...defaultSnapshot.settings,
+          indexSetup: "deferred",
+          indexRoots: ["*"],
+        },
+      }),
+    );
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole("button", { name: "设置" }));
+
+    expect(await screen.findByText("未建立索引")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "全部磁盘" }));
+    expect(
+      screen.getByRole("dialog", { name: "建立全部磁盘索引？" }),
+    ).toBeInTheDocument();
+  });
+
+  it("does not rebuild an already indexed full-disk scope without a reason", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole("button", { name: "设置" }));
+
+    expect(await screen.findByText("索引已建立")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "全部磁盘" }));
+    expect(await screen.findByText("当前全盘索引已经建立，无需重复建立")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("dialog", { name: "建立全部磁盘索引？" }),
+    ).not.toBeInTheDocument();
   });
 
   it("applies global branding and custom tool names immediately", async () => {
@@ -156,6 +226,18 @@ describe("Atlas desktop toolkit", () => {
     const font = screen.getByRole("combobox", { name: "界面字体" });
     expect(font).toHaveTextContent("微软雅黑");
     expect(font).not.toHaveTextContent("等宽字体");
+  });
+
+  it("applies each built-in font across component-level font declarations", () => {
+    expect(stylesheet).toMatch(
+      /:root\[data-font="system"\]:not\(\[data-custom-font="true"\]\)\s+body\s+\*:not\(code\):not\(pre\):not\(kbd\)/,
+    );
+    expect(stylesheet).toMatch(
+      /:root\[data-font="serif"\]:not\(\[data-custom-font="true"\]\)\s+body\s+\*:not\(code\):not\(pre\):not\(kbd\)[\s\S]*?"SimSun"/,
+    );
+    expect(stylesheet).toMatch(
+      /:root\[data-font="yahei"\]:not\(\[data-custom-font="true"\]\)\s+body\s+\*:not\(code\):not\(pre\):not\(kbd\)[\s\S]*?"Microsoft YaHei"/,
+    );
   });
 
   it("lets the user explicitly disable the boot scene", async () => {
@@ -668,6 +750,11 @@ describe("Atlas desktop toolkit", () => {
     const theme = screen.getByRole("combobox", { name: "界面主题" });
     expect(within(font).getByRole("option", { name: "霞鹜文楷" })).toBeInTheDocument();
     expect(within(theme).getByRole("option", { name: "雾蓝" })).toBeInTheDocument();
+    expect(stylesheet).toMatch(
+      /:root\[data-custom-font="true"\]\s+body\s+\*:not\(code\):not\(pre\):not\(kbd\)/,
+    );
+    expect(stylesheet).toMatch(/\.sidebar\s*\{[^}]*background:\s*var\(--sidebar\)/);
+    expect(stylesheet).toMatch(/\.nav-item\.active\s*\{[^}]*var\(--sidebar-active\)/);
   });
 
   it("removes duplicate master controls and can delete an imported theme", async () => {

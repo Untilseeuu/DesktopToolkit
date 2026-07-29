@@ -81,6 +81,7 @@ export const defaultSnapshot: AppSnapshot = {
     fontScale: 1,
     shortcuts: { ...DEFAULT_SHORTCUTS },
     dataDirectory: "应用目录\\data",
+    indexSetup: "ready",
     indexRoots: ["*"],
     excludedPatterns: ["node_modules", ".git", "Windows\\WinSxS"],
     searchFilters: { kind: "all", extension: "", drive: "" },
@@ -469,21 +470,6 @@ export function useToolkit() {
     }));
   }, []);
 
-  const addIndexRoot = useCallback((root: string) => {
-    setSnapshot((current) => ({
-      ...current,
-      settings: {
-        ...current.settings,
-        indexRoots: Array.from(
-          new Set([
-            ...current.settings.indexRoots.filter((item) => item !== "*"),
-            root,
-          ]),
-        ),
-      },
-    }));
-  }, []);
-
   const recordSearch = useCallback((query: string) => {
     void recordActivity("search", query);
   }, []);
@@ -523,7 +509,6 @@ export function useToolkit() {
       setTheme,
       setSetting,
       setSearchFilters,
-      addIndexRoot,
       recordSearch,
       recordCopy,
       setClipboardHistory,
@@ -545,7 +530,6 @@ export function useToolkit() {
       setTheme,
       setSetting,
       setSearchFilters,
-      addIndexRoot,
       recordSearch,
       recordCopy,
       setClipboardHistory,

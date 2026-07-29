@@ -241,6 +241,7 @@ impl StorageManager {
                 DROP TABLE IF EXISTS search_entries;
                 DROP TABLE IF EXISTS search_meta;
                 DROP TABLE IF EXISTS search_build_meta;
+                DROP TABLE IF EXISTS search_build_dirty_paths;
                 ",
             )
             .map_err(|error| error.to_string())
@@ -266,10 +267,39 @@ impl StorageManager {
                     indexed_items INTEGER NOT NULL DEFAULT 0,
                     updated_at INTEGER NOT NULL DEFAULT (unixepoch())
                 );
+                CREATE TABLE IF NOT EXISTS search_build_dirty_paths (
+                    path TEXT PRIMARY KEY
+                );
+                CREATE TABLE IF NOT EXISTS search_build_directories (
+                    path TEXT PRIMARY KEY COLLATE NOCASE,
+                    root_index INTEGER NOT NULL,
+                    started INTEGER NOT NULL DEFAULT 0
+                );
                 DROP TABLE IF EXISTS search_entries;
                 ",
             )
             .map_err(|error| error.to_string())?;
+        let has_directory_started = connection
+            .prepare("PRAGMA table_info(search_build_directories)")
+            .and_then(|mut statement| {
+                let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+                for column in columns {
+                    if column?.eq_ignore_ascii_case("started") {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            })
+            .map_err(|error| error.to_string())?;
+        if !has_directory_started {
+            connection
+                .execute(
+                    "ALTER TABLE search_build_directories
+                     ADD COLUMN started INTEGER NOT NULL DEFAULT 0",
+                    [],
+                )
+                .map_err(|error| error.to_string())?;
+        }
         let fts_schema = connection.query_row(
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'search_fts'",
             [],

@@ -3,25 +3,96 @@ mod tests {
     use crate::automation::{execute_commands_with, CommandExecution};
     use crate::domain::{default_data_directory, runtime_settings_changed};
     use crate::launcher::{launch_queue, validate_startup_item, StartupItem};
+    use crate::ntfs;
     use crate::{
         cleanup_clipboard_images, clipboard_file_path, delete_clipboard_entry, desired_shortcuts,
         folder_shortcut_target, quick_overlay_spec, runtime_search_snapshot,
         runtime_shortcut_snapshot, runtime_shortcut_snapshot_for_registered, search,
-        shortcut_target, storage::StorageManager, ClipboardSequenceTracker,
+        shortcut_target, storage::StorageManager, validate_appearance_file,
+        ClipboardSequenceTracker,
     };
+    use rusqlite::params;
     use serde_json::Value;
     use std::{
-        collections::BTreeMap,
+        collections::{BTreeMap, HashMap},
         fs,
-        path::Path,
+        path::{Path, PathBuf},
         str::FromStr,
         sync::{Arc, Mutex},
         thread,
-        time::{SystemTime, UNIX_EPOCH},
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
     use tauri_plugin_global_shortcut::Shortcut;
 
     static SEARCH_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn appearance_validation_accepts_a_valid_png_signature() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("atlas-valid-image-{nonce}.png"));
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        bytes.extend_from_slice(&[0, 0, 0, 13, b'I', b'H', b'D', b'R']);
+        fs::write(&path, bytes).unwrap();
+
+        assert_eq!(validate_appearance_file(&path, false), Ok(()));
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn appearance_validation_uses_image_content_when_extension_is_misleading() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("atlas-renamed-image-{nonce}.png"));
+        let mut bytes = vec![0xff, 0xd8, 0xff, 0xe0];
+        bytes.extend_from_slice(&[0; 20]);
+        fs::write(&path, bytes).unwrap();
+
+        assert_eq!(validate_appearance_file(&path, false), Ok(()));
+
+        fs::remove_file(path).unwrap();
+    }
+
+    fn synthetic_usn_v2_record(
+        file_reference: u64,
+        parent_reference: u64,
+        attributes: u32,
+        name: &str,
+    ) -> Vec<u8> {
+        let encoded = name.encode_utf16().collect::<Vec<_>>();
+        let record_length = 60 + encoded.len() * 2;
+        let aligned_length = (record_length + 7) & !7;
+        let mut bytes = vec![0u8; aligned_length];
+        bytes[0..4].copy_from_slice(&(aligned_length as u32).to_le_bytes());
+        bytes[4..6].copy_from_slice(&2u16.to_le_bytes());
+        bytes[8..16].copy_from_slice(&file_reference.to_le_bytes());
+        bytes[16..24].copy_from_slice(&parent_reference.to_le_bytes());
+        bytes[52..56].copy_from_slice(&attributes.to_le_bytes());
+        bytes[56..58].copy_from_slice(&((encoded.len() * 2) as u16).to_le_bytes());
+        bytes[58..60].copy_from_slice(&60u16.to_le_bytes());
+        for (index, character) in encoded.into_iter().enumerate() {
+            let offset = 60 + index * 2;
+            bytes[offset..offset + 2].copy_from_slice(&character.to_le_bytes());
+        }
+        bytes
+    }
+
+    #[test]
+    fn clicking_an_autostart_instance_prevents_setup_from_hiding_it_again() {
+        assert!(crate::should_hide_autostart_window(true, false));
+        assert!(!crate::should_hide_autostart_window(true, true));
+        assert!(!crate::should_hide_autostart_window(false, false));
+        let source = include_str!("lib.rs");
+        assert!(
+            source.find("tauri_plugin_single_instance::init").unwrap()
+                < source.find("StorageManager::initialize()").unwrap()
+        );
+    }
 
     #[test]
     fn quick_tools_reuse_one_webview_window() {
@@ -235,9 +306,11 @@ mod tests {
         fs::write(&resumed, b"second").unwrap();
         let storage =
             StorageManager::for_test(directory.join("bootstrap"), directory.join("data")).unwrap();
+        // Deliberately reverse the configured roots. Scope identity and scan
+        // order must still agree across restarts.
         let roots = vec![
-            first.to_string_lossy().to_string(),
             second.to_string_lossy().to_string(),
+            first.to_string_lossy().to_string(),
         ];
         let scope = search::scope_key(&roots);
         storage
@@ -300,7 +373,120 @@ mod tests {
     }
 
     #[test]
-    fn interrupted_index_preserves_the_partially_scanned_current_root() {
+    fn interrupted_index_resumes_from_the_persisted_directory_queue() {
+        let _search_test = SEARCH_TEST_LOCK.lock().unwrap();
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("atlas-dir-queue-resume-{nonce}"));
+        let root = directory.join("root");
+        let pending = root.join("pending");
+        fs::create_dir_all(&pending).unwrap();
+        let preserved = root.join("already-indexed.txt");
+        let resumed = pending.join("resume-target.pdf");
+        let stale = pending.join("deleted-before-resume.pdf");
+        fs::write(&preserved, b"old").unwrap();
+        fs::write(&resumed, b"new").unwrap();
+        let storage =
+            StorageManager::for_test(directory.join("bootstrap"), directory.join("data")).unwrap();
+        let roots = vec![root.to_string_lossy().to_string()];
+        let scope = search::scope_key(&roots);
+        storage
+            .with_search_connection(|connection| {
+                connection
+                    .execute_batch(
+                        "
+                        DROP TABLE IF EXISTS search_fts_next;
+                        CREATE VIRTUAL TABLE search_fts_next USING fts5(
+                            name, path UNINDEXED, kind UNINDEXED,
+                            modified_at UNINDEXED, tokenize = 'trigram'
+                        );
+                        ",
+                    )
+                    .map_err(|error| error.to_string())?;
+                connection
+                    .execute(
+                        "INSERT INTO search_fts_next(name, path, kind)
+                         VALUES ('already-indexed.txt', ?1, 'file')",
+                        [&preserved.to_string_lossy()],
+                    )
+                    .map_err(|error| error.to_string())?;
+                connection
+                    .execute(
+                        "INSERT INTO search_fts_next(name, path, kind)
+                         VALUES ('deleted-before-resume.pdf', ?1, 'file')",
+                        [&stale.to_string_lossy()],
+                    )
+                    .map_err(|error| error.to_string())?;
+                connection
+                    .execute(
+                        "INSERT INTO search_fts_next(name, path, kind)
+                         VALUES ('resume-target.pdf', ?1, 'file')",
+                        [&resumed.to_string_lossy()],
+                    )
+                    .map_err(|error| error.to_string())?;
+                connection
+                    .execute(
+                        "INSERT INTO search_build_dirty_paths(path) VALUES (?1)",
+                        [&resumed.to_string_lossy()],
+                    )
+                    .map_err(|error| error.to_string())?;
+                connection
+                    .execute(
+                        "INSERT INTO search_build_meta(
+                            id, scope, completed_roots, indexed_items
+                         ) VALUES (1, ?1, 0, 3)",
+                        [&scope],
+                    )
+                    .map_err(|error| error.to_string())?;
+                connection
+                    .execute(
+                        "INSERT INTO search_build_directories(path, root_index, started)
+                         VALUES (?1, 0, 1)",
+                        [&pending.to_string_lossy()],
+                    )
+                    .map_err(|error| error.to_string())?;
+                Ok(())
+            })
+            .unwrap();
+
+        search::rebuild(&storage, roots.clone()).unwrap();
+
+        assert!(
+            search::query(&storage, "already-indexed", "file", "", "", &roots)
+                .unwrap()
+                .iter()
+                .any(|result| result.path == preserved.to_string_lossy())
+        );
+        assert!(
+            search::query(&storage, "resume-target", "file", "pdf", "", &roots)
+                .unwrap()
+                .iter()
+                .any(|result| result.path == resumed.to_string_lossy())
+        );
+        assert!(
+            search::query(&storage, "deleted-before-resume", "file", "pdf", "", &roots)
+                .unwrap()
+                .is_empty()
+        );
+        let resumed_rows = storage
+            .with_search_connection(|connection| {
+                connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM search_fts WHERE path = ?1",
+                        [&resumed.to_string_lossy()],
+                        |row| row.get::<_, usize>(0),
+                    )
+                    .map_err(|error| error.to_string())
+            })
+            .unwrap();
+        assert_eq!(resumed_rows, 1);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn interrupted_index_rescans_the_incomplete_root_for_offline_changes() {
         let _search_test = SEARCH_TEST_LOCK.lock().unwrap();
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -311,6 +497,7 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let preserved = root.join("preserved.txt");
         fs::write(&preserved, b"partial").unwrap();
+        let deleted = root.join("deleted-while-closed.txt");
         let storage =
             StorageManager::for_test(directory.join("bootstrap"), directory.join("data")).unwrap();
         let roots = vec![root.to_string_lossy().to_string()];
@@ -337,6 +524,13 @@ mod tests {
                     .map_err(|error| error.to_string())?;
                 connection
                     .execute(
+                        "INSERT INTO search_fts_next(name, path, kind)
+                         VALUES ('deletedwhileclosed', ?1, 'file')",
+                        [&deleted.to_string_lossy()],
+                    )
+                    .map_err(|error| error.to_string())?;
+                connection
+                    .execute(
                         "
                         INSERT INTO search_build_meta(
                             id, scope, completed_roots, indexed_items
@@ -349,8 +543,14 @@ mod tests {
             })
             .unwrap();
 
+        let offline_addition = root.join("aaa-created-while-atlas-was-closed.pdf");
+        fs::write(&offline_addition, b"new").unwrap();
         search::rebuild(&storage, roots.clone()).unwrap();
-        let results = search::query(&storage, "checkpointalias", "file", "", "", &roots).unwrap();
+        let results = search::query(&storage, "preserved", "file", "", "", &roots).unwrap();
+        let offline_results =
+            search::query(&storage, "created-while-atlas", "file", "", "", &roots).unwrap();
+        let deleted_results =
+            search::query(&storage, "deletedwhileclosed", "file", "", "", &roots).unwrap();
 
         assert!(
             results
@@ -358,6 +558,127 @@ mod tests {
                 .any(|result| result.path == preserved.to_string_lossy()),
             "results: {results:?}"
         );
+        assert!(offline_results
+            .iter()
+            .any(|result| result.path == offline_addition.to_string_lossy()));
+        assert!(deleted_results.is_empty(), "results: {deleted_results:?}");
+        let preserved_rows = storage
+            .with_search_connection(|connection| {
+                connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM search_fts WHERE path = ?1",
+                        [&preserved.to_string_lossy()],
+                        |row| row.get::<_, usize>(0),
+                    )
+                    .map_err(|error| error.to_string())
+            })
+            .unwrap();
+        assert_eq!(preserved_rows, 1);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn interrupted_index_continues_after_the_last_committed_path() {
+        let _search_test = SEARCH_TEST_LOCK.lock().unwrap();
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("atlas-path-resume-{nonce}"));
+        let root = directory.join("root");
+        let nested = root.join("foo");
+        fs::create_dir_all(&nested).unwrap();
+        // WalkDir visits the nested child before the sibling, although the
+        // sibling's raw full path sorts before it because '-' precedes '\\'.
+        let first = nested.join("child-preserved.txt");
+        let second = root.join("foo-bar-resumed.pdf");
+        fs::write(&first, b"first").unwrap();
+        fs::write(&second, b"second").unwrap();
+        let storage =
+            StorageManager::for_test(directory.join("bootstrap"), directory.join("data")).unwrap();
+        let roots = vec![root.to_string_lossy().to_string()];
+        let scope = search::scope_key(&roots);
+        storage
+            .with_search_connection(|connection| {
+                connection
+                    .execute_batch(
+                        "
+                        DROP TABLE IF EXISTS search_fts_next;
+                        CREATE VIRTUAL TABLE search_fts_next USING fts5(
+                            name, path UNINDEXED, kind UNINDEXED,
+                            modified_at UNINDEXED, tokenize = 'trigram'
+                        );
+                        ",
+                    )
+                    .map_err(|error| error.to_string())?;
+                connection
+                    .execute(
+                        "INSERT INTO search_fts_next(name, path, kind)
+                         VALUES ('checkpointalias', ?1, 'file')",
+                        [&first.to_string_lossy()],
+                    )
+                    .map_err(|error| error.to_string())?;
+                connection
+                    .execute(
+                        "INSERT INTO search_fts_next(name, path, kind)
+                         VALUES ('watcherstalealias', ?1, 'file')",
+                        [&second.to_string_lossy()],
+                    )
+                    .map_err(|error| error.to_string())?;
+                connection
+                    .execute(
+                        "INSERT INTO search_build_dirty_paths(path) VALUES (?1)",
+                        [&second.to_string_lossy()],
+                    )
+                    .map_err(|error| error.to_string())?;
+                connection
+                    .execute(
+                        "
+                        INSERT INTO search_build_meta(
+                            id, scope, completed_roots, indexed_items
+                        ) VALUES (1, ?1, 0, 1)
+                        ",
+                        params![scope],
+                    )
+                    .map_err(|error| error.to_string())?;
+                Ok(())
+            })
+            .unwrap();
+
+        search::rebuild(&storage, roots.clone()).unwrap();
+        let preserved = search::query(&storage, "child-preserved", "file", "", "", &roots).unwrap();
+        let resumed = search::query(&storage, "foo-bar-resumed", "file", "", "", &roots).unwrap();
+        let duplicate_count = storage
+            .with_search_connection(|connection| {
+                connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM search_fts WHERE path = ?1",
+                        [&first.to_string_lossy()],
+                        |row| row.get::<_, usize>(0),
+                    )
+                    .map_err(|error| error.to_string())
+            })
+            .unwrap();
+        let resumed_count = storage
+            .with_search_connection(|connection| {
+                connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM search_fts WHERE path = ?1",
+                        [&second.to_string_lossy()],
+                        |row| row.get::<_, usize>(0),
+                    )
+                    .map_err(|error| error.to_string())
+            })
+            .unwrap();
+
+        assert!(preserved
+            .iter()
+            .any(|result| result.path == first.to_string_lossy()));
+        assert!(resumed
+            .iter()
+            .any(|result| result.path == second.to_string_lossy()));
+        assert_eq!(duplicate_count, 1);
+        assert_eq!(resumed_count, 1);
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -534,8 +855,638 @@ mod tests {
 
     #[test]
     fn background_index_throttle_never_creates_visible_quarter_second_stalls() {
-        assert!(search::index_pause_millis(100, true) <= 40);
-        assert!(search::index_pause_millis(100, false) <= 40);
+        assert!(search::index_pause_millis(100, true) <= 12);
+        assert_eq!(search::index_pause_millis(100, false), 0);
+        let source = include_str!("search.rs");
+        assert!(source.contains("THREAD_PRIORITY_BELOW_NORMAL"));
+        assert!(!source.contains("THREAD_MODE_BACKGROUND_BEGIN"));
+    }
+
+    #[test]
+    fn full_index_batches_avoid_per_file_delete_and_restat_work() {
+        let source = include_str!("search.rs");
+        assert!(source.contains("const INDEX_BATCH_SIZE: usize = 32768"));
+        let flush = source
+            .split("fn flush_index_batch")
+            .nth(1)
+            .and_then(|value| value.split("fn try_fast_ntfs_index").next())
+            .unwrap();
+        assert!(!flush.contains("DELETE FROM search_fts_next"));
+        assert!(!flush.contains("Path::new(&path).exists()"));
+        assert!(flush.contains("revision"));
+        assert!(flush.contains("index_build_cancelled"));
+        assert!(flush.contains("INSERT INTO search_fts_next"));
+        assert!(flush.contains("transaction.commit()"));
+    }
+
+    #[test]
+    fn completed_staging_index_is_swapped_without_a_second_full_fts_copy() {
+        let source = include_str!("search.rs");
+        let finalize = source
+            .split("let mut dirty_paths = std::mem::take")
+            .nth(1)
+            .and_then(|value| value.split("pub fn status").next())
+            .unwrap();
+
+        assert!(!finalize.contains("search_fts_compact"));
+        assert!(!finalize.contains("SELECT DISTINCT"));
+        assert!(finalize.contains("ALTER TABLE search_fts_next RENAME TO search_fts"));
+    }
+
+    #[test]
+    fn cancelling_an_index_build_invalidates_the_active_revision() {
+        let _guard = SEARCH_TEST_LOCK.lock().unwrap();
+        let before = search::revision();
+        search::cancel_indexing();
+        assert!(search::revision() > before);
+
+        let source = include_str!("search.rs");
+        let cancel = source
+            .split("pub fn cancel_indexing")
+            .nth(1)
+            .and_then(|value| value.split("pub fn rebuild").next())
+            .unwrap();
+        assert!(
+            cancel.find("INDEX_STATE.lock()").unwrap()
+                < cancel.find("INDEX_REVISION.fetch_add").unwrap()
+        );
+        assert!(source.contains("pending: Option<(Vec<String>, u64)>"));
+        assert!(source.contains("pending_revision == current_revision"));
+        assert!(source.contains("revision == current_revision"));
+        assert!(source.contains("queued_revision < revision"));
+    }
+
+    #[test]
+    fn native_quit_cancels_indexing_before_stopping_background_services() {
+        let source = include_str!("lib.rs");
+        let quit = source
+            .split("fn quit_application")
+            .nth(1)
+            .and_then(|value| value.split("#[tauri::command]").next())
+            .unwrap();
+        let cancel = quit.find("search::cancel_indexing()").unwrap();
+        let watchers = quit.find("search::stop_watchers()").unwrap();
+        let exit = quit.find("app.exit(0)").unwrap();
+        assert!(cancel < watchers && watchers < exit);
+    }
+
+    #[test]
+    fn bulk_name_indexing_keeps_interactive_initialization_throughput() {
+        let _guard = SEARCH_TEST_LOCK.lock().unwrap();
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("atlas-index-throughput-{nonce}"));
+        let root = directory.join("root");
+        fs::create_dir_all(&root).unwrap();
+        for group in 0..20 {
+            let group_path = root.join(format!("group-{group}"));
+            fs::create_dir_all(&group_path).unwrap();
+            for item in 0..500 {
+                fs::write(
+                    group_path.join(format!("毕业设计资料-{group}-{item}.pdf")),
+                    [],
+                )
+                .unwrap();
+            }
+        }
+        let storage =
+            StorageManager::for_test(directory.join("bootstrap"), directory.join("data")).unwrap();
+
+        let started = Instant::now();
+        let count = search::rebuild(&storage, vec![root.to_string_lossy().to_string()]).unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(count >= 10_020);
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "10,000-item index took {elapsed:?}; full-disk indexing must sustain at least 5,000 items/s in an unoptimized test build"
+        );
+        drop(storage);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn directory_heavy_volumes_are_committed_in_bulk() {
+        let _guard = SEARCH_TEST_LOCK.lock().unwrap();
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("atlas-directory-throughput-{nonce}"));
+        let root = directory.join("root");
+        fs::create_dir_all(&root).unwrap();
+        for group in 0..3_000 {
+            let group_path = root.join(format!("group-{group}"));
+            fs::create_dir(&group_path).unwrap();
+            fs::write(group_path.join(format!("document-{group}.pdf")), []).unwrap();
+        }
+        let storage =
+            StorageManager::for_test(directory.join("bootstrap"), directory.join("data")).unwrap();
+
+        let started = Instant::now();
+        let count = search::rebuild(&storage, vec![root.to_string_lossy().to_string()]).unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(count >= 6_001);
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "directory-heavy 6,000-item index took {elapsed:?}; directory checkpoints must be committed in bulk"
+        );
+        drop(storage);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn full_disk_index_skips_regenerable_system_and_package_caches() {
+        assert!(!search::should_descend_full_disk_path(
+            Path::new("C:\\Windows\\SoftwareDistribution\\Download\\update-bucket"),
+            true,
+        ));
+        assert!(!search::should_descend_full_disk_path(
+            Path::new("C:\\Users\\Alice\\AppData\\Local\\Yarn\\Cache\\v6"),
+            true,
+        ));
+        assert!(!search::should_descend_full_disk_path(
+            Path::new("D:\\Programming\\Node.js\\node_cache\\_cacache\\index-v5"),
+            true,
+        ));
+        assert!(search::should_descend_full_disk_path(
+            Path::new("C:\\Users\\Alice\\Documents\\毕业设计"),
+            true,
+        ));
+        // Explicit custom roots remain literal: users can still opt into a
+        // cache directory when they intentionally add it in Settings.
+        assert!(search::should_descend_path(
+            Path::new("C:\\Users\\Alice\\AppData\\Local\\Yarn\\Cache\\v6"),
+            true,
+        ));
+    }
+
+    #[test]
+    fn dependency_files_keep_a_compact_exact_name_index() {
+        let _guard = SEARCH_TEST_LOCK.lock().unwrap();
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("atlas-compact-dependency-{nonce}"));
+        let root = directory.join("root");
+        fs::create_dir_all(&root).unwrap();
+        let filename = "Microsoft.Build.Framework.resources.dll";
+        fs::write(root.join(filename), []).unwrap();
+        let storage =
+            StorageManager::for_test(directory.join("bootstrap"), directory.join("data")).unwrap();
+
+        search::rebuild(&storage, vec![root.to_string_lossy().to_string()]).unwrap();
+
+        let indexed_length = storage
+            .with_search_connection(|connection| {
+                connection
+                    .query_row(
+                        "SELECT length(name) FROM search_fts WHERE instr(path, ?1) > 0",
+                        [filename],
+                        |row| row.get::<_, usize>(0),
+                    )
+                    .map_err(|error| error.to_string())
+            })
+            .unwrap();
+        assert!(
+            indexed_length <= filename.len() + 4,
+            "dependency filename expanded from {} to {indexed_length} characters",
+            filename.len()
+        );
+        drop(storage);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn long_directories_publish_progress_before_their_batch_commits() {
+        let source = include_str!("search.rs");
+        let scanner = source
+            .split("fn scan_directory")
+            .nth(1)
+            .and_then(|value| value.split("fn rebuild_inner").next())
+            .unwrap();
+        assert!(scanner.contains(">= INDEX_ENTRY_CHUNK"));
+        assert!(scanner.contains("finished: false"));
+        assert!(scanner.contains("started_directories"));
+        assert!(scanner.contains("mpsc::sync_channel(worker_count * 2)"));
+        let worker = source
+            .split("fn scan_directory")
+            .nth(1)
+            .and_then(|value| value.split("fn process_queued_directories").next())
+            .unwrap();
+        assert!(!worker.contains("update_index_progress("));
+    }
+
+    #[test]
+    fn slow_directory_does_not_create_a_small_frontier_barrier() {
+        let source = include_str!("search.rs");
+        assert!(source.contains("const INDEX_DIRECTORY_CHUNK: usize = 16_384"));
+        let pending_query = source
+            .split("fn pending_directory_chunk")
+            .nth(1)
+            .and_then(|value| value.split("fn commit_directory_batch").next())
+            .unwrap();
+        assert!(pending_query.contains("ORDER BY rowid"));
+        assert!(source.contains(".clamp(4, 8)"));
+    }
+
+    #[test]
+    fn ntfs_fast_index_parses_mft_records_without_touching_each_file() {
+        let mut buffer = 99u64.to_le_bytes().to_vec();
+        buffer.extend(synthetic_usn_v2_record(5, 5, 0x10, ""));
+        buffer.extend(synthetic_usn_v2_record(10, 5, 0x10, "Users"));
+        buffer.extend(synthetic_usn_v2_record(11, 10, 0, "毕业设计.pdf"));
+
+        let (next_reference, records) = ntfs::parse_usn_output(&buffer).unwrap();
+
+        assert_eq!(next_reference, 99);
+        assert_eq!(records.len(), 3);
+        assert!(records[1].is_directory());
+        assert_eq!(records[2].file_reference, 11);
+        assert_eq!(records[2].parent_reference, 10);
+        assert_eq!(records[2].name, "毕业设计.pdf");
+    }
+
+    #[test]
+    fn ntfs_file_references_ignore_sequence_bits_and_seed_the_root_record() {
+        let mut buffer = 99u64.to_le_bytes().to_vec();
+        buffer.extend(synthetic_usn_v2_record(
+            (9u64 << 48) | 10,
+            (3u64 << 48) | 5,
+            0x10,
+            "Users",
+        ));
+        buffer.extend(synthetic_usn_v2_record(
+            (4u64 << 48) | 11,
+            (7u64 << 48) | 10,
+            0,
+            "毕业设计课题拟定.docx",
+        ));
+
+        let (_, records) = ntfs::parse_usn_output(&buffer).unwrap();
+        assert_eq!(records[0].file_reference, 10);
+        assert_eq!(records[0].parent_reference, 5);
+        assert_eq!(records[1].file_reference, 11);
+        assert_eq!(records[1].parent_reference, 10);
+
+        let directories = HashMap::from([(
+            records[0].file_reference,
+            ntfs::DirectoryRecord::new(records[0].parent_reference, records[0].name.clone()),
+        )]);
+        let resolved = ntfs::resolve_all_directory_paths(&directories, "C:\\");
+        assert_eq!(
+            resolved.get(&10),
+            Some(&PathBuf::from("C:\\").join("Users"))
+        );
+        assert_eq!(
+            resolved
+                .get(&records[1].parent_reference)
+                .map(|parent| parent.join(&records[1].name)),
+            Some(PathBuf::from("C:\\Users\\毕业设计课题拟定.docx"))
+        );
+    }
+
+    #[test]
+    fn fast_ntfs_index_rejects_an_implausibly_incomplete_file_tree() {
+        assert!(!search::fast_index_coverage_is_credible(2_000_000, 384));
+        assert!(search::fast_index_coverage_is_credible(
+            2_000_000, 1_500_000
+        ));
+        assert!(search::fast_index_coverage_is_credible(5_000, 1_000));
+    }
+
+    #[test]
+    fn runtime_log_is_written_inside_the_active_data_directory() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("atlas-runtime-log-{nonce}"));
+        fs::create_dir_all(&directory).unwrap();
+
+        let path = crate::runtime_log::append_lines(
+            &directory,
+            &["2026-07-29T12:00:00.000Z [INFO] action=theme.change result=success\nforged".into()],
+        )
+        .unwrap();
+
+        assert_eq!(path, directory.join("logs").join("atlas-runtime.log"));
+        let contents = fs::read_to_string(&path).unwrap();
+        assert!(contents.contains("action=theme.change result=success forged"));
+        assert!(!contents.contains("\nforged"));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn ntfs_fast_index_reconstructs_paths_from_parent_references() {
+        let directories = [
+            (5, ntfs::DirectoryRecord::new(5, "")),
+            (10, ntfs::DirectoryRecord::new(5, "Users")),
+            (20, ntfs::DirectoryRecord::new(10, "Alice")),
+        ]
+        .into_iter()
+        .collect();
+
+        let parent = ntfs::resolve_all_directory_paths(&directories, "C:\\")
+            .remove(&20)
+            .unwrap();
+
+        assert_eq!(parent, PathBuf::from("C:\\Users\\Alice"));
+    }
+
+    #[test]
+    fn ntfs_directory_paths_are_resolved_once_and_reused_for_all_files() {
+        let directories = [
+            (5, ntfs::DirectoryRecord::new(5, "")),
+            (10, ntfs::DirectoryRecord::new(5, "Users")),
+            (20, ntfs::DirectoryRecord::new(10, "Atlas")),
+        ]
+        .into_iter()
+        .collect();
+
+        let resolved = ntfs::resolve_all_directory_paths(&directories, "C:\\");
+
+        assert_eq!(resolved.get(&5), Some(&PathBuf::from("C:\\")));
+        assert_eq!(resolved.get(&10), Some(&PathBuf::from("C:\\Users")));
+        assert_eq!(resolved.get(&20), Some(&PathBuf::from("C:\\Users\\Atlas")));
+    }
+
+    #[test]
+    fn only_complete_windows_volumes_use_the_mft_fast_path() {
+        assert_eq!(
+            search::fast_ntfs_volumes(&[PathBuf::from("C:\\"), PathBuf::from("D:\\")]),
+            Some(vec!['C', 'D'])
+        );
+        assert_eq!(
+            search::fast_ntfs_volumes(&[PathBuf::from(r"\\?\C:\"), PathBuf::from(r"\\?\D:\"),]),
+            Some(vec!['C', 'D'])
+        );
+        let canonical_system_drive = PathBuf::from("C:\\").canonicalize().unwrap();
+        assert_eq!(
+            search::fast_ntfs_volumes(&[canonical_system_drive]),
+            Some(vec!['C'])
+        );
+        assert_eq!(
+            search::fast_ntfs_volumes(&[PathBuf::from("D:\\Documents")]),
+            None
+        );
+    }
+
+    #[test]
+    fn a_partial_directory_fallback_can_be_replaced_by_the_mft_fast_path() {
+        let roots = [PathBuf::from("C:\\"), PathBuf::from("D:\\")];
+        assert_eq!(
+            search::fast_ntfs_volumes_for_build(&roots, 0, 2),
+            Some(vec!['C', 'D'])
+        );
+        assert_eq!(
+            search::fast_ntfs_volumes_for_build(&roots, 1, 2),
+            Some(vec!['C', 'D'])
+        );
+        assert_eq!(search::fast_ntfs_volumes_for_build(&roots, 2, 2), None);
+    }
+
+    #[test]
+    fn mft_streaming_batches_ipc_instead_of_flushing_each_file_as_a_tcp_packet() {
+        let source = include_str!("ntfs.rs");
+        assert!(source.contains("BufWriter::with_capacity"));
+        assert!(source.contains("BufReader::with_capacity"));
+        assert!(!source.contains("set_nodelay(true)"));
+    }
+
+    #[test]
+    fn accepted_mft_helper_socket_returns_to_blocking_mode_before_the_handshake() {
+        let source = include_str!("ntfs.rs");
+        let accepted = source
+            .split("let mut stream = loop")
+            .nth(1)
+            .and_then(|value| value.split("let mut hello").next())
+            .unwrap();
+        assert!(accepted.contains(".set_nonblocking(false)"));
+        assert!(
+            accepted.find(".set_nonblocking(false)").unwrap()
+                < accepted.find(".set_read_timeout").unwrap()
+        );
+    }
+
+    #[test]
+    fn elevated_mft_helper_reports_authorization_before_scanning_and_flushes_progress() {
+        let source = include_str!("ntfs.rs");
+        let helper = source
+            .split("pub(super) fn run_helper")
+            .nth(1)
+            .and_then(|value| value.split("pub(super) fn launch_elevated").next())
+            .unwrap();
+        assert!(
+            helper
+                .find("FastIndexEvent::Progress { discovered: 0 }")
+                .unwrap()
+                < helper.find("volumes.iter().try_for_each").unwrap()
+        );
+
+        let progress_writer = source
+            .split("FastIndexEvent::Progress { discovered } =>")
+            .nth(1)
+            .and_then(|value| value.split("}").next())
+            .unwrap();
+        assert!(progress_writer.contains("stream.flush()"));
+    }
+
+    #[test]
+    fn mft_volume_handle_uses_the_access_required_by_windows_usn_enumeration() {
+        let source = include_str!("ntfs.rs");
+        assert!(source.contains("GENERIC_READ | GENERIC_WRITE"));
+        assert!(source.contains(
+            "FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,\n                ptr::null(),\n                OPEN_EXISTING,\n                0,"
+        ));
+    }
+
+    #[test]
+    fn changing_index_scope_keeps_only_the_latest_build_request() {
+        let source = include_str!("search.rs");
+        assert!(source.contains("state.pending = Some((requested_roots, revision))"));
+        assert!(source.contains("queued_revision < revision"));
+        assert!(source.contains("pending_revision == current_revision"));
+        assert!(source.contains("index_build_cancelled(revision)"));
+    }
+
+    #[test]
+    fn elevated_mft_helper_exits_without_showing_the_desktop_startup_dialog() {
+        let main = include_str!("main.rs");
+        assert!(main.contains("--atlas-mft-helper"));
+        assert!(main.contains("if helper_mode"));
+    }
+
+    #[test]
+    fn first_run_and_partial_indexes_build_in_the_background() {
+        assert!(crate::index_setup_allows_background_build(
+            &serde_json::Value::Null,
+            false,
+            false,
+        ));
+        assert!(!crate::index_setup_allows_background_build(
+            &serde_json::json!({ "settings": { "indexSetup": "deferred" } }),
+            false,
+            false,
+        ));
+        assert!(crate::index_setup_allows_background_build(
+            &serde_json::json!({ "settings": { "indexSetup": "pending" } }),
+            false,
+            false,
+        ));
+        assert!(crate::index_setup_allows_background_build(
+            &serde_json::json!({ "settings": { "indexSetup": "ready" } }),
+            false,
+            false,
+        ));
+        assert!(crate::index_setup_allows_background_build(
+            &serde_json::json!({ "settings": {} }),
+            false,
+            false,
+        ));
+        assert!(crate::index_setup_allows_background_build(
+            &serde_json::json!({ "settings": { "indexSetup": "deferred" } }),
+            true,
+            false,
+        ));
+        assert!(crate::index_setup_allows_background_build(
+            &serde_json::json!({ "settings": { "indexSetup": "pending" } }),
+            false,
+            true,
+        ));
+    }
+
+    #[test]
+    fn background_full_disk_index_uses_one_resumable_pass() {
+        let source = include_str!("lib.rs");
+        assert!(!source.contains("search::bootstrap_roots()"));
+    }
+
+    #[test]
+    fn completing_a_resumed_index_persists_ready_and_refreshes_shortcuts() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("atlas-index-ready-{nonce}"));
+        let storage =
+            StorageManager::for_test(directory.join("bootstrap"), directory.join("data")).unwrap();
+        storage
+            .update_snapshot(|snapshot| {
+                *snapshot = serde_json::json!({
+                    "settings": {
+                        "indexSetup": "pending",
+                        "shortcuts": { "search": "Alt+Space" }
+                    }
+                });
+                Ok(())
+            })
+            .unwrap();
+
+        crate::mark_index_setup_ready(&storage).unwrap();
+        let snapshot = storage.load_snapshot().unwrap();
+
+        assert_eq!(
+            snapshot
+                .pointer("/settings/indexSetup")
+                .and_then(Value::as_str),
+            Some("ready")
+        );
+        assert_eq!(
+            crate::RUNTIME_SHORTCUT_SNAPSHOT
+                .read()
+                .pointer("/settings/indexSetup")
+                .and_then(Value::as_str),
+            Some("ready")
+        );
+        drop(storage);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn resumable_index_uses_a_durable_unsorted_directory_queue() {
+        let source = include_str!("search.rs");
+        assert!(source.contains("search_build_directories"));
+        assert!(source.contains("pending_directory_chunk"));
+        assert!(source.contains("fs::read_dir"));
+        assert!(!source.contains("resume_order_key"));
+        let rebuild = source
+            .split("fn rebuild_inner")
+            .nth(1)
+            .and_then(|value| value.split("pub fn status").next())
+            .unwrap();
+        assert!(!rebuild.contains(".sort_by(|left, right|"));
+        let roots = source
+            .split("fn distinct_roots")
+            .nth(1)
+            .and_then(|value| value.split("pub(crate) fn scope_key").next())
+            .unwrap();
+        assert!(roots.contains("then_with"));
+    }
+
+    #[test]
+    fn watchers_track_changes_in_both_live_and_staging_indexes_during_builds() {
+        let search_source = include_str!("search.rs");
+        let refresh = search_source
+            .split("fn refresh_paths")
+            .nth(1)
+            .and_then(|value| value.split("pub fn refresh_path").next())
+            .unwrap();
+        assert!(
+            refresh.find("storage.index_write_guard()").unwrap()
+                < refresh.find("INDEX_DIRTY_PATHS.lock()").unwrap()
+        );
+        assert!(refresh.contains(r#"reconcile_path_in_table(&transaction, "search_fts""#));
+        assert!(refresh.contains(r#"reconcile_path_in_table(&transaction, "search_fts_next""#));
+
+        let lib_source = include_str!("lib.rs");
+        let command = lib_source
+            .split("async fn rebuild_search_index")
+            .nth(1)
+            .and_then(|value| value.split("async fn launch_startup_items").next())
+            .unwrap();
+        assert!(
+            command.find("search::start_watchers").unwrap()
+                < command.find("spawn_blocking").unwrap()
+        );
+        assert!(search_source.contains("INDEX_DIRTY_PATHS"));
+        assert!(search_source.contains("reconcile_dirty_paths"));
+        assert!(search_source.contains("without another overflow"));
+        assert!(search_source.contains("latest_requests == observed_requests"));
+        assert!(search_source.contains("256 * 1024"));
+    }
+
+    #[test]
+    fn background_indexing_never_blocks_global_shortcuts() {
+        let source = include_str!("lib.rs");
+        assert!(!source.contains("fn shortcuts_blocked_by_index_setup"));
+        let handler = source
+            .split(".with_handler")
+            .nth(1)
+            .and_then(|value| value.split(".build()").next())
+            .unwrap();
+        assert!(!handler.contains("index_status"));
+        assert!(handler.contains("show_quick_window"));
+    }
+
+    #[test]
+    fn indexer_and_watchers_exclude_atlas_own_data_directory() {
+        let source = include_str!("search.rs");
+        assert!(source.contains("fn is_index_internal_path"));
+        let watcher = source
+            .split("pub fn start_watchers")
+            .nth(1)
+            .and_then(|value| value.split("pub fn stop_watchers").next())
+            .unwrap();
+        assert!(watcher.contains("is_index_internal_path"));
+        assert!(watcher.contains("queue_overflow_validation"));
+        assert!(source.contains("search_build_dirty_paths"));
+        assert!(source.contains("INDEX_ENTRY_CHUNK"));
+        assert!(source.contains("WATCH_REFRESH_BATCH_SIZE"));
     }
 
     #[test]
@@ -769,6 +1720,18 @@ mod tests {
         let mut next = previous.clone();
         next["prompts"] = serde_json::json!([{ "id": "new" }]);
         assert!(!runtime_settings_changed(&previous, &next));
+    }
+
+    #[test]
+    fn index_setup_changes_refresh_runtime_shortcut_routing() {
+        let previous = serde_json::json!({
+            "settings": { "indexSetup": "pending" }
+        });
+        let next = serde_json::json!({
+            "settings": { "indexSetup": "ready" }
+        });
+
+        assert!(runtime_settings_changed(&previous, &next));
     }
 
     #[test]
@@ -1413,6 +2376,52 @@ mod tests {
     }
 
     #[test]
+    fn completed_full_disk_index_can_serve_a_narrower_directory_scope() {
+        let _search_test = SEARCH_TEST_LOCK.lock().unwrap();
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("atlas-index-reuse-{nonce}"));
+        let bootstrap = directory.join("bootstrap");
+        let data = directory.join("data");
+        fs::create_dir_all(&bootstrap).unwrap();
+        fs::create_dir_all(&data).unwrap();
+        let storage = StorageManager::for_test(bootstrap, data).unwrap();
+        let full_scope = search::scope_key(&["*".into()]);
+        storage
+            .with_search_connection(|connection| {
+                connection
+                    .execute_batch(
+                        "CREATE VIRTUAL TABLE IF NOT EXISTS search_fts USING fts5(name, path UNINDEXED, kind UNINDEXED);",
+                    )
+                    .map_err(|error| error.to_string())?;
+                connection
+                    .execute(
+                        "INSERT INTO search_fts(name, path, kind) VALUES (?1, ?2, 'file')",
+                        ["reuse.txt", directory.join("reuse.txt").to_string_lossy().as_ref()],
+                    )
+                    .map_err(|error| error.to_string())?;
+                connection
+                    .execute(
+                        "INSERT INTO search_meta(id, scope, complete) VALUES (1, ?1, 1)
+                         ON CONFLICT(id) DO UPDATE SET scope = excluded.scope, complete = 1",
+                        [&full_scope],
+                    )
+                    .map_err(|error| error.to_string())?;
+                Ok(())
+            })
+            .unwrap();
+
+        assert!(search::has_index(
+            &storage,
+            &[directory.to_string_lossy().to_string()],
+        ));
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn search_index_keeps_paths_unindexed_and_bounds_name_alias_payloads() {
         let _search_test = SEARCH_TEST_LOCK.lock().unwrap();
         let nonce = SystemTime::now()
@@ -1593,6 +2602,36 @@ mod tests {
     }
 
     #[test]
+    fn chinese_two_character_query_is_not_dropped_late_in_a_long_file_name() {
+        let _search_test = SEARCH_TEST_LOCK.lock().unwrap();
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("atlas-search-long-chinese-{nonce}"));
+        let files = directory.join("files");
+        fs::create_dir_all(&files).unwrap();
+        let expected = files.join(
+            "这是一个用于验证长文件名称中的中文二字检索不会因为模糊别名上限而丢失的联合项目资料.pdf",
+        );
+        fs::write(&expected, b"pdf").unwrap();
+        let storage =
+            StorageManager::for_test(directory.join("bootstrap"), directory.join("data")).unwrap();
+        search::rebuild(&storage, vec![files.to_string_lossy().to_string()]).unwrap();
+
+        let chinese = search::query(&storage, "联合", "file", "pdf", "", &["*".into()]).unwrap();
+        let pinyin = search::query(&storage, "lianhe", "file", "pdf", "", &["*".into()]).unwrap();
+
+        assert!(chinese
+            .iter()
+            .any(|result| result.path == expected.to_string_lossy()));
+        assert!(pinyin
+            .iter()
+            .any(|result| result.path == expected.to_string_lossy()));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn search_tolerates_one_transposed_character() {
         let _search_test = SEARCH_TEST_LOCK.lock().unwrap();
         let nonce = SystemTime::now()
@@ -1698,6 +2737,12 @@ mod tests {
     }
 
     #[test]
+    fn incomplete_mft_path_format_is_invalidated_before_searching() {
+        assert!(search::scope_key(&["*".into()]).contains("v14-ntfs-root-index"));
+        assert!(!search::scope_key(&["*".into()]).contains("v13-ntfs-mft-index"));
+    }
+
+    #[test]
     fn search_expands_common_chinese_and_english_synonyms() {
         let _search_test = SEARCH_TEST_LOCK.lock().unwrap();
         let nonce = SystemTime::now()
@@ -1720,25 +2765,5 @@ mod tests {
             Some("浏览器收藏夹.txt")
         );
         fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn bootstrap_search_roots_keep_fast_user_and_start_menu_locations() {
-        let base = std::env::temp_dir().join("atlas-bootstrap-roots");
-        let home = base.join("home");
-        let roaming = base.join("roaming");
-        let program_data = base.join("program-data");
-
-        let roots = search::bootstrap_roots_from(&home, &roaming, &program_data);
-
-        assert!(roots.contains(&home.join("Desktop")));
-        assert!(roots.contains(&home.join("Documents")));
-        assert!(roots.contains(&roaming.join("Microsoft").join("Windows").join("Start Menu")));
-        assert!(roots.contains(
-            &program_data
-                .join("Microsoft")
-                .join("Windows")
-                .join("Start Menu")
-        ));
     }
 }

@@ -463,6 +463,7 @@ function defaultSnapshotForMigration(): AppSnapshot {
       theme: "light",
       fontFamily: "system",
       fontScale: 1,
+      indexSetup: "ready",
       shortcuts: {
         search: "Alt+Space",
         prompts: "Alt+Shift+P",

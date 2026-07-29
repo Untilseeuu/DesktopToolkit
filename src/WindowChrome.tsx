@@ -1,9 +1,10 @@
 import { Maximize2, Minus, X } from "lucide-react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useCallback, useEffect, useState } from "react";
+import { quitApplication } from "./native";
 
 async function performWindowAction(
-  action: "minimize" | "toggleMaximize" | "hide",
+  action: "minimize" | "toggleMaximize",
 ) {
   try {
     await getCurrentWindow()[action]();
@@ -17,22 +18,32 @@ export default function WindowChrome({
   description = "本地效率工作台",
   confirmOnClose = false,
   onDisableCloseReminder,
+  onBeforeQuit,
 }: {
   title?: string;
   description?: string;
   confirmOnClose?: boolean;
   onDisableCloseReminder?: () => void;
+  onBeforeQuit?: (disableReminder: boolean) => Promise<void>;
 }) {
   const [confirmingClose, setConfirmingClose] = useState(false);
   const [dontRemindAgain, setDontRemindAgain] = useState(false);
+  const quit = useCallback(async (disableReminder: boolean) => {
+    if (disableReminder) onDisableCloseReminder?.();
+    try {
+      await onBeforeQuit?.(disableReminder);
+    } finally {
+      await quitApplication();
+    }
+  }, [onBeforeQuit, onDisableCloseReminder]);
   const requestClose = useCallback(() => {
     if (confirmOnClose) {
       setDontRemindAgain(false);
       setConfirmingClose(true);
       return;
     }
-    void performWindowAction("hide");
-  }, [confirmOnClose]);
+    void quit(false);
+  }, [confirmOnClose, quit]);
   useEffect(() => {
     let dispose: (() => void) | undefined;
     void import("@tauri-apps/api/event")
@@ -90,7 +101,7 @@ export default function WindowChrome({
             <span className="confirm-dialog-icon"><X size={20} /></span>
             <div>
               <h2 id="window-close-title">确认关闭 Atlas</h2>
-              <p>关闭主窗口后，Atlas 会继续在系统托盘运行，快捷键和后台工具仍然有效。</p>
+              <p>退出后快捷键和后台工具会停止；未完成的索引会在下次启动时继续。</p>
             </div>
             <label className="confirm-dialog-check">
               <input
@@ -105,9 +116,8 @@ export default function WindowChrome({
               <button
                 className="button primary"
                 onClick={() => {
-                  if (dontRemindAgain) onDisableCloseReminder?.();
                   setConfirmingClose(false);
-                  void performWindowAction("hide");
+                  void quit(dontRemindAgain);
                 }}
               >
                 确认关闭

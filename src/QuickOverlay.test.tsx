@@ -3,11 +3,13 @@ import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import QuickOverlay from "./QuickOverlay";
 import { defaultSnapshot } from "./useToolkit";
+import stylesheet from "./styles.css?inline";
 
 const {
   clipboardHistoryHandler,
   hideOverlay,
   invokeNative,
+  loadAppearanceAsset,
   loadSnapshot,
   openTarget,
   recordActivity,
@@ -17,6 +19,7 @@ const {
   clipboardHistoryHandler: { current: undefined as undefined | ((entries: unknown[]) => void) },
   hideOverlay: vi.fn(async () => undefined),
   invokeNative: vi.fn<(command: string) => Promise<unknown>>(async () => null),
+  loadAppearanceAsset: vi.fn(async () => "data:font/ttf;base64,AA=="),
   loadSnapshot: vi.fn(),
   openTarget: vi.fn(async () => undefined),
   recordActivity: vi.fn(async () => undefined),
@@ -54,6 +57,7 @@ vi.mock("./native", () => ({
   hideOverlay,
   invokeNative,
   listSearchDrives: vi.fn(async () => ["C:", "D:"]),
+  loadAppearanceAsset,
   loadSnapshot,
   openTarget,
   recordActivity,
@@ -70,10 +74,33 @@ describe("QuickOverlay", () => {
     recordActivity.mockClear();
     invokeNative.mockReset();
     invokeNative.mockResolvedValue(null);
+    loadAppearanceAsset.mockClear();
     loadSnapshot.mockReset();
     loadSnapshot.mockResolvedValue(defaultSnapshot);
     searchNative.mockReset();
     searchNative.mockResolvedValue([]);
+  });
+
+  it("installs the selected custom font inside the independent overlay webview", async () => {
+    loadSnapshot.mockResolvedValue({
+      ...defaultSnapshot,
+      settings: {
+        ...defaultSnapshot.settings,
+        customFonts: [{ id: "font-1", name: "测试字体", path: "D:\\font.ttf" }],
+        activeCustomFontId: "font-1",
+      },
+    });
+
+    const { unmount } = render(<QuickOverlay mode="prompts" />);
+
+    await waitFor(() => {
+      expect(loadAppearanceAsset).toHaveBeenCalledWith("D:\\font.ttf");
+      expect(document.documentElement.dataset.customFont).toBe("true");
+    });
+    expect(document.getElementById("atlas-custom-font")?.textContent).toContain(
+      'font-family:"Atlas Custom ',
+    );
+    unmount();
   });
 
   it("switches tool modes inside one reusable overlay webview", async () => {
@@ -187,12 +214,17 @@ describe("QuickOverlay", () => {
       prompts: [],
       clipboardHistory: [],
     });
-    const { unmount } = render(<QuickOverlay mode="prompts" />);
+    const { container, unmount } = render(<QuickOverlay mode="prompts" />);
     expect(await screen.findByText("还没有提示词。")).toBeInTheDocument();
+    expect(container.querySelector(".quick-results")).toHaveClass("is-empty");
     unmount();
 
-    render(<QuickOverlay mode="clipboard" />);
+    const clipboard = render(<QuickOverlay mode="clipboard" />);
     expect(await screen.findByText("还没有剪贴板记录。")).toBeInTheDocument();
+    expect(clipboard.container.querySelector(".quick-results")).toHaveClass("is-empty");
+    expect(stylesheet).toMatch(
+      /\.quick-results\.is-empty\s*\{[^}]*border:\s*0[^}]*background:\s*transparent/,
+    );
   });
 
   it("reloads hidden clipboard and prompt data when the overlay regains focus", async () => {
@@ -248,6 +280,29 @@ describe("QuickOverlay", () => {
     render(<QuickOverlay mode="clipboard" />);
 
     expect(await screen.findByText("首次打开也能显示")).toBeInTheDocument();
+    expect(loadSnapshot.mock.calls.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("recovers when the first native snapshot read never settles", async () => {
+    loadSnapshot
+      .mockImplementationOnce(() => new Promise(() => undefined))
+      .mockImplementationOnce(() => new Promise(() => undefined))
+      .mockImplementationOnce(() => new Promise(() => undefined))
+      .mockResolvedValue({
+        ...defaultSnapshot,
+        clipboardHistory: [{
+          id: "timeout-copy",
+          kind: "text",
+          text: "首次挂起后仍能恢复",
+          copiedAt: Date.now(),
+        }],
+      });
+
+    render(<QuickOverlay mode="clipboard" />);
+
+    expect(
+      await screen.findByText("首次挂起后仍能恢复", {}, { timeout: 3_000 }),
+    ).toBeInTheDocument();
     expect(loadSnapshot.mock.calls.length).toBeGreaterThanOrEqual(2);
   });
 

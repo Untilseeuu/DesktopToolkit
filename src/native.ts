@@ -66,9 +66,105 @@ const LOCAL_KEY = "atlas-toolkit-state-v1";
 const APP_ICON_CACHE_LIMIT = 64;
 const appIconCache = new Map<string, string>();
 const appIconRequests = new Map<string, Promise<Record<string, string>>>();
+const INTERNAL_POLL_COMMANDS = new Set(["get_index_progress"]);
+const runtimeLogQueue: string[] = [];
+let runtimeLogTimer: number | undefined;
 
 function hasTauriRuntime(): boolean {
   return "__TAURI_INTERNALS__" in window;
+}
+
+function runtimeLogLine(
+  level: "INFO" | "ERROR",
+  action: string,
+  result: string,
+  detail = "",
+  durationMs?: number,
+) {
+  const fields = [
+    new Date().toISOString(),
+    `[${level}]`,
+    `action=${action}`,
+    `result=${result}`,
+    durationMs === undefined ? "" : `duration_ms=${Math.max(0, Math.round(durationMs))}`,
+    detail ? `detail=${detail.replace(/[\r\n]+/g, " ").slice(0, 12_000)}` : "",
+  ].filter(Boolean);
+  runtimeLogQueue.push(fields.join(" "));
+  if (runtimeLogQueue.length >= 100) {
+    void flushRuntimeLogs();
+  } else if (runtimeLogTimer === undefined) {
+    runtimeLogTimer = window.setTimeout(() => void flushRuntimeLogs(), 1_500);
+  }
+}
+
+function summarizeNativeResult(command: string, value: unknown): string {
+  if (value === null || value === undefined) return "empty";
+  if (Array.isArray(value)) {
+    if (
+      [
+        "launch_startup_items",
+        "close_previous_startup_scene",
+        "restore_startup_scene_layout",
+        "run_command_task",
+      ].includes(command)
+    ) {
+      const diagnostic = value.slice(0, 100).map((item) => {
+        if (!item || typeof item !== "object") return item;
+        const source = item as Record<string, unknown>;
+        return Object.fromEntries(
+          [
+            "id",
+            "itemId",
+            "name",
+            "command",
+            "status",
+            "success",
+            "exitCode",
+            "error",
+            "reason",
+            "stdout",
+            "stderr",
+          ]
+            .filter((key) => source[key] !== undefined)
+            .map((key) => [key, String(source[key]).slice(0, 2_000)]),
+        );
+      });
+      return `array_count=${value.length} outcomes=${JSON.stringify(diagnostic).slice(0, 10_000)}`;
+    }
+    return `array_count=${value.length}`;
+  }
+  if (typeof value === "object") return `object`;
+  if (typeof value === "string") return `text_length=${value.length}`;
+  return String(value).slice(0, 120);
+}
+
+export function recordRuntimeEvent(
+  action: string,
+  result: "started" | "success" | "failed",
+  detail = "",
+  durationMs?: number,
+) {
+  runtimeLogLine(result === "failed" ? "ERROR" : "INFO", action, result, detail, durationMs);
+}
+
+export async function flushRuntimeLogs(): Promise<void> {
+  if (runtimeLogTimer !== undefined) {
+    window.clearTimeout(runtimeLogTimer);
+    runtimeLogTimer = undefined;
+  }
+  if (!runtimeLogQueue.length) return;
+  if (!hasTauriRuntime()) {
+    runtimeLogQueue.length = 0;
+    return;
+  }
+  const lines = runtimeLogQueue.splice(0, runtimeLogQueue.length);
+  try {
+    const { invoke } = await import("@tauri-apps/api/core");
+    await invoke("append_runtime_logs", { lines });
+  } catch (error) {
+    console.error("Unable to write Atlas runtime log", error);
+    runtimeLogQueue.unshift(...lines.slice(-500));
+  }
 }
 
 export async function invokeNative<T>(
@@ -76,8 +172,32 @@ export async function invokeNative<T>(
   args: Record<string, unknown> = {},
 ): Promise<T | null> {
   if (!hasTauriRuntime()) return null;
+  const startedAt = performance.now();
+  const logOperation = !INTERNAL_POLL_COMMANDS.has(command);
+  if (logOperation) recordRuntimeEvent(`native.${command}`, "started");
   const { invoke } = await import("@tauri-apps/api/core");
-  return invoke<T>(command, args);
+  try {
+    const result = await invoke<T>(command, args);
+    if (logOperation) {
+      recordRuntimeEvent(
+        `native.${command}`,
+        "success",
+        summarizeNativeResult(command, result),
+        performance.now() - startedAt,
+      );
+    }
+    return result;
+  } catch (error) {
+    if (logOperation) {
+      recordRuntimeEvent(
+        `native.${command}`,
+        "failed",
+        String(error),
+        performance.now() - startedAt,
+      );
+    }
+    throw error;
+  }
 }
 
 export async function loadSnapshot(): Promise<AppSnapshot | null> {
@@ -89,6 +209,17 @@ export async function loadSnapshot(): Promise<AppSnapshot | null> {
 
 export async function getDataDirectory(): Promise<string | null> {
   return invokeNative<string>("get_data_directory");
+}
+
+export async function quitApplication(): Promise<void> {
+  recordRuntimeEvent("application.quit", "started");
+  await flushRuntimeLogs();
+  await invokeNative("quit_application");
+}
+
+export async function openRuntimeLog(): Promise<void> {
+  await flushRuntimeLogs();
+  await invokeNative("open_runtime_log");
 }
 
 export function snapshotForNativePersistence(snapshot: AppSnapshot): AppSnapshot {

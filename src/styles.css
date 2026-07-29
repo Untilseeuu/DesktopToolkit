@@ -20,6 +20,10 @@
   --brand-mark-surface: #1c211f;
   --brand-mark-ink: #f8f5ed;
   --brand-mark-ring: rgba(255, 255, 255, 0.12);
+  --sidebar: color-mix(in srgb, var(--paper-deep) 82%, transparent);
+  --sidebar-active: var(--panel);
+  --sidebar-ink: var(--ink);
+  --sidebar-muted: var(--muted);
   --font-scale: 1;
   --display-scale: 1;
   --custom-font: "Atlas Sans";
@@ -30,8 +34,12 @@
   text-rendering: geometricPrecision;
 }
 
+:root[data-font="system"] {
+  font-family: "Microsoft YaHei UI", "Segoe UI Variable Text", "Segoe UI", sans-serif;
+}
+
 :root[data-font="serif"] {
-  font-family: "Microsoft YaHei UI", "Noto Serif CJK SC", "SimSun", serif;
+  font-family: "STSong", "Songti SC", "Noto Serif CJK SC", "SimSun", serif;
 }
 
 :root[data-font="yahei"] {
@@ -40,6 +48,22 @@
 
 :root[data-custom-font="true"] {
   font-family: var(--custom-font), "Microsoft YaHei UI", sans-serif;
+}
+
+:root[data-custom-font="true"] body *:not(code):not(pre):not(kbd) {
+  font-family: var(--custom-font), "Microsoft YaHei UI", sans-serif;
+}
+
+:root[data-font="system"]:not([data-custom-font="true"]) body *:not(code):not(pre):not(kbd) {
+  font-family: "Microsoft YaHei UI", "Segoe UI Variable Text", "Segoe UI", sans-serif;
+}
+
+:root[data-font="serif"]:not([data-custom-font="true"]) body *:not(code):not(pre):not(kbd) {
+  font-family: "STSong", "Songti SC", "Noto Serif CJK SC", "SimSun", serif;
+}
+
+:root[data-font="yahei"]:not([data-custom-font="true"]) body *:not(code):not(pre):not(kbd) {
+  font-family: "Microsoft YaHei", "Microsoft YaHei UI", sans-serif;
 }
 
 :root[data-theme="dark"] {
@@ -58,6 +82,10 @@
   --brand-mark-surface: #242925;
   --brand-mark-ink: #f8f5ed;
   --brand-mark-ring: rgba(255, 255, 255, 0.14);
+  --sidebar: color-mix(in srgb, var(--paper-deep) 88%, transparent);
+  --sidebar-active: var(--panel);
+  --sidebar-ink: var(--ink);
+  --sidebar-muted: var(--muted);
 }
 
 * {
@@ -115,7 +143,7 @@ a:focus-visible {
   color: var(--muted);
   border-bottom: 1px solid var(--line);
   background:
-    linear-gradient(90deg, var(--paper-deep) 0 218px, var(--paper) 218px);
+    linear-gradient(90deg, var(--sidebar) 0 218px, var(--paper) 218px);
   user-select: none;
 }
 
@@ -566,6 +594,19 @@ a:focus-visible {
   background: color-mix(in srgb, var(--card) 94%, transparent);
 }
 
+.quick-results.is-empty {
+  overflow: hidden;
+  border: 0;
+  background: transparent;
+}
+
+.quick-results.is-empty .quick-empty {
+  display: grid;
+  min-height: 150px;
+  padding: 24px;
+  place-items: center;
+}
+
 .quick-results button {
   display: grid;
   grid-template-columns: 36px minmax(0, 1fr) auto;
@@ -692,8 +733,9 @@ a:focus-visible {
   display: flex;
   flex-direction: column;
   padding: 24px 14px 16px;
+  color: var(--sidebar-ink);
   border-right: 1px solid var(--line);
-  background: color-mix(in srgb, var(--paper-deep) 82%, transparent);
+  background: var(--sidebar);
 }
 
 .brand {
@@ -744,7 +786,7 @@ a:focus-visible {
 
 .brand small {
   margin-top: 5px;
-  color: var(--muted);
+  color: var(--sidebar-muted);
   font-size: calc(8px * var(--font-scale));
   font-weight: 700;
   letter-spacing: 0.22em;
@@ -758,7 +800,7 @@ a:focus-visible {
 
 .nav-label {
   margin: 0 12px 9px;
-  color: var(--muted);
+  color: var(--sidebar-muted);
   font-size: calc(9px * var(--font-scale));
   font-weight: 700;
   letter-spacing: 0.16em;
@@ -785,13 +827,13 @@ a:focus-visible {
 }
 
 .nav-item:hover {
-  color: var(--ink);
-  background: color-mix(in srgb, var(--ink) 5%, transparent);
+  color: var(--sidebar-ink);
+  background: color-mix(in srgb, var(--sidebar-ink) 6%, transparent);
 }
 
 .nav-item.active {
-  color: var(--ink);
-  background: var(--panel);
+  color: var(--sidebar-ink);
+  background: var(--sidebar-active);
   box-shadow: 0 5px 18px rgba(50, 46, 38, 0.05);
 }
 
@@ -2669,8 +2711,36 @@ kbd {
 
 .setting-row small {
   margin-top: 5px;
-  color: var(--muted);
+  color: var(--sidebar-muted);
   font-size: calc(8px * var(--font-scale));
+}
+
+.index-scope-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 8px;
+  padding: 3px 8px;
+  color: var(--muted);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--ink) 6%, transparent);
+  font-size: calc(8px * var(--font-scale));
+}
+
+.index-scope-status::before {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  content: "";
+}
+
+.index-scope-status.ready {
+  color: var(--moss);
+}
+
+.index-scope-status.building {
+  color: var(--vermillion);
 }
 
 .privacy-apps-setting {
@@ -2759,6 +2829,42 @@ kbd {
   font-size: calc(10px * var(--font-scale));
 }
 
+.index-deferred-notice {
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr) auto;
+  gap: 14px;
+  align-items: center;
+  margin-bottom: 14px;
+  padding: 13px 15px;
+  border: 1px solid color-mix(in srgb, var(--vermillion) 28%, var(--line));
+  border-radius: 14px;
+  background: color-mix(in srgb, var(--vermillion) 6%, var(--panel));
+}
+
+.window-close-backdrop {
+  z-index: 600;
+}
+
+.index-deferred-notice > span {
+  display: grid;
+  width: 42px;
+  height: 42px;
+  color: var(--vermillion);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--vermillion) 10%, transparent);
+  place-items: center;
+}
+
+.index-deferred-notice strong,
+.index-deferred-notice small {
+  display: block;
+}
+
+.index-deferred-notice small {
+  margin-top: 4px;
+  color: var(--muted);
+}
+
 .index-progress-banner {
   position: fixed;
   z-index: 35;
@@ -2793,6 +2899,14 @@ kbd {
   font-size: calc(8px * var(--font-scale));
 }
 
+.index-progress-banner .index-progress-fallback {
+  max-width: 270px;
+  overflow: hidden;
+  color: var(--vermillion);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .index-progress-banner > span {
   grid-row: 1;
   grid-column: 2;
@@ -2817,6 +2931,28 @@ kbd {
 .index-progress-banner progress::-webkit-progress-value {
   border-radius: 999px;
   background: var(--vermillion);
+}
+
+.index-progress-activity {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 18px;
+  color: var(--muted);
+  font-size: calc(8px * var(--font-scale));
+}
+
+.index-progress-activity .index-progress-pulse {
+  flex: 0 0 auto;
+  animation: index-activity-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes index-activity-pulse {
+  50% {
+    opacity: 0.45;
+    transform: scale(0.72);
+  }
 }
 
 .index-progress-banner > button {
@@ -2855,18 +2991,7 @@ kbd {
   font-size: calc(10px * var(--font-scale));
 }
 
-.index-progress-banner.collapsed > span:not(.index-progress-pulse) {
-  grid-row: auto;
-  grid-column: auto;
-  margin: 0;
-  color: var(--muted);
-  font-size: calc(8px * var(--font-scale));
-  white-space: nowrap;
-}
-
 .index-progress-pulse {
-  grid-row: auto;
-  grid-column: auto;
   width: 7px;
   height: 7px;
   border-radius: 50%;

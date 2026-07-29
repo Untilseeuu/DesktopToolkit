@@ -6,17 +6,22 @@ import mainCapability from "../src-tauri/capabilities/default.json";
 import WindowChrome from "./WindowChrome";
 import stylesheet from "./styles.css?inline";
 
-const { closeRequestedHandler, windowActions } = vi.hoisted(() => ({
+const { closeRequestedHandler, quitApplication, windowActions } = vi.hoisted(() => ({
   closeRequestedHandler: { current: undefined as undefined | (() => void) },
+  quitApplication: vi.fn(async () => undefined),
   windowActions: {
-  minimize: vi.fn(async () => undefined),
-  toggleMaximize: vi.fn(async () => undefined),
-  hide: vi.fn(async () => undefined),
+    minimize: vi.fn(async () => undefined),
+    toggleMaximize: vi.fn(async () => undefined),
+    hide: vi.fn(async () => undefined),
   },
 }));
 
 vi.mock("@tauri-apps/api/window", () => ({
   getCurrentWindow: () => windowActions,
+}));
+
+vi.mock("./native", () => ({
+  quitApplication,
 }));
 
 vi.mock("@tauri-apps/api/event", () => ({
@@ -31,6 +36,7 @@ vi.mock("@tauri-apps/api/event", () => ({
 describe("custom desktop window chrome", () => {
   beforeEach(() => {
     Object.values(windowActions).forEach((action) => action.mockClear());
+    quitApplication.mockClear();
     closeRequestedHandler.current = undefined;
   });
 
@@ -66,13 +72,26 @@ describe("custom desktop window chrome", () => {
 
     expect(windowActions.minimize).toHaveBeenCalledOnce();
     expect(windowActions.toggleMaximize).toHaveBeenCalledOnce();
-    expect(windowActions.hide).toHaveBeenCalledOnce();
+    expect(quitApplication).toHaveBeenCalledOnce();
+    expect(windowActions.hide).not.toHaveBeenCalled();
   });
 
   it("asks before closing and lets the user disable future reminders", async () => {
     const user = userEvent.setup();
     const disableReminder = vi.fn();
-    render(<WindowChrome confirmOnClose onDisableCloseReminder={disableReminder} />);
+    let finishSave: (() => void) | undefined;
+    const onBeforeQuit = vi.fn(
+      () => new Promise<void>((resolve) => {
+        finishSave = resolve;
+      }),
+    );
+    render(
+      <WindowChrome
+        confirmOnClose
+        onDisableCloseReminder={disableReminder}
+        onBeforeQuit={onBeforeQuit}
+      />,
+    );
 
     await user.click(screen.getByRole("button", { name: "关闭" }));
     expect(screen.getByRole("dialog", { name: "确认关闭 Atlas" })).toBeInTheDocument();
@@ -80,7 +99,10 @@ describe("custom desktop window chrome", () => {
     await user.click(screen.getByRole("button", { name: "确认关闭" }));
 
     expect(disableReminder).toHaveBeenCalledOnce();
-    expect(windowActions.hide).toHaveBeenCalledOnce();
+    expect(onBeforeQuit).toHaveBeenCalledWith(true);
+    expect(quitApplication).not.toHaveBeenCalled();
+    finishSave?.();
+    await vi.waitFor(() => expect(quitApplication).toHaveBeenCalledOnce());
   });
 
   it("routes Alt+F4 and taskbar close requests through the same confirmation", async () => {
@@ -92,9 +114,9 @@ describe("custom desktop window chrome", () => {
     act(() => closeRequestedHandler.current?.());
 
     expect(screen.getByRole("dialog", { name: "确认关闭 Atlas" })).toBeInTheDocument();
-    expect(windowActions.hide).not.toHaveBeenCalled();
+    expect(quitApplication).not.toHaveBeenCalled();
     await user.click(screen.getByRole("button", { name: "确认关闭" }));
-    expect(windowActions.hide).toHaveBeenCalledOnce();
+    expect(quitApplication).toHaveBeenCalledOnce();
   });
 
   it("keeps every title-bar control fully visible at the native minimum width", () => {
@@ -106,6 +128,12 @@ describe("custom desktop window chrome", () => {
     );
     expect(stylesheet).toMatch(
       /\.window-chrome-controls button\s*\{[^}]*flex:\s*0\s+0\s+46px/,
+    );
+  });
+
+  it("keeps the close confirmation above the blocking index initializer", () => {
+    expect(stylesheet).toMatch(
+      /\.window-close-backdrop\s*\{[^}]*z-index:\s*600/,
     );
   });
 });

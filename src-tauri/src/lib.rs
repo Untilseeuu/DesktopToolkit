@@ -1,6 +1,8 @@
 mod automation;
 mod domain;
 mod launcher;
+mod ntfs;
+mod runtime_log;
 mod search;
 mod storage;
 
@@ -17,7 +19,7 @@ use std::{
     path::{Component, Path, PathBuf},
     process::Command,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -59,6 +61,7 @@ static REGISTERED_SHORTCUTS: Mutex<BTreeMap<String, String>> = Mutex::new(BTreeM
 static RUNTIME_SHORTCUT_SNAPSHOT: RwLock<Value> = RwLock::new(Value::Null);
 static RUNTIME_SEARCH_SNAPSHOT: RwLock<Value> = RwLock::new(Value::Null);
 static SEARCH_CONFIG_GENERATION: AtomicU64 = AtomicU64::new(0);
+static USER_REQUESTED_MAIN_WINDOW: AtomicBool = AtomicBool::new(false);
 static SEARCH_CONFIG_GATE: Mutex<()> = Mutex::new(());
 static CURRENT_QUICK_OVERLAY_MODE: Mutex<Option<String>> = Mutex::new(None);
 #[cfg(target_os = "windows")]
@@ -411,6 +414,26 @@ fn appearance_asset_path(storage: &StorageManager, candidate: &str) -> Result<Pa
     Ok(canonical)
 }
 
+fn read_appearance_header(path: &Path) -> Result<[u8; 16], String> {
+    let mut header = [0u8; 16];
+    let mut file = std::fs::File::open(path).map_err(|error| error.to_string())?;
+    file.read_exact(&mut header)
+        .map_err(|error| format!("读取文件头失败：{error}"))?;
+    Ok(header)
+}
+
+fn detected_image_extension(header: &[u8]) -> Option<&'static str> {
+    if header.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("png")
+    } else if header.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some("jpg")
+    } else if header.len() >= 12 && header.starts_with(b"RIFF") && &header[8..12] == b"WEBP" {
+        Some("webp")
+    } else {
+        None
+    }
+}
+
 fn validate_appearance_file(path: &Path, font: bool) -> Result<(), String> {
     const MAX_IMAGE_BYTES: u64 = 12 * 1024 * 1024;
     const MAX_FONT_BYTES: u64 = 16 * 1024 * 1024;
@@ -427,10 +450,7 @@ fn validate_appearance_file(path: &Path, font: bool) -> Result<(), String> {
             limit / 1024 / 1024
         ));
     }
-    let mut header = [0u8; 12];
-    let read = std::fs::File::open(path)
-        .and_then(|mut file| file.read(&mut header))
-        .map_err(|error| error.to_string())?;
+    let header = read_appearance_header(path)?;
     let extension = path
         .extension()
         .and_then(|value| value.to_str())
@@ -445,17 +465,19 @@ fn validate_appearance_file(path: &Path, font: bool) -> Result<(), String> {
             _ => false,
         }
     } else {
-        match extension.as_str() {
-            "png" => header.starts_with(b"\x89PNG\r\n\x1a\n"),
-            "jpg" | "jpeg" => header.starts_with(&[0xff, 0xd8, 0xff]),
-            "webp" => read >= 12 && header.starts_with(b"RIFF") && &header[8..12] == b"WEBP",
-            _ => false,
-        }
+        detected_image_extension(&header).is_some()
     };
     if !valid {
+        let signature = header[..12]
+            .iter()
+            .map(|byte| format!("{byte:02X}"))
+            .collect::<Vec<_>>()
+            .join(" ");
         return Err(format!(
-            "所选文件不是有效的{}",
-            if font { "字体" } else { "图片" }
+            "所选文件不是有效的{}（扩展名 .{}，文件签名 {}）",
+            if font { "字体" } else { "图片" },
+            extension,
+            signature
         ));
     }
     Ok(())
@@ -503,15 +525,23 @@ fn import_appearance_asset(
     let Some(source) = selected else {
         return Ok(None);
     };
-    let extension = source
+    let selected_extension = source
         .extension()
         .and_then(|value| value.to_str())
         .unwrap_or_default()
         .to_ascii_lowercase();
-    if !extensions.contains(&extension.as_str()) {
+    if !extensions.contains(&selected_extension.as_str()) {
         return Err("所选文件格式不受支持".into());
     }
     validate_appearance_file(&source, kind == "font")?;
+    let extension = if kind == "font" {
+        selected_extension
+    } else {
+        let header = read_appearance_header(&source)?;
+        detected_image_extension(&header)
+            .ok_or_else(|| "所选文件不是有效的图片".to_string())?
+            .to_string()
+    };
     let directory = storage.data_dir().join("appearance");
     std::fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
     let nonce = SystemTime::now()
@@ -798,12 +828,73 @@ fn shortcut_registration_delta(
 
 #[tauri::command]
 fn load_snapshot(storage: State<'_, SharedStorage>) -> Result<Value, String> {
-    storage.load_snapshot()
+    let snapshot = storage.load_snapshot()?;
+    if snapshot.is_null() {
+        return Ok(serde_json::json!({
+            "settings": { "indexSetup": "pending" }
+        }));
+    }
+    Ok(snapshot)
+}
+
+pub(crate) fn index_setup_allows_background_build(
+    snapshot: &Value,
+    has_partial: bool,
+    has_complete: bool,
+) -> bool {
+    if has_partial || has_complete {
+        return true;
+    }
+    match snapshot
+        .pointer("/settings/indexSetup")
+        .and_then(Value::as_str)
+    {
+        Some("ready" | "pending") => true,
+        Some("deferred") => false,
+        Some(_) => false,
+        None => true,
+    }
+}
+
+fn mark_index_setup_ready(storage: &StorageManager) -> Result<(), String> {
+    storage.update_snapshot(|snapshot| {
+        if snapshot
+            .pointer("/settings/indexSetup")
+            .and_then(Value::as_str)
+            != Some("ready")
+        {
+            snapshot["settings"]["indexSetup"] = Value::String("ready".into());
+        }
+        Ok(())
+    })?;
+    let snapshot = storage.load_snapshot()?;
+    *RUNTIME_SHORTCUT_SNAPSHOT.write() =
+        runtime_shortcut_snapshot_for_registered(&snapshot, &REGISTERED_SHORTCUTS.lock());
+    Ok(())
 }
 
 #[tauri::command]
 fn get_data_directory(storage: State<'_, SharedStorage>) -> String {
     storage.data_dir().to_string_lossy().to_string()
+}
+
+#[tauri::command]
+fn append_runtime_logs(
+    storage: State<'_, SharedStorage>,
+    lines: Vec<String>,
+) -> Result<bool, String> {
+    runtime_log::append_lines(&storage.data_dir(), &lines)?;
+    Ok(true)
+}
+
+#[tauri::command]
+fn open_runtime_log(storage: State<'_, SharedStorage>) -> Result<bool, String> {
+    let path = runtime_log::append_lines(
+        &storage.data_dir(),
+        &["----- Atlas runtime log opened -----".into()],
+    )?;
+    open::that(&path).map_err(|error| format!("无法打开运行日志：{error}"))?;
+    Ok(true)
 }
 
 #[tauri::command]
@@ -894,8 +985,10 @@ fn save_snapshot(
                 .pointer("/tools/search/enabled")
                 .and_then(Value::as_bool)
                 .unwrap_or(true);
-        if previous.pointer("/settings/indexRoots") != sanitized.pointer("/settings/indexRoots")
-            || search_turned_on
+        if index_setup_allows_background_build(&sanitized, false, false)
+            && (previous.pointer("/settings/indexRoots")
+                != sanitized.pointer("/settings/indexRoots")
+                || search_turned_on)
         {
             rebuild_roots = sanitized
                 .pointer("/settings/indexRoots")
@@ -969,33 +1062,6 @@ fn save_snapshot(
             };
             if !force && search::has_index(&storage_for_index, &roots) {
                 return;
-            }
-            if roots.iter().any(|root| root == "*")
-                && !search::has_partial_index(&storage_for_index, &roots)
-            {
-                let bootstrap_roots = search::bootstrap_roots();
-                if !bootstrap_roots.is_empty()
-                    && search::rebuild_if_revision(
-                        &storage_for_index,
-                        bootstrap_roots,
-                        expected_revision,
-                    )
-                    .ok()
-                    .flatten()
-                    .is_some()
-                {
-                    let next_revision = {
-                        let _coordinator = SEARCH_CONFIG_GATE.lock();
-                        if SEARCH_CONFIG_GENERATION.load(Ordering::Acquire)
-                            != search_config_generation
-                        {
-                            return;
-                        }
-                        search::revision()
-                    };
-                    let _ = search::rebuild_if_revision(&storage_for_index, roots, next_revision);
-                    return;
-                }
             }
             let _ = search::rebuild_if_revision(&storage_for_index, roots, expected_revision);
         });
@@ -1227,25 +1293,22 @@ async fn rebuild_search_index(
     roots: Vec<String>,
 ) -> Result<usize, String> {
     let storage = storage.inner().clone();
-    if roots.iter().any(|root| root == "*") {
-        let revision = search::revision();
-        let bootstrap_roots = search::bootstrap_roots();
-        if !bootstrap_roots.is_empty() {
-            let storage_for_quick = storage.clone();
-            let count = tauri::async_runtime::spawn_blocking(move || {
-                search::rebuild(&storage_for_quick, bootstrap_roots)
-            })
-            .await
-            .map_err(|error| error.to_string())??;
-            tauri::async_runtime::spawn_blocking(move || {
-                let _ = search::rebuild_if_revision(&storage, roots, revision + 1);
-            });
-            return Ok(count);
-        }
+    if search::status() != "indexing" && search::has_index(&storage, &roots) {
+        let watcher_roots = if search::has_full_disk_index(&storage) {
+            vec!["*".to_string()]
+        } else {
+            roots
+        };
+        search::start_watchers(storage.clone(), watcher_roots);
+        return search::count(&storage);
     }
-    tauri::async_runtime::spawn_blocking(move || search::rebuild(&storage, roots))
+    let watcher_storage = storage.clone();
+    let watcher_roots = roots.clone();
+    search::start_watchers(watcher_storage, watcher_roots);
+    let count = tauri::async_runtime::spawn_blocking(move || search::rebuild(&storage, roots))
         .await
-        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())??;
+    Ok(count)
 }
 
 #[tauri::command]
@@ -1385,6 +1448,13 @@ fn hide_overlay(app: AppHandle, mode: String) -> Result<bool, String> {
         .ok_or_else(|| "快捷窗口不存在".to_string())?;
     window.hide().map_err(|error| error.to_string())?;
     Ok(true)
+}
+
+#[tauri::command]
+fn quit_application(app: AppHandle) {
+    search::cancel_indexing();
+    search::stop_watchers();
+    app.exit(0);
 }
 
 #[tauri::command]
@@ -1609,10 +1679,21 @@ fn runtime_shortcut_snapshot_for_registered(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    let index_setup = snapshot
+        .pointer("/settings/indexSetup")
+        .cloned()
+        .unwrap_or_else(|| {
+            if snapshot.is_null() {
+                Value::String("pending".into())
+            } else {
+                Value::String("ready".into())
+            }
+        });
     serde_json::json!({
         "tools": tools,
         "settings": {
-            "shortcuts": shortcuts
+            "shortcuts": shortcuts,
+            "indexSetup": index_setup
         },
         "folderFavorites": folder_favorites
     })
@@ -2028,6 +2109,7 @@ fn start_clipboard_monitor(app: AppHandle, storage: SharedStorage) {
 }
 
 fn show_main_window(app: &AppHandle) {
+    USER_REQUESTED_MAIN_WINDOW.store(true, Ordering::Release);
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.unminimize();
         let _ = window.show();
@@ -2035,14 +2117,14 @@ fn show_main_window(app: &AppHandle) {
     }
 }
 
+fn should_hide_autostart_window(launched_from_autostart: bool, user_requested: bool) -> bool {
+    launched_from_autostart && !user_requested
+}
+
 pub fn run() -> Result<(), String> {
-    let storage = Arc::new(
-        StorageManager::initialize()
-            .map_err(|error| format!("初始化软件安装目录内的 data 文件夹失败：{error}"))?,
-    );
-    let startup_snapshot = storage.load_snapshot().unwrap_or(Value::Null);
-    *RUNTIME_SEARCH_SNAPSHOT.write() = runtime_search_snapshot(&startup_snapshot);
-    let startup_search_generation = SEARCH_CONFIG_GENERATION.load(Ordering::Acquire);
+    if let Some(result) = ntfs::run_helper_if_requested() {
+        return result;
+    }
     let launched_from_autostart = std::env::args().any(|argument| argument == "--autostart");
 
     tauri::Builder::default()
@@ -2081,8 +2163,28 @@ pub fn run() -> Result<(), String> {
                 })
                 .build(),
         )
-        .manage(storage.clone())
         .setup(move |app| {
+            // Single-instance handling is installed before this setup callback,
+            // so a foreground click can reach an autostart instance even while
+            // its databases and background services are still warming up.
+            let storage = Arc::new(StorageManager::initialize().map_err(|error| {
+                std::io::Error::other(format!("初始化软件安装目录内的 data 文件夹失败：{error}"))
+            })?);
+            runtime_log::append_event(
+                &storage.data_dir(),
+                "INFO",
+                "application.start",
+                "success",
+                if launched_from_autostart {
+                    "mode=autostart"
+                } else {
+                    "mode=interactive"
+                },
+            );
+            app.manage(storage.clone());
+            let startup_snapshot = storage.load_snapshot().unwrap_or(Value::Null);
+            *RUNTIME_SEARCH_SNAPSHOT.write() = runtime_search_snapshot(&startup_snapshot);
+            let startup_search_generation = SEARCH_CONFIG_GENERATION.load(Ordering::Acquire);
             let open_item = MenuItem::with_id(app, "open", "打开 Atlas", true, None::<&str>)?;
             let quit_item = MenuItem::with_id(app, "quit", "退出 Atlas", true, None::<&str>)?;
             let tray_menu = Menu::with_items(app, &[&open_item, &quit_item])?;
@@ -2115,10 +2217,15 @@ pub fn run() -> Result<(), String> {
                 eprintln!("failed to apply Atlas runtime settings: {error}");
             }
             start_clipboard_monitor(app.handle().clone(), storage.clone());
-            if launched_from_autostart {
+            if should_hide_autostart_window(
+                launched_from_autostart,
+                USER_REQUESTED_MAIN_WINDOW.load(Ordering::Acquire),
+            ) {
                 if let Some(window) = app.get_webview_window("main") {
                     let _ = window.hide();
                 }
+            }
+            if launched_from_autostart {
                 let startup_enabled = startup_snapshot
                     .pointer("/tools/startup/enabled")
                     .and_then(Value::as_bool)
@@ -2189,7 +2296,15 @@ pub fn run() -> Result<(), String> {
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_else(|| vec!["*".into()]);
-            if search_enabled {
+            let partial_index = search::has_partial_index(&storage, &index_roots);
+            let complete_index = search::has_index(&storage, &index_roots);
+            if search_enabled
+                && index_setup_allows_background_build(
+                    &startup_snapshot,
+                    partial_index,
+                    complete_index,
+                )
+            {
                 let storage_for_index = storage.clone();
                 let roots_for_index = index_roots.clone();
                 tauri::async_runtime::spawn_blocking(move || {
@@ -2200,11 +2315,16 @@ pub fn run() -> Result<(), String> {
                         {
                             return;
                         }
-                        search::start_watchers(storage_for_index.clone(), roots_for_index.clone());
                     }
                     if search::has_index(&storage_for_index, &roots_for_index) {
+                        let _ = mark_index_setup_ready(&storage_for_index);
+                        search::start_watchers(storage_for_index.clone(), roots_for_index.clone());
                         return;
                     }
+                    // refresh_path mirrors notifications into search_fts_next
+                    // while it exists, preserving changes in roots that have
+                    // already been scanned during this build.
+                    search::start_watchers(storage_for_index.clone(), roots_for_index.clone());
                     let expected_revision = {
                         let _coordinator = SEARCH_CONFIG_GATE.lock();
                         if SEARCH_CONFIG_GENERATION.load(Ordering::Acquire)
@@ -2214,44 +2334,44 @@ pub fn run() -> Result<(), String> {
                         }
                         search::revision()
                     };
-                    if roots_for_index.iter().any(|root| root == "*")
-                        && !search::has_partial_index(&storage_for_index, &roots_for_index)
-                    {
-                        let bootstrap_roots = search::bootstrap_roots();
-                        if !bootstrap_roots.is_empty() {
-                            if search::rebuild_if_revision(
-                                &storage_for_index,
-                                bootstrap_roots,
-                                expected_revision,
-                            )
-                            .ok()
-                            .flatten()
-                            .is_none()
-                            {
-                                return;
-                            }
-                            let next_revision = {
-                                let _coordinator = SEARCH_CONFIG_GATE.lock();
-                                if SEARCH_CONFIG_GENERATION.load(Ordering::Acquire)
-                                    != startup_search_generation
-                                {
-                                    return;
-                                }
-                                search::revision()
-                            };
-                            let _ = search::rebuild_if_revision(
-                                &storage_for_index,
-                                roots_for_index,
-                                next_revision,
-                            );
-                            return;
-                        }
-                    }
-                    let _ = search::rebuild_if_revision(
+                    runtime_log::append_event(
+                        &storage_for_index.data_dir(),
+                        "INFO",
+                        "search.index.background",
+                        "started",
+                        &format!("roots={}", roots_for_index.len()),
+                    );
+                    let rebuild_result = search::rebuild_if_revision(
                         &storage_for_index,
-                        roots_for_index,
+                        roots_for_index.clone(),
                         expected_revision,
                     );
+                    match &rebuild_result {
+                        Ok(Some(count)) => runtime_log::append_event(
+                            &storage_for_index.data_dir(),
+                            "INFO",
+                            "search.index.background",
+                            "success",
+                            &format!("indexed_items={count}"),
+                        ),
+                        Ok(None) => runtime_log::append_event(
+                            &storage_for_index.data_dir(),
+                            "INFO",
+                            "search.index.background",
+                            "cancelled",
+                            "reason=scope_changed",
+                        ),
+                        Err(error) => runtime_log::append_event(
+                            &storage_for_index.data_dir(),
+                            "ERROR",
+                            "search.index.background",
+                            "failed",
+                            error,
+                        ),
+                    }
+                    if search::has_index(&storage_for_index, &roots_for_index) {
+                        let _ = mark_index_setup_ready(&storage_for_index);
+                    }
                 });
             }
             Ok(())
@@ -2273,6 +2393,8 @@ pub fn run() -> Result<(), String> {
         .invoke_handler(tauri::generate_handler![
             load_snapshot,
             get_data_directory,
+            append_runtime_logs,
+            open_runtime_log,
             save_snapshot,
             choose_startup_item,
             sync_startup_items,
@@ -2293,6 +2415,7 @@ pub fn run() -> Result<(), String> {
             run_command_task,
             open_target,
             hide_overlay,
+            quit_application,
             get_quick_overlay_mode,
             activate_clipboard_entry,
             delete_clipboard_history_entry,

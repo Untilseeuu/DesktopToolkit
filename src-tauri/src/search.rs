@@ -7,21 +7,22 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        mpsc, Arc, LazyLock,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(all(target_os = "windows", not(test)))]
 use windows_sys::Win32::System::Threading::{
-    GetCurrentThread, SetThreadPriority, THREAD_MODE_BACKGROUND_BEGIN, THREAD_MODE_BACKGROUND_END,
+    GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL, THREAD_PRIORITY_NORMAL,
 };
 
 use parking_lot::Mutex;
 use pinyin::ToPinyin;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, Transaction};
 use serde::{Deserialize, Serialize};
+#[cfg(all(target_os = "windows", not(test)))]
 use walkdir::{DirEntry, WalkDir};
 
 use crate::storage::StorageManager;
@@ -29,12 +30,13 @@ use crate::storage::StorageManager;
 struct IndexState {
     status: u8,
     running: bool,
-    pending: Option<Vec<String>>,
+    pending: Option<(Vec<String>, u64)>,
     phase: u8,
     indexed_items: usize,
     completed_roots: usize,
     total_roots: usize,
     current_root: Option<String>,
+    fallback_reason: Option<String>,
 }
 
 static INDEX_STATE: Mutex<IndexState> = Mutex::new(IndexState {
@@ -46,13 +48,19 @@ static INDEX_STATE: Mutex<IndexState> = Mutex::new(IndexState {
     completed_roots: 0,
     total_roots: 0,
     current_root: None,
+    fallback_reason: None,
 });
 static INDEX_REVISION: AtomicU64 = AtomicU64::new(0);
 static QUERY_REVISION: AtomicU64 = AtomicU64::new(0);
 #[cfg(all(target_os = "windows", not(test)))]
 static WATCH_REVISION: AtomicU64 = AtomicU64::new(0);
+#[cfg(all(target_os = "windows", not(test)))]
+static WATCH_OVERFLOW_REBUILD_QUEUED: LazyLock<Mutex<HashMap<u64, u64>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 static LAST_QUERY_AT_MS: AtomicU64 = AtomicU64::new(0);
 static QUERY_GATE: Mutex<()> = Mutex::new(());
+static INDEX_DIRTY_PATHS: LazyLock<Mutex<HashSet<PathBuf>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
 static LIVE_RESULT_CACHE: Mutex<LiveResultCache> = Mutex::new(LiveResultCache {
     scope: String::new(),
     refreshed_at: None,
@@ -69,12 +77,19 @@ const LIVE_RESULT_CACHE_LIMIT: usize = 8_192;
 const MAX_PINYIN_ALIAS_CHARS: usize = 160;
 const MAX_FUZZY_ALIAS_TOKENS: usize = 48;
 const MAX_FILE_FUZZY_ALIAS_TOKENS: usize = 24;
+const MAX_CJK_BIGRAM_TOKENS: usize = 256;
+const INDEX_ENTRY_CHUNK: usize = 8_192;
+#[cfg(all(target_os = "windows", not(test)))]
+const WATCH_REFRESH_BATCH_SIZE: usize = 512;
 #[cfg(not(test))]
 const INTERACTIVE_QUERY_GRACE_MS: u64 = 2_500;
 
 pub(crate) fn index_pause_millis(work_millis: u64, interactive_query: bool) -> u64 {
-    let multiplier = if interactive_query { 2 } else { 1 };
-    work_millis.saturating_mul(multiplier).clamp(1, 40)
+    if interactive_query {
+        (work_millis / 4).clamp(2, 12)
+    } else {
+        0
+    }
 }
 
 struct LiveResultCache {
@@ -90,7 +105,7 @@ struct BackgroundIndexPriority(bool);
 impl BackgroundIndexPriority {
     fn begin() -> Self {
         let changed =
-            unsafe { SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN) } != 0;
+            unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL) } != 0;
         Self(changed)
     }
 }
@@ -100,7 +115,7 @@ impl Drop for BackgroundIndexPriority {
     fn drop(&mut self) {
         if self.0 {
             unsafe {
-                SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END);
+                SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL);
             }
         }
     }
@@ -150,7 +165,9 @@ impl IndexThrottle {
             work_time.as_millis() as u64,
             since_query < INTERACTIVE_QUERY_GRACE_MS,
         );
-        std::thread::sleep(Duration::from_millis(pause_ms));
+        if pause_ms > 0 {
+            std::thread::sleep(Duration::from_millis(pause_ms));
+        }
         self.work_started = Instant::now();
     }
 }
@@ -184,6 +201,10 @@ fn update_index_progress(
     state.completed_roots = completed_roots;
     state.total_roots = total_roots;
     state.current_root = current_root;
+}
+
+fn set_fast_index_fallback_reason(reason: Option<String>) {
+    INDEX_STATE.lock().fallback_reason = reason;
 }
 
 const SYNONYM_GROUPS: &[&[&str]] = &[
@@ -222,6 +243,7 @@ pub struct IndexProgress {
     pub completed_roots: usize,
     pub total_roots: usize,
     pub current_root: Option<String>,
+    pub fallback_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -370,6 +392,14 @@ fn encode_indexed_name(name: &str, kind: &str) -> String {
                 .collect::<String>()
         })
         .collect::<Vec<_>>();
+    // SQLite's trigram tokenizer cannot retrieve a two-character CJK query
+    // directly. Keep those exact CJK bigrams ahead of the bounded fuzzy
+    // aliases so a phrase near the end of a long filename is never discarded.
+    aliases.extend(
+        cjk_bigram_tokens(name)
+            .into_iter()
+            .take(MAX_CJK_BIGRAM_TOKENS),
+    );
     let mut fuzzy_sources = vec![name.to_string()];
     if matches!(kind, "app" | "folder") {
         fuzzy_sources.extend(aliases.iter().cloned());
@@ -379,16 +409,54 @@ fn encode_indexed_name(name: &str, kind: &str) -> String {
             .into_iter()
             .flat_map(|source| fuzzy_bigram_tokens(&source))
             .take(if kind == "file" {
-                MAX_FILE_FUZZY_ALIAS_TOKENS
+                file_fuzzy_alias_limit(name)
             } else {
                 MAX_FUZZY_ALIAS_TOKENS
             }),
     );
+    let mut seen_aliases = HashSet::new();
+    aliases.retain(|alias| seen_aliases.insert(alias.clone()));
     if aliases.is_empty() {
         name.to_string()
     } else {
         format!("{name}{INDEXED_NAME_SEPARATOR}{}", aliases.join("\u{1f}"))
     }
+}
+
+fn file_fuzzy_alias_limit(name: &str) -> usize {
+    let extension = Path::new(name)
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    if [
+        "txt", "md", "rtf", "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "csv", "epub",
+    ]
+    .iter()
+    .any(|candidate| extension.eq_ignore_ascii_case(candidate))
+    {
+        MAX_FILE_FUZZY_ALIAS_TOKENS
+    } else {
+        0
+    }
+}
+
+fn is_cjk(character: char) -> bool {
+    matches!(
+        character,
+        '\u{3400}'..='\u{4dbf}'
+            | '\u{4e00}'..='\u{9fff}'
+            | '\u{f900}'..='\u{faff}'
+    )
+}
+
+fn cjk_bigram_tokens(value: &str) -> Vec<String> {
+    normalized_search_value(value)
+        .chars()
+        .collect::<Vec<_>>()
+        .windows(2)
+        .filter(|window| is_cjk(window[0]) && is_cjk(window[1]))
+        .map(|window| format!("~{}{}", window[0], window[1]))
+        .collect()
 }
 
 fn fuzzy_bigram_tokens(value: &str) -> Vec<String> {
@@ -793,6 +861,16 @@ fn normalized_scope_path(path: &Path) -> String {
         .to_lowercase()
 }
 
+pub(crate) fn is_index_internal_path(data_dir: &Path, path: &Path) -> bool {
+    path_starts_with(path, data_dir)
+}
+
+fn path_starts_with(path: &Path, root: &Path) -> bool {
+    let root = normalized_scope_path(root);
+    let candidate = normalized_scope_path(path);
+    !root.is_empty() && (candidate == root || candidate.starts_with(&format!("{root}\\")))
+}
+
 pub fn path_matches_roots(path: &Path, roots: &[String]) -> bool {
     if include_application_roots(roots) {
         return true;
@@ -806,24 +884,9 @@ pub fn path_matches_roots(path: &Path, roots: &[String]) -> bool {
     })
 }
 
+#[cfg(all(target_os = "windows", not(test)))]
 fn should_descend(entry: &DirEntry) -> bool {
-    if !entry.file_type().is_dir() {
-        return true;
-    }
-    let name = entry.file_name().to_string_lossy();
-    ![
-        "node_modules",
-        ".git",
-        "$recycle.bin",
-        "system volume information",
-        "winsxs",
-    ]
-    .iter()
-    .any(|excluded| name.eq_ignore_ascii_case(excluded))
-}
-
-fn kind_for_entry(entry: &DirEntry) -> &'static str {
-    kind_for_path(entry.path(), entry.file_type().is_dir())
+    should_descend_path(entry.path(), entry.file_type().is_dir())
 }
 
 fn kind_for_path(path: &Path, is_dir: bool) -> &'static str {
@@ -843,45 +906,31 @@ fn kind_for_path(path: &Path, is_dir: bool) -> &'static str {
     }
 }
 
-pub fn refresh_path(storage: &StorageManager, path: &Path) -> Result<(), String> {
+fn reconcile_path_in_table(
+    transaction: &Transaction<'_>,
+    table: &str,
+    path: &Path,
+) -> Result<(), String> {
     let display = display_path(path);
     let metadata = path.metadata().ok();
     let is_dir = metadata.as_ref().is_some_and(|value| value.is_dir());
     let exists = metadata.is_some();
-    let _writer = storage.index_write_guard();
-    let mut connection =
-        Connection::open(storage.search_database_path()).map_err(|error| error.to_string())?;
-    let transaction = connection
-        .transaction()
-        .map_err(|error| error.to_string())?;
-    let next_exists = transaction
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='search_fts_next')",
-            [],
-            |row| row.get::<_, bool>(0),
-        )
-        .unwrap_or(false);
-    let tables = if next_exists {
-        vec!["search_fts", "search_fts_next"]
+    let child_prefix = format!(
+        "{}{}",
+        display.trim_end_matches(['\\', '/']),
+        std::path::MAIN_SEPARATOR
+    );
+    if exists {
+        transaction
+            .execute(&format!("DELETE FROM {table} WHERE path = ?1"), [&display])
+            .map_err(|error| error.to_string())?;
     } else {
-        vec!["search_fts"]
-    };
-    let child_prefix = format!("{}\\", display.trim_end_matches(['\\', '/']));
-    for table in &tables {
-        if exists {
-            transaction
-                .execute(&format!("DELETE FROM {table} WHERE path = ?1"), [&display])
-                .map_err(|error| error.to_string())?;
-        } else {
-            transaction
-                .execute(
-                    &format!(
-                        "DELETE FROM {table} WHERE path = ?1 OR substr(path, 1, length(?2)) = ?2"
-                    ),
-                    params![display, child_prefix],
-                )
-                .map_err(|error| error.to_string())?;
-        }
+        transaction
+            .execute(
+                &format!("DELETE FROM {table} WHERE path = ?1 OR substr(path, 1, length(?2)) = ?2"),
+                params![display, child_prefix],
+            )
+            .map_err(|error| error.to_string())?;
     }
     if exists {
         let kind = kind_for_path(path, is_dir);
@@ -895,20 +944,115 @@ pub fn refresh_path(storage: &StorageManager, path: &Path) -> Result<(), String>
             };
             if !name.is_empty() {
                 let indexed = encode_indexed_name(&name, kind);
-                for table in tables {
-                    transaction
-                        .execute(
-                            &format!(
-                                "INSERT INTO {table}(name, path, kind, modified_at) VALUES (?1, ?2, ?3, NULL)"
-                            ),
-                            params![indexed, display, kind],
-                        )
-                        .map_err(|error| error.to_string())?;
-                }
+                transaction
+                    .execute(
+                        &format!(
+                            "INSERT INTO {table}(name, path, kind, modified_at) VALUES (?1, ?2, ?3, NULL)"
+                        ),
+                        params![indexed, display, kind],
+                    )
+                    .map_err(|error| error.to_string())?;
             }
         }
     }
+    Ok(())
+}
+
+fn reconcile_dirty_paths(
+    transaction: &Transaction<'_>,
+    paths: impl IntoIterator<Item = PathBuf>,
+) -> Result<(), String> {
+    for path in paths {
+        reconcile_path_in_table(transaction, "search_fts_next", &path)?;
+    }
+    Ok(())
+}
+
+fn refresh_paths(storage: &StorageManager, paths: &[PathBuf]) -> Result<(), String> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    // Dirty registration and the staging write must stay on the same side of
+    // the rebuild initialization barrier. Then any watcher/scanner overlap is
+    // guaranteed to be reconciled before the staging table is published.
+    let _writer = storage.index_write_guard();
+    if INDEX_STATE.lock().running {
+        INDEX_DIRTY_PATHS.lock().extend(paths.iter().cloned());
+    }
+    let mut connection =
+        Connection::open(storage.search_database_path()).map_err(|error| error.to_string())?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
+    let next_exists = transaction
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='search_fts_next')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .unwrap_or(false);
+    for path in paths {
+        reconcile_path_in_table(&transaction, "search_fts", path)?;
+        if next_exists {
+            reconcile_path_in_table(&transaction, "search_fts_next", path)?;
+            transaction
+                .execute(
+                    "INSERT OR IGNORE INTO search_build_dirty_paths(path) VALUES (?1)",
+                    [display_path(path)],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+    }
     transaction.commit().map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+pub fn refresh_path(storage: &StorageManager, path: &Path) -> Result<(), String> {
+    refresh_paths(storage, &[path.to_path_buf()])
+}
+
+#[cfg(all(target_os = "windows", not(test)))]
+fn queue_overflow_validation(
+    storage: Arc<StorageManager>,
+    watcher_scope: Vec<String>,
+    watcher_revision: u64,
+) {
+    {
+        let mut queued = WATCH_OVERFLOW_REBUILD_QUEUED.lock();
+        let requests = queued.entry(watcher_revision).or_default();
+        *requests = requests.saturating_add(1);
+        if *requests > 1 {
+            return;
+        }
+    }
+    std::thread::spawn(move || {
+        // Keep coalescing overflows until a complete validation finishes
+        // without another overflow. Stopping after a fixed number of passes
+        // can publish a stale index when an overflow occurs behind the final
+        // scan cursor.
+        loop {
+            while WATCH_REVISION.load(Ordering::Acquire) == watcher_revision
+                && status() == "indexing"
+            {
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            if WATCH_REVISION.load(Ordering::Acquire) != watcher_revision {
+                break;
+            }
+            let observed_requests = WATCH_OVERFLOW_REBUILD_QUEUED
+                .lock()
+                .get(&watcher_revision)
+                .copied()
+                .unwrap_or_default();
+            let _ = rebuild(&storage, watcher_scope.clone());
+            let mut queued = WATCH_OVERFLOW_REBUILD_QUEUED.lock();
+            let latest_requests = queued.get(&watcher_revision).copied().unwrap_or_default();
+            if latest_requests == observed_requests {
+                queued.remove(&watcher_revision);
+                return;
+            }
+        }
+    });
 }
 
 #[cfg(all(target_os = "windows", not(test)))]
@@ -947,6 +1091,7 @@ pub fn start_watchers(storage: Arc<StorageManager>, requested_roots: Vec<String>
         let storage = storage.clone();
         let watcher_scope = watcher_scope.clone();
         std::thread::spawn(move || {
+            let data_dir = storage.data_dir();
             let mut wide = root.as_os_str().encode_wide().collect::<Vec<_>>();
             wide.push(0);
             let handle = unsafe {
@@ -970,7 +1115,7 @@ pub fn start_watchers(storage: Arc<StorageManager>, requested_roots: Vec<String>
                 }
                 return;
             }
-            let mut buffer = vec![0u8; 64 * 1024];
+            let mut buffer = vec![0u8; 256 * 1024];
             'watch: while WATCH_REVISION.load(Ordering::Acquire) == revision {
                 let mut returned = 0u32;
                 let mut overlapped = unsafe { std::mem::zeroed::<OVERLAPPED>() };
@@ -1020,9 +1165,12 @@ pub fn start_watchers(storage: Arc<StorageManager>, requested_roots: Vec<String>
                     }
                 }
                 if returned == 0 {
-                    // A zero-byte completion means notifications overflowed. Rebuild
-                    // the configured scope once, then keep the subscription alive.
-                    let _ = rebuild(&storage, watcher_scope.clone());
+                    // A zero-byte completion means notifications overflowed.
+                    // Coalesce every overflow observed during the active scan
+                    // into one validation pass. The watcher keeps consuming
+                    // notifications instead of synchronously blocking on a
+                    // second full scan or starting an endless rebuild loop.
+                    queue_overflow_validation(storage.clone(), watcher_scope.clone(), revision);
                     continue;
                 }
                 let mut offset = 0usize;
@@ -1047,21 +1195,31 @@ pub fn start_watchers(storage: Arc<StorageManager>, requested_roots: Vec<String>
                     }
                     offset += info.NextEntryOffset as usize;
                 }
+                let mut refresh_batch = Vec::with_capacity(changed_paths.len());
                 for (path, action) in changed_paths {
-                    let _ = refresh_path(&storage, &path);
+                    if is_index_internal_path(&data_dir, &path) {
+                        continue;
+                    }
+                    refresh_batch.push(path.clone());
                     if path.is_dir()
                         && matches!(action, FILE_ACTION_ADDED | FILE_ACTION_RENAMED_NEW_NAME)
                     {
                         for entry in WalkDir::new(&path)
                             .follow_links(false)
                             .into_iter()
-                            .filter_entry(should_descend)
+                            .filter_entry(|entry| {
+                                should_descend(entry)
+                                    && !is_index_internal_path(&data_dir, entry.path())
+                            })
                             .filter_map(Result::ok)
                             .skip(1)
                         {
-                            let _ = refresh_path(&storage, entry.path());
+                            refresh_batch.push(entry.into_path());
                         }
                     }
+                }
+                for paths in refresh_batch.chunks(WATCH_REFRESH_BATCH_SIZE) {
+                    let _ = refresh_paths(&storage, paths);
                 }
             }
             unsafe {
@@ -1225,19 +1383,7 @@ pub fn available_drives() -> Vec<String> {
     drive_labels_from_roots(roots.iter().map(PathBuf::as_path))
 }
 
-pub fn bootstrap_roots_from(home: &Path, roaming: &Path, program_data: &Path) -> Vec<PathBuf> {
-    vec![
-        home.join("Desktop"),
-        home.join("Documents"),
-        home.join("Downloads"),
-        roaming.join("Microsoft").join("Windows").join("Start Menu"),
-        program_data
-            .join("Microsoft")
-            .join("Windows")
-            .join("Start Menu"),
-    ]
-}
-
+#[cfg(not(test))]
 fn application_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
     for variable in ["LOCALAPPDATA", "APPDATA", "PROGRAMDATA"] {
@@ -1261,32 +1407,18 @@ fn application_roots() -> Vec<PathBuf> {
     roots.into_iter().filter(|root| root.is_dir()).collect()
 }
 
-pub fn bootstrap_roots() -> Vec<String> {
-    let home = std::env::var_os("USERPROFILE")
-        .map(PathBuf::from)
-        .unwrap_or_default();
-    let roaming = std::env::var_os("APPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_default();
-    let program_data = std::env::var_os("PROGRAMDATA")
-        .map(PathBuf::from)
-        .unwrap_or_default();
-    let mut roots = bootstrap_roots_from(&home, &roaming, &program_data);
-    roots.extend(application_roots());
-    distinct_roots(roots)
-        .into_iter()
-        .filter(|root| root.is_dir())
-        .map(|root| root.to_string_lossy().to_string())
-        .collect()
-}
-
 fn distinct_roots(roots: Vec<PathBuf>) -> Vec<PathBuf> {
     let mut normalized = roots
         .into_iter()
         .filter(|root| root.exists())
         .map(|root| root.canonicalize().unwrap_or(root))
         .collect::<Vec<_>>();
-    normalized.sort_by_key(|root| root.components().count());
+    normalized.sort_by(|left, right| {
+        left.components()
+            .count()
+            .cmp(&right.components().count())
+            .then_with(|| normalized_scope_path(left).cmp(&normalized_scope_path(right)))
+    });
     let mut distinct = Vec::<PathBuf>::new();
     for root in normalized {
         if !distinct.iter().any(|parent| root.starts_with(parent)) {
@@ -1296,11 +1428,32 @@ fn distinct_roots(roots: Vec<PathBuf>) -> Vec<PathBuf> {
     distinct
 }
 
+pub(crate) fn fast_ntfs_volumes(roots: &[PathBuf]) -> Option<Vec<char>> {
+    let volumes = roots
+        .iter()
+        .map(|root| crate::ntfs::volume_letter(root))
+        .collect::<Option<Vec<_>>>()?;
+    (!volumes.is_empty()).then_some(volumes)
+}
+
+pub(crate) fn fast_ntfs_volumes_for_build(
+    roots: &[PathBuf],
+    completed_roots: usize,
+    total_roots: usize,
+) -> Option<Vec<char>> {
+    (completed_roots < total_roots)
+        .then(|| fast_ntfs_volumes(roots))
+        .flatten()
+}
+
 pub(crate) fn scope_key(requested_roots: &[String]) -> String {
-    if requested_roots.is_empty() || requested_roots.iter().any(|root| root == "*") {
-        return "[\"v9\",\"*\"]".to_string();
-    }
-    let mut roots = distinct_roots(requested_roots.iter().map(PathBuf::from).collect())
+    let resolved_roots =
+        if requested_roots.is_empty() || requested_roots.iter().any(|root| root == "*") {
+            default_roots()
+        } else {
+            requested_roots.iter().map(PathBuf::from).collect()
+        };
+    let mut roots = distinct_roots(resolved_roots)
         .iter()
         .map(|root| {
             let value = display_path(root);
@@ -1312,12 +1465,25 @@ pub(crate) fn scope_key(requested_roots: &[String]) -> String {
         })
         .collect::<Vec<_>>();
     roots.sort();
-    roots.insert(0, "v9".to_string());
+    roots.insert(0, "v14-ntfs-root-index".to_string());
     serde_json::to_string(&roots).unwrap_or_else(|_| "[]".to_string())
 }
 
 pub fn revision() -> u64 {
     INDEX_REVISION.load(Ordering::Acquire)
+}
+
+fn index_build_cancelled(revision: u64) -> bool {
+    INDEX_REVISION.load(Ordering::Acquire) != revision
+}
+
+pub fn cancel_indexing() {
+    // Serialize cancellation with the hand-off from an active build to a
+    // queued build. Otherwise the worker can consume `pending`, observe the
+    // cancellation revision as its own, and start another full scan on exit.
+    let mut state = INDEX_STATE.lock();
+    state.pending = None;
+    INDEX_REVISION.fetch_add(1, Ordering::AcqRel);
 }
 
 pub fn rebuild(storage: &StorageManager, requested_roots: Vec<String>) -> Result<usize, String> {
@@ -1352,8 +1518,19 @@ fn rebuild_at_revision(
 ) -> Result<usize, String> {
     {
         let mut state = INDEX_STATE.lock();
+        let current_revision = INDEX_REVISION.load(Ordering::Acquire);
+        if revision != current_revision {
+            return Ok(0);
+        }
         if state.running {
-            state.pending = Some(requested_roots);
+            let replaces_older_request =
+                state.pending.as_ref().map_or(true, |(_, queued_revision)| {
+                    let queued_revision = *queued_revision;
+                    queued_revision < revision
+                });
+            if revision == current_revision && replaces_older_request {
+                state.pending = Some((requested_roots, revision));
+            }
             return Ok(0);
         }
         state.running = true;
@@ -1370,11 +1547,17 @@ fn rebuild_at_revision(
     loop {
         let result = rebuild_inner(storage, roots, active_revision);
         let mut state = INDEX_STATE.lock();
-        if let Some(pending) = state.pending.take() {
-            roots = pending;
-            active_revision = INDEX_REVISION.load(Ordering::Acquire);
-            drop(state);
-            continue;
+        if let Some((pending, pending_revision)) = state.pending.take() {
+            let current_revision = INDEX_REVISION.load(Ordering::Acquire);
+            // A request can reserve a revision just before shutdown and only
+            // reach this queue after cancellation. Never let that stale request
+            // adopt the cancellation revision and revive a full-disk scan.
+            if pending_revision == current_revision {
+                roots = pending;
+                active_revision = pending_revision;
+                drop(state);
+                continue;
+            }
         }
         state.running = false;
         state.status = if result.is_ok() { 2 } else { 3 };
@@ -1389,16 +1572,30 @@ fn rebuild_at_revision(
     }
 }
 
-const INDEX_BATCH_SIZE: usize = 512;
+// A larger transaction dramatically reduces FTS5 journal and tree-rebalance
+// overhead on multi-million item volumes while keeping transient memory bounded.
+const INDEX_BATCH_SIZE: usize = 32768;
+const INDEX_DIRECTORY_CHUNK: usize = 16_384;
+
+pub(crate) fn fast_index_coverage_is_credible(discovered: usize, indexed: usize) -> bool {
+    // Small test volumes and nearly empty drives do not provide a useful ratio.
+    // On a real full disk, however, reconstructing only a tiny fraction of MFT
+    // records means the file-reference graph was incomplete. Never publish that
+    // partial tree as a completed index.
+    discovered < 10_000 || indexed.saturating_mul(20) >= discovered
+}
 
 fn flush_index_batch(
     storage: &StorageManager,
     connection: &mut Connection,
     records: &mut Vec<(String, String, &'static str)>,
-    preserve_existing: bool,
+    revision: u64,
 ) -> Result<(), String> {
     if records.is_empty() {
         return Ok(());
+    }
+    if index_build_cancelled(revision) {
+        return Err("索引任务已取消".into());
     }
     let _writer = storage.index_write_guard();
     let transaction = connection
@@ -1411,17 +1608,9 @@ fn flush_index_batch(
                  VALUES (?1, ?2, ?3, ?4)",
             )
             .map_err(|error| error.to_string())?;
-        for (name, path, kind) in records.drain(..) {
-            if !preserve_existing {
-                transaction
-                    .execute("DELETE FROM search_fts_next WHERE path = ?1", [&path])
-                    .map_err(|error| error.to_string())?;
-            }
-            let filesystem_path = path.starts_with(r"\\")
-                || (path.as_bytes().get(1) == Some(&b':')
-                    && path.as_bytes().first().is_some_and(u8::is_ascii_alphabetic));
-            if filesystem_path && !Path::new(&path).exists() {
-                continue;
+        for (index, (name, path, kind)) in records.drain(..).enumerate() {
+            if index % 1024 == 0 && index_build_cancelled(revision) {
+                return Err("索引任务已取消".into());
             }
             statement
                 .execute(params![name, path, kind, Option::<u64>::None])
@@ -1429,6 +1618,601 @@ fn flush_index_batch(
         }
     }
     transaction.commit().map_err(|error| error.to_string())
+}
+
+#[cfg(target_os = "windows")]
+fn try_fast_ntfs_index(
+    storage: &StorageManager,
+    connection: &mut Connection,
+    volumes: &[char],
+    data_dir: &Path,
+    indexed_app_paths: &mut HashSet<String>,
+    system_apps: &[RegisteredApp],
+    total_roots: usize,
+    revision: u64,
+) -> Result<usize, String> {
+    let root_paths = volumes
+        .iter()
+        .map(|volume| format!("{volume}:\\").to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+    let _writer = storage.index_write_guard();
+    let transaction = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute("DELETE FROM search_fts_next", [])
+        .map_err(|error| error.to_string())?;
+    let mut statement = transaction
+        .prepare(
+            "INSERT INTO search_fts_next(name, path, kind, modified_at)
+             VALUES (?1, ?2, ?3, NULL)",
+        )
+        .map_err(|error| error.to_string())?;
+    let mut fast_indexed_app_paths = HashSet::new();
+    let mut count = 0usize;
+    for app in system_apps {
+        let normalized = app.path.replace('/', "\\").to_ascii_lowercase();
+        if !root_paths.iter().any(|root| normalized.starts_with(root))
+            || is_noisy_application(Path::new(&app.path))
+            || is_noisy_app_name(&app.name)
+            || !fast_indexed_app_paths.insert(normalized)
+        {
+            continue;
+        }
+        statement
+            .execute(params![
+                encode_indexed_name(&app.name, "app"),
+                app.path,
+                "app"
+            ])
+            .map_err(|error| error.to_string())?;
+        count = count.saturating_add(1);
+    }
+    let registered_app_count = count;
+    let mut preview_count = count;
+    let mut largest_discovered = 0usize;
+    update_index_progress(4, preview_count, 0, total_roots, None);
+    let result = crate::ntfs::scan_volumes_elevated(volumes, |event| {
+        if index_build_cancelled(revision) {
+            return Err("索引任务已取消".into());
+        }
+        match event {
+            crate::ntfs::FastIndexEvent::Progress { discovered } => {
+                largest_discovered = largest_discovered.max(discovered);
+                preview_count = preview_count.max(count.saturating_add(discovered));
+                update_index_progress(5, preview_count, 0, total_roots, None);
+            }
+            crate::ntfs::FastIndexEvent::Entry { path, is_directory } => {
+                if is_index_internal_path(data_dir, &path)
+                    || is_regenerable_cache_path(&path)
+                    || root_paths.contains(&display_path(&path).to_ascii_lowercase())
+                {
+                    return Ok(());
+                }
+                let normalized = display_path(&path).replace('/', "\\").to_ascii_lowercase();
+                if [
+                    "\\node_modules\\",
+                    "\\.git\\",
+                    "\\$recycle.bin\\",
+                    "\\system volume information\\",
+                    "\\winsxs\\",
+                    "\\__pycache__\\",
+                ]
+                .iter()
+                .any(|excluded| normalized.contains(excluded))
+                {
+                    return Ok(());
+                }
+                let kind = kind_for_path(&path, is_directory);
+                if kind == "app" {
+                    if is_noisy_application(&path) || !fast_indexed_app_paths.insert(normalized) {
+                        return Ok(());
+                    }
+                }
+                let name = path
+                    .file_name()
+                    .map(|value| value.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                if name.is_empty() {
+                    return Ok(());
+                }
+                statement
+                    .execute(params![
+                        encode_indexed_name(&name, kind),
+                        display_path(&path),
+                        kind
+                    ])
+                    .map_err(|error| error.to_string())?;
+                count = count.saturating_add(1);
+                if count % 8192 == 0 {
+                    update_index_progress(5, preview_count.max(count), 0, total_roots, None);
+                }
+            }
+        }
+        Ok(())
+    });
+    drop(statement);
+    result?;
+    let indexed_file_tree_items = count.saturating_sub(registered_app_count);
+    if !fast_index_coverage_is_credible(largest_discovered, indexed_file_tree_items) {
+        return Err(format!(
+            "NTFS 文件路径还原不完整（发现 {largest_discovered} 项，仅还原 {indexed_file_tree_items} 项）"
+        ));
+    }
+    transaction
+        .execute("DELETE FROM search_build_directories", [])
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute(
+            "UPDATE search_build_meta
+             SET completed_roots = ?1, indexed_items = ?2, updated_at = unixepoch()
+             WHERE id = 1",
+            params![total_roots, count],
+        )
+        .map_err(|error| error.to_string())?;
+    transaction.commit().map_err(|error| error.to_string())?;
+    *indexed_app_paths = fast_indexed_app_paths;
+    Ok(count)
+}
+
+pub(crate) fn should_descend_path(path: &Path, is_dir: bool) -> bool {
+    if !is_dir {
+        return true;
+    }
+    let name = path
+        .file_name()
+        .map(|value| value.to_string_lossy())
+        .unwrap_or_default();
+    if [
+        "node_modules",
+        ".git",
+        "$recycle.bin",
+        "system volume information",
+        "winsxs",
+        "__pycache__",
+    ]
+    .iter()
+    .any(|excluded| name.eq_ignore_ascii_case(excluded))
+    {
+        return false;
+    }
+    true
+}
+
+pub(crate) fn should_descend_full_disk_path(path: &Path, is_dir: bool) -> bool {
+    let should_descend = should_descend_path(path, is_dir);
+    if !should_descend || !is_dir {
+        return should_descend;
+    }
+    !is_regenerable_cache_path(path)
+}
+
+fn is_regenerable_cache_path(path: &Path) -> bool {
+    let normalized = path
+        .to_string_lossy()
+        .replace('/', "\\")
+        .to_ascii_lowercase();
+    [
+        "\\windows\\softwaredistribution\\download",
+        "\\program files\\microsoft office\\updates\\download\\packagefiles",
+        "\\appdata\\local\\temp",
+        "\\appdata\\local\\cache",
+        "\\appdata\\local\\yarn\\cache",
+        "\\node_cache\\_cacache",
+        "\\npm-cache\\_cacache",
+        "\\appdata\\local\\pub\\cache",
+        "\\appdata\\local\\.dartserver",
+        "\\appdata\\roaming\\.minecraft\\cache",
+        "\\.m2\\repository",
+        "\\.gradle\\caches",
+        "\\.cargo\\registry",
+        "\\anaconda\\pkgs",
+        "\\miniconda\\pkgs",
+        "\\.codex\\.tmp",
+    ]
+    .iter()
+    .any(|excluded| {
+        normalized == excluded.trim_start_matches('\\')
+            || normalized.ends_with(excluded)
+            || normalized.contains(&format!("{excluded}\\"))
+    })
+}
+
+fn pending_directory_chunk(connection: &Connection) -> Result<Vec<(String, usize, bool)>, String> {
+    let mut statement = connection
+        .prepare(
+            "SELECT path, root_index, started
+             FROM search_build_directories
+             ORDER BY rowid
+             LIMIT ?1",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([INDEX_DIRECTORY_CHUNK as i64], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, usize>(1)?,
+                row.get::<_, bool>(2)?,
+            ))
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    Ok(rows)
+}
+
+fn commit_directory_batch(
+    storage: &StorageManager,
+    connection: &mut Connection,
+    records: &mut Vec<(String, String, &'static str)>,
+    children: &mut Vec<(String, usize)>,
+    started_directories: &mut Vec<String>,
+    completed_directories: &mut Vec<String>,
+    indexed_items: usize,
+    total_roots: usize,
+    revision: u64,
+) -> Result<(usize, usize), String> {
+    if records.is_empty()
+        && children.is_empty()
+        && started_directories.is_empty()
+        && completed_directories.is_empty()
+    {
+        return Ok((indexed_items, 0));
+    }
+    if index_build_cancelled(revision) {
+        return Err("索引任务已取消".into());
+    }
+    let _writer = storage.index_write_guard();
+    let transaction = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
+    let mut next_count = indexed_items;
+    {
+        let mut insert_entry = transaction
+            .prepare(
+                "INSERT INTO search_fts_next(name, path, kind, modified_at)
+                 VALUES (?1, ?2, ?3, NULL)",
+            )
+            .map_err(|error| error.to_string())?;
+        let mut insert_directory = transaction
+            .prepare(
+                "INSERT OR IGNORE INTO search_build_directories(path, root_index)
+                 VALUES (?1, ?2)",
+            )
+            .map_err(|error| error.to_string())?;
+        let mut finish_directory = transaction
+            .prepare(
+                "DELETE FROM search_build_directories
+                 WHERE path = ?1 COLLATE NOCASE",
+            )
+            .map_err(|error| error.to_string())?;
+        let mut start_directory = transaction
+            .prepare(
+                "UPDATE search_build_directories
+                 SET started = 1
+                 WHERE path = ?1 COLLATE NOCASE",
+            )
+            .map_err(|error| error.to_string())?;
+        for (name, path, kind) in records.drain(..) {
+            insert_entry
+                .execute(params![name, path, kind])
+                .map_err(|error| error.to_string())?;
+            next_count = next_count.saturating_add(1);
+        }
+        for (child, root_index) in children.drain(..) {
+            insert_directory
+                .execute(params![child, root_index])
+                .map_err(|error| error.to_string())?;
+        }
+        for directory in started_directories.drain(..) {
+            start_directory
+                .execute([directory])
+                .map_err(|error| error.to_string())?;
+        }
+        for directory in completed_directories.drain(..) {
+            finish_directory
+                .execute([directory])
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    let completed_roots = transaction
+        .query_row(
+            "SELECT MIN(root_index) FROM search_build_directories",
+            [],
+            |row| row.get::<_, Option<usize>>(0),
+        )
+        .map_err(|error| error.to_string())?
+        .unwrap_or(total_roots)
+        .min(total_roots);
+    transaction
+        .execute(
+            "UPDATE search_build_meta
+             SET indexed_items = ?1, completed_roots = ?2,
+                 updated_at = unixepoch()
+             WHERE id = 1",
+            params![next_count, completed_roots],
+        )
+        .map_err(|error| error.to_string())?;
+    transaction.commit().map_err(|error| error.to_string())?;
+    Ok((next_count, completed_roots))
+}
+
+struct ScannedDirectoryChunk {
+    path: String,
+    records: Vec<(String, String, &'static str)>,
+    children: Vec<(String, usize)>,
+    finished: bool,
+}
+
+fn scan_directory(
+    directory_path: &str,
+    root_index: usize,
+    full_disk_root: bool,
+    data_dir: &Path,
+    revision: u64,
+    sender: &mpsc::SyncSender<Result<ScannedDirectoryChunk, String>>,
+) -> Result<(), String> {
+    let mut records = Vec::with_capacity(INDEX_ENTRY_CHUNK);
+    let mut children = Vec::with_capacity(INDEX_ENTRY_CHUNK / 4);
+    if let Ok(entries) = fs::read_dir(directory_path) {
+        for (entry_index, entry) in entries.filter_map(Result::ok).enumerate() {
+            if entry_index % 512 == 0 && index_build_cancelled(revision) {
+                return Err("索引任务已取消".into());
+            }
+            let entry_path = entry.path();
+            if is_index_internal_path(data_dir, &entry_path) {
+                continue;
+            }
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            let is_dir = file_type.is_dir();
+            if !(if full_disk_root {
+                should_descend_full_disk_path(&entry_path, is_dir)
+            } else {
+                should_descend_path(&entry_path, is_dir)
+            }) {
+                continue;
+            }
+            let kind = kind_for_path(&entry_path, is_dir);
+            if kind == "app" && is_noisy_application(&entry_path) {
+                continue;
+            }
+            let displayed_path = display_path(&entry_path);
+            let name = if kind == "app" {
+                application_display_name(&entry_path)
+            } else {
+                entry.file_name().to_string_lossy().to_string()
+            };
+            if !name.is_empty() {
+                records.push((
+                    encode_indexed_name(&name, kind),
+                    displayed_path.clone(),
+                    kind,
+                ));
+            }
+            if is_dir {
+                children.push((displayed_path, root_index));
+            }
+            if records.len().saturating_add(children.len()) >= INDEX_ENTRY_CHUNK {
+                sender
+                    .send(Ok(ScannedDirectoryChunk {
+                        path: directory_path.to_string(),
+                        records: std::mem::take(&mut records),
+                        children: std::mem::take(&mut children),
+                        finished: false,
+                    }))
+                    .map_err(|_| "索引接收线程已停止".to_string())?;
+            }
+        }
+    }
+    sender
+        .send(Ok(ScannedDirectoryChunk {
+            path: directory_path.to_string(),
+            records,
+            children,
+            finished: true,
+        }))
+        .map_err(|_| "索引接收线程已停止".to_string())
+}
+
+fn process_queued_directories(
+    storage: &StorageManager,
+    connection: &mut Connection,
+    queued: &[(String, usize, bool)],
+    full_disk_roots: &[bool],
+    data_dir: &Path,
+    indexed_app_paths: &mut HashSet<String>,
+    indexed_items: usize,
+    initial_completed_roots: usize,
+    total_roots: usize,
+    revision: u64,
+) -> Result<(usize, usize), String> {
+    let mut next_count = indexed_items;
+    // Compatibility with v11 partial-directory checkpoints. Current builds
+    // only persist whole directory groups, so this branch disappears after
+    // the first successful resume.
+    for (directory_path, _, started) in queued {
+        if *started {
+            let prefix = if directory_path.ends_with('\\') || directory_path.ends_with('/') {
+                directory_path.to_string()
+            } else {
+                format!("{directory_path}{}", std::path::MAIN_SEPARATOR)
+            };
+            let _writer = storage.index_write_guard();
+            let transaction = connection
+                .transaction()
+                .map_err(|error| error.to_string())?;
+            let removed = transaction
+                .execute(
+                    "DELETE FROM search_fts_next
+                     WHERE substr(path, 1, ?2) = ?1 COLLATE NOCASE",
+                    params![prefix, prefix.chars().count()],
+                )
+                .map_err(|error| error.to_string())?;
+            transaction
+                .execute(
+                    "DELETE FROM search_build_directories
+                     WHERE path != ?2 COLLATE NOCASE
+                       AND substr(path, 1, ?3) = ?1 COLLATE NOCASE",
+                    params![prefix, directory_path, prefix.chars().count()],
+                )
+                .map_err(|error| error.to_string())?;
+            transaction
+                .execute(
+                    "UPDATE search_build_directories
+                     SET started = 0 WHERE path = ?1 COLLATE NOCASE",
+                    [directory_path],
+                )
+                .map_err(|error| error.to_string())?;
+            transaction.commit().map_err(|error| error.to_string())?;
+            next_count = next_count.saturating_sub(removed);
+        }
+    }
+
+    // The recovery transaction above can remove descendants of an incomplete
+    // directory. Do not dispatch the stale, pre-recovery snapshot: a child
+    // from that snapshot could finish before its parent re-enqueues it, which
+    // would make the child run twice and duplicate its FTS rows.
+    let queued = pending_directory_chunk(connection)?;
+    if queued.is_empty() {
+        return Ok((next_count, initial_completed_roots));
+    }
+    let queued = queued.as_slice();
+
+    let mut records = Vec::with_capacity(INDEX_BATCH_SIZE);
+    let mut children = Vec::with_capacity(INDEX_ENTRY_CHUNK);
+    let mut started_directories = Vec::with_capacity(4);
+    let mut completed_directories = Vec::with_capacity(32);
+    let mut completed_roots = initial_completed_roots;
+    let mut live_items = next_count;
+    let task_cursor = AtomicUsize::new(0);
+    let worker_count = std::thread::available_parallelism()
+        .map(|parallelism| parallelism.get())
+        .unwrap_or(2)
+        .clamp(4, 8)
+        .min(queued.len().max(1));
+
+    std::thread::scope(|scope| -> Result<(), String> {
+        let (sender, receiver) = mpsc::sync_channel(worker_count * 2);
+        for _ in 0..worker_count {
+            let sender = sender.clone();
+            let task_cursor = &task_cursor;
+            scope.spawn(move || {
+                let _priority = BackgroundIndexPriority::begin();
+                loop {
+                    let index = task_cursor.fetch_add(1, Ordering::AcqRel);
+                    let Some((path, root_index, _)) = queued.get(index) else {
+                        break;
+                    };
+                    let full_disk_root = full_disk_roots.get(*root_index).copied().unwrap_or(false);
+                    if let Err(error) = scan_directory(
+                        path,
+                        *root_index,
+                        full_disk_root,
+                        data_dir,
+                        revision,
+                        &sender,
+                    ) {
+                        let _ = sender.send(Err(error));
+                        break;
+                    }
+                }
+            });
+        }
+        drop(sender);
+
+        for result in receiver {
+            let mut scanned = result?;
+            scanned.records.retain(|(_, path, kind)| {
+                if *kind != "app" {
+                    return true;
+                }
+                let key = if cfg!(target_os = "windows") {
+                    path.to_lowercase()
+                } else {
+                    path.clone()
+                };
+                indexed_app_paths.insert(key)
+            });
+            let incoming_size = scanned.records.len().saturating_add(scanned.children.len());
+            let buffered_size = records.len().saturating_add(children.len());
+            if buffered_size > 0 && buffered_size.saturating_add(incoming_size) > INDEX_BATCH_SIZE {
+                (next_count, completed_roots) = commit_directory_batch(
+                    storage,
+                    connection,
+                    &mut records,
+                    &mut children,
+                    &mut started_directories,
+                    &mut completed_directories,
+                    next_count,
+                    total_roots,
+                    revision,
+                )?;
+            }
+            live_items = live_items.saturating_add(scanned.records.len());
+            let current_path = scanned.path.clone();
+            records.append(&mut scanned.records);
+            children.append(&mut scanned.children);
+            if scanned.finished {
+                completed_directories.push(scanned.path);
+            } else {
+                started_directories.push(scanned.path);
+            }
+            update_index_progress(
+                1,
+                live_items.max(next_count),
+                completed_roots,
+                total_roots,
+                Some(current_path.clone()),
+            );
+            if started_directories
+                .len()
+                .saturating_add(completed_directories.len())
+                >= 32
+                || records.len().saturating_add(children.len()) >= INDEX_BATCH_SIZE
+            {
+                (next_count, completed_roots) = commit_directory_batch(
+                    storage,
+                    connection,
+                    &mut records,
+                    &mut children,
+                    &mut started_directories,
+                    &mut completed_directories,
+                    next_count,
+                    total_roots,
+                    revision,
+                )?;
+                update_index_progress(
+                    1,
+                    live_items.max(next_count),
+                    completed_roots,
+                    total_roots,
+                    Some(current_path),
+                );
+            }
+        }
+        Ok(())
+    })?;
+
+    if !records.is_empty()
+        || !children.is_empty()
+        || !started_directories.is_empty()
+        || !completed_directories.is_empty()
+    {
+        (next_count, completed_roots) = commit_directory_batch(
+            storage,
+            connection,
+            &mut records,
+            &mut children,
+            &mut started_directories,
+            &mut completed_directories,
+            next_count,
+            total_roots,
+            revision,
+        )?;
+    }
+    Ok((next_count, completed_roots))
 }
 
 fn rebuild_inner(
@@ -1458,10 +2242,16 @@ fn rebuild_inner(
         roots
     };
     let roots = distinct_roots(roots);
+    let full_disk_roots = roots
+        .iter()
+        .map(|root| root.parent().is_none())
+        .collect::<Vec<_>>();
     let total_roots = roots.len();
     let legacy_staging = storage.data_dir().join("search-index-staging.db");
     if legacy_staging.exists() {
-        fs::remove_file(legacy_staging).map_err(|error| error.to_string())?;
+        // This file belonged to the retired pre-v11 indexer. A locked legacy
+        // artifact must never prevent the current index from starting.
+        let _ = fs::remove_file(legacy_staging);
     }
     let mut index_connection =
         Connection::open(storage.search_database_path()).map_err(|error| error.to_string())?;
@@ -1469,12 +2259,14 @@ fn rebuild_inner(
         .busy_timeout(Duration::from_secs(8))
         .map_err(|error| error.to_string())?;
     let writer = storage.index_write_guard();
+    INDEX_DIRTY_PATHS.lock().clear();
     index_connection
         .execute_batch(
             "
             PRAGMA synchronous = NORMAL;
             PRAGMA temp_store = MEMORY;
-            PRAGMA cache_size = -8192;
+            PRAGMA cache_size = -16384;
+            PRAGMA wal_autocheckpoint = 16384;
             ",
         )
         .map_err(|error| error.to_string())?;
@@ -1487,9 +2279,18 @@ fn rebuild_inner(
             ) AND EXISTS(
                 SELECT 1 FROM search_build_meta
                 WHERE id = 1 AND scope = ?1
+            ) AND EXISTS(
+                SELECT 1 FROM sqlite_master
+                WHERE type = 'table' AND name = 'search_build_directories'
+            ) AND (
+                EXISTS(
+                    SELECT 1 FROM search_build_meta
+                    WHERE id = 1 AND completed_roots >= ?2
+                )
+                OR EXISTS(SELECT 1 FROM search_build_directories)
             )
             ",
-            [&scope],
+            params![scope, total_roots],
             |row| row.get::<_, bool>(0),
         )
         .unwrap_or(false);
@@ -1506,10 +2307,15 @@ fn rebuild_inner(
                     tokenize = 'trigram'
                 );
                 DELETE FROM search_build_meta;
+                DELETE FROM search_build_dirty_paths;
+                DELETE FROM search_build_directories;
                 ",
             )
             .map_err(|error| error.to_string())?;
-        index_connection
+        let transaction = index_connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        transaction
             .execute(
                 "
                 INSERT INTO search_build_meta(
@@ -1519,41 +2325,76 @@ fn rebuild_inner(
                 [&scope],
             )
             .map_err(|error| error.to_string())?;
+        for (root_index, root) in roots.iter().enumerate() {
+            let displayed_path = display_path(root);
+            let is_dir = root.is_dir();
+            let kind = kind_for_path(root, is_dir);
+            let name = root
+                .file_name()
+                .map(|value| value.to_string_lossy().to_string())
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| displayed_path.clone());
+            transaction
+                .execute(
+                    "INSERT INTO search_fts_next(name, path, kind, modified_at)
+                     VALUES (?1, ?2, ?3, NULL)",
+                    params![encode_indexed_name(&name, kind), displayed_path, kind],
+                )
+                .map_err(|error| error.to_string())?;
+            if is_dir {
+                transaction
+                    .execute(
+                        "INSERT OR IGNORE INTO search_build_directories(path, root_index)
+                         VALUES (?1, ?2)",
+                        params![display_path(root), root_index],
+                    )
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+        transaction.commit().map_err(|error| error.to_string())?;
     }
-    let completed_roots = if resumable {
-        index_connection
-            .query_row(
-                "SELECT completed_roots FROM search_build_meta WHERE id = 1",
-                [],
-                |row| row.get::<_, usize>(0),
-            )
-            .unwrap_or(0)
-            .min(total_roots)
-    } else {
-        0
-    };
+    let completed_roots = index_connection
+        .query_row(
+            "SELECT completed_roots FROM search_build_meta WHERE id = 1",
+            [],
+            |row| row.get::<_, usize>(0),
+        )
+        .unwrap_or(0)
+        .min(total_roots);
     // Application discovery is cheap and may change independently of a disk root.
     // Refresh registered application paths one by one. Deleting every app row here
     // would also remove .exe/.lnk entries from roots already completed before a
     // restart, while those roots are intentionally skipped during resume.
-    for app in system_apps {
-        index_connection
-            .execute("DELETE FROM search_fts_next WHERE path = ?1", [&app.path])
+    {
+        let transaction = index_connection
+            .transaction()
             .map_err(|error| error.to_string())?;
+        {
+            let mut delete = transaction
+                .prepare("DELETE FROM search_fts_next WHERE path = ?1")
+                .map_err(|error| error.to_string())?;
+            for app in system_apps {
+                delete
+                    .execute([&app.path])
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+        transaction.commit().map_err(|error| error.to_string())?;
     }
-    // Keep the rows already committed for the interrupted root. On restart the
-    // current root is scanned again and the final compaction removes exact
-    // duplicates. This makes progress immediately searchable and avoids
-    // throwing away a long-running drive scan whenever Atlas exits.
+    // Keep the committed prefix and continue from its durable cursor. Watcher
+    // changes that landed ahead of that cursor were removed above so the
+    // scanner can insert them once in traversal order.
     let mut count = index_connection
         .query_row("SELECT COUNT(*) FROM search_fts_next", [], |row| {
             row.get::<_, usize>(0)
         })
         .unwrap_or(0);
     drop(writer);
+    set_fast_index_fallback_reason(None);
     update_index_progress(1, count, completed_roots, total_roots, None);
     let mut batch = Vec::with_capacity(INDEX_BATCH_SIZE);
     let mut indexed_app_paths = HashSet::new();
+    let data_dir = storage.data_dir();
 
     for app in system_apps {
         if !path_matches_roots(Path::new(&app.path), &requested_roots)
@@ -1575,120 +2416,101 @@ fn rebuild_inner(
         ));
         count += 1;
         if batch.len() >= INDEX_BATCH_SIZE {
-            flush_index_batch(storage, &mut index_connection, &mut batch, resumable)?;
+            flush_index_batch(storage, &mut index_connection, &mut batch, revision)?;
             update_index_progress(1, count, completed_roots, total_roots, None);
             yield_indexer_to_interactive_work(&mut throttle);
-            if INDEX_REVISION.load(Ordering::Acquire) != revision {
+            if index_build_cancelled(revision) {
                 return Err("索引范围已更新，正在切换到最新目录".into());
             }
         }
     }
 
-    for (root_index, root) in roots.into_iter().enumerate().skip(completed_roots) {
-        let current_root = display_path(&root);
-        update_index_progress(
-            1,
-            count,
-            root_index,
-            total_roots,
-            Some(current_root.clone()),
-        );
-        for entry in WalkDir::new(&root)
-            .follow_links(false)
-            .into_iter()
-            .filter_entry(should_descend)
-            .filter_map(Result::ok)
-        {
-            if INDEX_REVISION.load(Ordering::Acquire) != revision {
-                return Err("索引范围已更新，正在切换到最新目录".into());
-            }
-            let path = entry.path();
-            let kind = kind_for_entry(&entry);
-            if kind == "app" && is_noisy_application(path) {
-                continue;
-            }
-            let display_path = display_path(path);
-            let path_key = if cfg!(target_os = "windows") {
-                display_path.to_lowercase()
-            } else {
-                display_path.clone()
-            };
-            if kind == "app" && !indexed_app_paths.insert(path_key) {
-                continue;
-            }
-            let name = if kind == "app" {
-                application_display_name(path)
-            } else {
-                entry.file_name().to_string_lossy().to_string()
-            };
-            if name.is_empty() {
-                continue;
-            }
-            // WalkDir already resolved the file type. Avoid another metadata
-            // syscall for every item: modification time is optional in the UI,
-            // while stat-ing millions of paths dominates a full-disk rebuild.
-            batch.push((encode_indexed_name(&name, kind), display_path, kind));
-            count += 1;
-            if batch.len() >= INDEX_BATCH_SIZE {
-                flush_index_batch(storage, &mut index_connection, &mut batch, resumable)?;
-                update_index_progress(
-                    1,
-                    count,
-                    root_index,
-                    total_roots,
-                    Some(current_root.clone()),
-                );
-                yield_indexer_to_interactive_work(&mut throttle);
-                if INDEX_REVISION.load(Ordering::Acquire) != revision {
-                    return Err("索引范围已更新，正在切换到最新目录".into());
+    flush_index_batch(storage, &mut index_connection, &mut batch, revision)?;
+    count = index_connection
+        .query_row("SELECT COUNT(*) FROM search_fts_next", [], |row| row.get(0))
+        .unwrap_or(count);
+
+    let mut completed = completed_roots;
+    #[cfg(all(target_os = "windows", not(test)))]
+    {
+        if let Some(volumes) = fast_ntfs_volumes_for_build(&roots, completed_roots, total_roots) {
+            set_fast_index_fallback_reason(None);
+            match try_fast_ntfs_index(
+                storage,
+                &mut index_connection,
+                &volumes,
+                &data_dir,
+                &mut indexed_app_paths,
+                &system_apps,
+                total_roots,
+                revision,
+            ) {
+                Ok(indexed) => {
+                    count = indexed;
+                    completed = total_roots;
+                    update_index_progress(1, count, completed, total_roots, None);
+                }
+                Err(error) => {
+                    eprintln!("NTFS MFT fast index unavailable; using directory fallback: {error}");
+                    set_fast_index_fallback_reason(Some(error));
+                    update_index_progress(1, count, completed, total_roots, None);
                 }
             }
         }
-        flush_index_batch(storage, &mut index_connection, &mut batch, resumable)?;
-        {
-            let _writer = storage.index_write_guard();
-            index_connection
-                .execute(
-                    "
-                    UPDATE search_build_meta
-                    SET completed_roots = ?1, indexed_items = ?2, updated_at = unixepoch()
-                    WHERE id = 1
-                    ",
-                    params![root_index + 1, count],
-                )
-                .map_err(|error| error.to_string())?;
-        }
-        update_index_progress(1, count, root_index + 1, total_roots, None);
     }
-    flush_index_batch(storage, &mut index_connection, &mut batch, resumable)?;
-    if INDEX_REVISION.load(Ordering::Acquire) != revision {
+    loop {
+        if index_build_cancelled(revision) {
+            return Err("索引范围已更新，正在切换到最新目录".into());
+        }
+        let queued = pending_directory_chunk(&index_connection)?;
+        if queued.is_empty() {
+            break;
+        }
+        let active_root_index = queued[0].1.min(total_roots.saturating_sub(1));
+        let current_root = roots
+            .get(active_root_index)
+            .map(|root| display_path(root))
+            .unwrap_or_default();
+        update_index_progress(1, count, completed, total_roots, Some(current_root.clone()));
+        (count, completed) = process_queued_directories(
+            storage,
+            &mut index_connection,
+            &queued,
+            &full_disk_roots,
+            &data_dir,
+            &mut indexed_app_paths,
+            count,
+            completed,
+            total_roots,
+            revision,
+        )?;
+        update_index_progress(1, count, completed, total_roots, Some(current_root));
+        yield_indexer_to_interactive_work(&mut throttle);
+    }
+    if index_build_cancelled(revision) {
         return Err("索引范围已更新，正在切换到最新目录".into());
     }
+    update_index_progress(6, count, total_roots, total_roots, None);
     let _writer = storage.index_write_guard();
     let transaction = index_connection
         .transaction()
         .map_err(|error| error.to_string())?;
+    let mut dirty_paths = std::mem::take(&mut *INDEX_DIRTY_PATHS.lock());
+    {
+        let mut statement = transaction
+            .prepare("SELECT path FROM search_build_dirty_paths")
+            .map_err(|error| error.to_string())?;
+        let persisted = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?;
+        dirty_paths.extend(persisted.filter_map(Result::ok).map(PathBuf::from));
+    }
+    reconcile_dirty_paths(&transaction, dirty_paths)?;
     transaction
         .execute_batch(
             "
-            DROP TABLE IF EXISTS search_fts_compact;
-            CREATE VIRTUAL TABLE search_fts_compact USING fts5(
-                name,
-                path UNINDEXED,
-                kind UNINDEXED,
-                modified_at UNINDEXED,
-                tokenize = 'trigram'
-            );
-            INSERT INTO search_fts_compact(name, path, kind, modified_at)
-            SELECT group_concat(name, ' '), path, kind, MAX(modified_at)
-            FROM (
-                SELECT DISTINCT name, path, kind, modified_at
-                FROM search_fts_next
-            )
-            GROUP BY path, kind;
             DROP TABLE search_fts;
-            DROP TABLE search_fts_next;
-            ALTER TABLE search_fts_compact RENAME TO search_fts;
+            ALTER TABLE search_fts_next RENAME TO search_fts;
             ",
         )
         .map_err(|error| error.to_string())?;
@@ -1708,13 +2530,19 @@ fn rebuild_inner(
     transaction
         .execute("DELETE FROM search_build_meta", [])
         .map_err(|error| error.to_string())?;
+    transaction
+        .execute("DELETE FROM search_build_dirty_paths", [])
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute("DELETE FROM search_build_directories", [])
+        .map_err(|error| error.to_string())?;
     transaction.commit().map_err(|error| error.to_string())?;
-    let compacted_count = index_connection
+    let indexed_count = index_connection
         .query_row("SELECT COUNT(*) FROM search_fts", [], |row| {
             row.get::<_, usize>(0)
         })
         .unwrap_or(count);
-    Ok(compacted_count)
+    Ok(indexed_count)
 }
 
 pub fn status() -> &'static str {
@@ -1738,6 +2566,9 @@ pub fn progress() -> IndexProgress {
         1 => "scanning",
         2 => "complete",
         3 => "failed",
+        4 => "authorizing",
+        5 => "mft",
+        6 => "finalizing",
         _ => "idle",
     };
     IndexProgress {
@@ -1747,11 +2578,24 @@ pub fn progress() -> IndexProgress {
         completed_roots: state.completed_roots,
         total_roots: state.total_roots,
         current_root: state.current_root.clone(),
+        fallback_reason: state.fallback_reason.clone(),
     }
 }
 
 pub fn has_index(storage: &StorageManager, requested_roots: &[String]) -> bool {
     let expected_scope = scope_key(requested_roots);
+    let reusable_full_scope = if !include_application_roots(requested_roots) {
+        let disk_roots = default_roots()
+            .iter()
+            .map(|root| display_path(root))
+            .collect::<Vec<_>>();
+        requested_roots
+            .iter()
+            .all(|root| path_matches_roots(Path::new(root), &disk_roots))
+            .then(|| scope_key(&["*".to_string()]))
+    } else {
+        None
+    };
     let exists = storage
         .with_search_read_connection(|connection| {
             connection
@@ -1765,10 +2609,12 @@ pub fn has_index(storage: &StorageManager, requested_roots: &[String]) -> bool {
                        )
                        AND EXISTS(
                            SELECT 1 FROM search_meta
-                           WHERE id = 1 AND scope = ?2 AND complete = 1
+                           WHERE id = 1
+                             AND complete = 1
+                             AND (scope = ?2 OR (?3 IS NOT NULL AND scope = ?3))
                        )
                     ",
-                    params![r"\\?\", expected_scope],
+                    params![r"\\?\", expected_scope, reusable_full_scope],
                     |row| row.get::<_, bool>(0),
                 )
                 .map_err(|error| error.to_string())
@@ -1780,6 +2626,24 @@ pub fn has_index(storage: &StorageManager, requested_roots: &[String]) -> bool {
         state.phase = 2;
     }
     exists
+}
+
+pub fn has_full_disk_index(storage: &StorageManager) -> bool {
+    let full_scope = scope_key(&["*".to_string()]);
+    storage
+        .with_search_read_connection(|connection| {
+            connection
+                .query_row(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM search_meta
+                        WHERE id = 1 AND scope = ?1 AND complete = 1
+                    )",
+                    [full_scope],
+                    |row| row.get::<_, bool>(0),
+                )
+                .map_err(|error| error.to_string())
+        })
+        .unwrap_or(false)
 }
 
 pub fn has_partial_index(storage: &StorageManager, requested_roots: &[String]) -> bool {

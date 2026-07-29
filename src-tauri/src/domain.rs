@@ -22,6 +22,7 @@ pub fn runtime_settings_changed(previous: &serde_json::Value, next: &serde_json:
         "/settings/shortcuts/search",
         "/settings/shortcuts/prompts",
         "/settings/shortcuts/clipboard",
+        "/settings/indexSetup",
     ]
     .iter()
     .any(|pointer| runtime_value(previous, pointer) != runtime_value(next, pointer))

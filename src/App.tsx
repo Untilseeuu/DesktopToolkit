@@ -78,6 +78,7 @@ import {
   normalizeFolderShortcut,
   normalizeFolderTags,
 } from "./folderFavorites";
+import { installCustomFont, installTheme } from "./appearance";
 import {
   activateClipboardEntry,
   bindNativeSearchShortcut,
@@ -94,10 +95,14 @@ import {
   launchStartupItems,
   listStartupSceneMonitors,
   loadAppearanceAsset,
+  openRuntimeLog,
   openTarget,
+  recordRuntimeEvent,
   restoreStartupSceneLayout,
+  rebuildSearchIndex,
   runCommandTask,
   searchNative,
+  saveSnapshot,
 } from "./native";
 import { SearchQueryInput } from "./SearchQueryInput";
 import { SearchFilterControls } from "./SearchFilterControls";
@@ -208,6 +213,18 @@ export default function App() {
         description={model.snapshot.settings.branding.appDescription}
         confirmOnClose={model.snapshot.settings.confirmOnClose}
         onDisableCloseReminder={() => model.setSetting("confirmOnClose", false)}
+        onBeforeQuit={async (disableReminder) => {
+          const snapshot = disableReminder
+            ? {
+                ...model.snapshot,
+                settings: {
+                  ...model.snapshot.settings,
+                  confirmOnClose: false,
+                },
+              }
+            : model.snapshot;
+          await saveSnapshot(snapshot);
+        }}
       />
       <MainApp model={model} />
     </div>
@@ -265,51 +282,36 @@ function MainApp({ model }: { model: ToolkitModel }) {
   }, [branding.avatarPath, branding.backgroundPath, branding.logoPath]);
 
   useEffect(() => {
-    const root = document.documentElement;
-    const colors = customTheme?.colors;
-    root.dataset.theme = customTheme?.mode ?? model.snapshot.settings.theme;
-    const variables = {
-      "--paper": colors?.paper,
-      "--panel": colors?.panel,
-      "--card": colors?.card,
-      "--ink": colors?.ink,
-      "--muted": colors?.muted,
-      "--vermillion": colors?.accent,
-      "--moss": colors?.moss,
-    };
-    Object.entries(variables).forEach(([key, value]) => {
-      if (value) root.style.setProperty(key, value);
-      else root.style.removeProperty(key);
-    });
-    return () => {
-      Object.keys(variables).forEach((key) => root.style.removeProperty(key));
-    };
+    const cleanup = installTheme(customTheme, model.snapshot.settings.theme);
+    recordRuntimeEvent(
+      "appearance.theme.apply",
+      "success",
+      customTheme
+        ? `theme_id=${customTheme.id} mode=${customTheme.mode}`
+        : `builtin_mode=${model.snapshot.settings.theme}`,
+    );
+    return cleanup;
   }, [customTheme, model.snapshot.settings.theme]);
 
   useEffect(() => {
-    const root = document.documentElement;
     if (!customFont) {
-      root.style.removeProperty("--custom-font");
-      delete root.dataset.customFont;
-      return;
+      recordRuntimeEvent(
+        "appearance.font.apply",
+        "success",
+        `builtin=${model.snapshot.settings.fontFamily}`,
+      );
     }
-    let active = true;
-    void loadAppearanceAsset(customFont.path).then((source) => {
-      if (!active) return;
-      let style = document.getElementById("atlas-custom-font") as HTMLStyleElement | null;
-      if (!style) {
-        style = document.createElement("style");
-        style.id = "atlas-custom-font";
-        document.head.append(style);
+    return installCustomFont(customFont?.path, (result, detail) => {
+      recordRuntimeEvent(
+        "appearance.font.apply",
+        result,
+        `font_id=${customFont?.id ?? "builtin"} ${detail}`,
+      );
+      if (result === "failed") {
+        setToast("字体加载失败，请查看运行日志或重新导入字体");
       }
-      style.textContent = `@font-face{font-family:"Atlas Custom";src:url("${source}")}`;
-      root.style.setProperty("--custom-font", '"Atlas Custom"');
-      root.dataset.customFont = "true";
     });
-    return () => {
-      active = false;
-    };
-  }, [customFont]);
+  }, [customFont, model.snapshot.settings.fontFamily]);
 
   useEffect(() => {
     const showSearch = () => setActiveNav("search");
@@ -342,6 +344,36 @@ function MainApp({ model }: { model: ToolkitModel }) {
     };
   }, []);
 
+  const previousIndexStatus = useRef<string | null>(null);
+  useEffect(() => {
+    const previous = previousIndexStatus.current;
+    previousIndexStatus.current = indexProgress?.status ?? null;
+    if (
+      previous !== "indexing" ||
+      indexProgress?.status !== "ready" ||
+      model.snapshot.settings.indexSetup === "ready"
+    ) {
+      return;
+    }
+    model.setSetting("indexSetup", "ready");
+    const scopeName = model.snapshot.settings.indexRoots.includes("*")
+      ? "全盘索引"
+      : "目录索引";
+    setToast(
+      `${scopeName}已经建立，共 ${indexProgress.indexedItems.toLocaleString()} 项`,
+    );
+    recordRuntimeEvent(
+      "search.index.complete",
+      "success",
+      `scope=${scopeName} indexed_items=${indexProgress.indexedItems}`,
+    );
+  }, [
+    indexProgress?.indexedItems,
+    indexProgress?.status,
+    model.snapshot.settings.indexRoots,
+    model.snapshot.settings.indexSetup,
+  ]);
+
   useEffect(() => {
     if (!toast) return;
     const timer = window.setTimeout(() => setToast(null), 2200);
@@ -370,6 +402,39 @@ function MainApp({ model }: { model: ToolkitModel }) {
   useEffect(() => {
     if (mainPanelRef.current) mainPanelRef.current.scrollTop = 0;
   }, [activeNav]);
+
+  const startIndexBuild = async (roots: string[]) => {
+    model.setSetting("indexRoots", roots);
+    model.setSetting("indexSetup", "pending");
+    const buildingSnapshot = {
+      ...model.snapshot,
+      settings: {
+        ...model.snapshot.settings,
+        indexRoots: roots,
+        indexSetup: "pending" as const,
+      },
+    };
+    try {
+      // Persist the selected scope before scanning so an interrupted first-run
+      // build resumes the same scope instead of falling back to all disks.
+      await saveSnapshot(buildingSnapshot);
+      const count = await rebuildSearchIndex(roots);
+      model.setSetting("indexSetup", "ready");
+      await saveSnapshot({
+        ...buildingSnapshot,
+        settings: { ...buildingSnapshot.settings, indexSetup: "ready" },
+      });
+      setToast(`搜索索引已建立，共 ${count.toLocaleString()} 项`);
+      setIndexProgress(await getSearchIndexProgress());
+    } catch (error) {
+      model.setSetting("indexSetup", "deferred");
+      await saveSnapshot({
+        ...buildingSnapshot,
+        settings: { ...buildingSnapshot.settings, indexSetup: "deferred" },
+      }).catch(() => undefined);
+      setToast(`索引建立失败：${String(error)}`);
+    }
+  };
 
   if (!model.hydrated) {
     return (
@@ -403,6 +468,7 @@ function MainApp({ model }: { model: ToolkitModel }) {
             model={model}
             notify={setToast}
             indexProgress={indexProgress}
+            onStartIndex={() => void startIndexBuild(model.snapshot.settings.indexRoots)}
           />
         );
       case "prompts":
@@ -414,7 +480,14 @@ function MainApp({ model }: { model: ToolkitModel }) {
       case "folders":
         return <FolderFavoritesPage model={model} notify={setToast} />;
       case "settings":
-        return <EnhancedSettingsPage model={model} notify={setToast} />;
+        return (
+          <EnhancedSettingsPage
+            model={model}
+            notify={setToast}
+            indexProgress={indexProgress}
+            onStartIndex={(roots) => void startIndexBuild(roots)}
+          />
+        );
       default:
         return <OverviewPage model={model} navigate={setActiveNav} />;
     }
@@ -513,50 +586,72 @@ type ToolkitModel = ReturnType<typeof useToolkit>;
 export function IndexProgressBanner({ progress }: { progress: IndexProgress }) {
   const [collapsed, setCollapsed] = useState(false);
   const max = Math.max(progress.totalRoots, 1);
+  const fastNtfs = progress.phase === "authorizing" || progress.phase === "mft";
+  const finalizing = progress.phase === "finalizing";
+  const activityOnly = fastNtfs || finalizing;
   if (collapsed) {
     return (
-      <aside
-        className="index-progress-banner collapsed"
-        aria-live="polite"
-      >
+      <aside className="index-progress-banner collapsed" role="status" aria-label="后台索引进度">
         <span className="index-progress-pulse" aria-hidden="true" />
         <strong>索引中</strong>
-        <button
-          type="button"
-          aria-label="展开索引详情"
-          onClick={() => setCollapsed(false)}
-        >
+        <button type="button" aria-label="展开索引详情" onClick={() => setCollapsed(false)}>
           <ChevronUp size={14} />
         </button>
       </aside>
     );
   }
   return (
-    <aside className="index-progress-banner" aria-live="polite">
+    <aside className="index-progress-banner" role="status" aria-label="后台索引进度">
       <div>
-        <strong>正在建立全盘索引</strong>
+        <strong>
+          {progress.phase === "authorizing"
+            ? "正在等待管理员授权"
+            : finalizing
+              ? "正在整理搜索索引"
+            : fastNtfs
+              ? "正在建立 NTFS 快速索引"
+              : "正在建立全盘索引"}
+        </strong>
         <small>
           {progress.currentRoot ? `${progress.currentRoot} · ` : ""}
           已发现 {progress.indexedItems.toLocaleString("zh-CN")} 项
         </small>
+        {progress.fallbackReason ? (
+          <small className="index-progress-fallback">
+            快速索引未生效：{progress.fallbackReason}，已切换兼容扫描
+          </small>
+        ) : null}
       </div>
-      <progress
-        aria-label="全盘索引进度"
-        max={max}
-        {...(progress.completedRoots > 0
-          ? { value: progress.completedRoots }
-          : {})}
-      />
+      {activityOnly ? (
+        <div className="index-progress-activity" aria-label="快速索引正在运行">
+          <span className="index-progress-pulse" aria-hidden="true" />
+          <span>
+            {progress.phase === "authorizing"
+              ? "等待系统确认"
+              : finalizing
+                ? "正在写入索引元数据"
+                : "持续读取中"}
+          </span>
+        </div>
+      ) : (
+        <progress
+          aria-label="全盘索引进度"
+          max={max}
+          {...(progress.completedRoots > 0 ? { value: progress.completedRoots } : {})}
+        />
+      )}
       <span>
-        {progress.completedRoots > 0
+        {finalizing
+          ? "文件读取已完成，正在安全切换索引"
+          : fastNtfs
+          ? progress.phase === "authorizing"
+            ? "请在系统提示中允许访问 NTFS 文件表"
+            : `正在读取磁盘文件表，无需逐个扫描目录`
+          : progress.completedRoots > 0
           ? `${progress.completedRoots} / ${progress.totalRoots} 个位置`
           : `正在扫描第 ${Math.min(1, progress.totalRoots)} / ${progress.totalRoots} 个位置`}
       </span>
-      <button
-        type="button"
-        aria-label="隐藏索引详情"
-        onClick={() => setCollapsed(true)}
-      >
+      <button type="button" aria-label="隐藏索引详情" onClick={() => setCollapsed(true)}>
         <ChevronDown size={15} />
       </button>
     </aside>
@@ -1174,10 +1269,12 @@ function SearchPage({
   model,
   notify,
   indexProgress,
+  onStartIndex,
 }: {
   model: ToolkitModel;
   notify: (message: string) => void;
   indexProgress: IndexProgress | null;
+  onStartIndex: () => void;
 }) {
   const enabled = model.snapshot.tools.search.enabled;
   const filters = model.snapshot.settings.searchFilters;
@@ -1263,6 +1360,18 @@ function SearchPage({
         }
       />
       <section className="search-stage">
+        {model.snapshot.settings.indexSetup === "deferred" ? (
+          <div className="index-deferred-notice">
+            <span><FileSearch size={20} /></span>
+            <div>
+              <strong>尚未建立文件索引</strong>
+              <small>快捷链接和应用仍可搜索；建立索引后才能完整搜索文件与文件夹。</small>
+            </div>
+            <button className="button secondary" onClick={onStartIndex}>
+              现在建立索引
+            </button>
+          </div>
+        ) : null}
         <div className="search-box">
           <Search size={22} />
           <SearchQueryInput
@@ -2617,12 +2726,23 @@ function BootScenePicker({
 function EnhancedSettingsPage({
   model,
   notify,
+  indexProgress,
+  onStartIndex,
 }: {
   model: ToolkitModel;
   notify: (message: string) => void;
+  indexProgress: IndexProgress | null;
+  onStartIndex: (roots: string[]) => void;
 }) {
+  type PendingIndexScope = {
+    roots: string[];
+    title: string;
+    description: string;
+  };
   const [linkDraft, setLinkDraft] = useState<QuickLink | null>(null);
   const [personalizationOpen, setPersonalizationOpen] = useState(false);
+  const [pendingIndexScope, setPendingIndexScope] =
+    useState<PendingIndexScope | null>(null);
   const [excludedAppsText, setExcludedAppsText] = useState(
     model.snapshot.settings.clipboardExcludedApps.join(", "),
   );
@@ -2641,6 +2761,44 @@ function EnhancedSettingsPage({
     setRetentionDaysText(String(model.snapshot.settings.clipboardRetentionDays));
   }, [model.snapshot.settings.clipboardRetentionDays]);
 
+  const normalizeIndexRoots = (roots: string[]) => {
+    if (roots.includes("*")) return ["*"];
+    return Array.from(
+      new Set(
+        roots.map((root) =>
+          root.replaceAll("/", "\\").replace(/\\+$/, "").toLocaleLowerCase(),
+        ),
+      ),
+    ).sort();
+  };
+  const sameIndexScope = (left: string[], right: string[]) =>
+    JSON.stringify(normalizeIndexRoots(left)) === JSON.stringify(normalizeIndexRoots(right));
+  const indexBuilding = indexProgress?.status === "indexing";
+  const indexReady =
+    model.snapshot.settings.indexSetup === "ready" &&
+    !indexBuilding &&
+    indexProgress?.status !== "failed";
+
+  const requestIndexScope = (
+    roots: string[],
+    title: string,
+    description: string,
+    alreadyBuiltMessage: string,
+  ) => {
+    if (
+      indexBuilding &&
+      sameIndexScope(roots, model.snapshot.settings.indexRoots)
+    ) {
+      notify(`${roots.includes("*") ? "全盘" : "当前目录"}索引正在建立，请稍候`);
+      return;
+    }
+    if (indexReady && sameIndexScope(roots, model.snapshot.settings.indexRoots)) {
+      notify(alreadyBuiltMessage);
+      return;
+    }
+    setPendingIndexScope({ roots, title, description });
+  };
+
   const addRoot = async () => {
     const root = await chooseDirectory();
     if (!root) return;
@@ -2650,8 +2808,12 @@ function EnhancedSettingsPage({
         root,
       ]),
     );
-    model.addIndexRoot(root);
-    notify(`索引范围已更新，将只扫描 ${roots.length} 个指定位置`);
+    requestIndexScope(
+      roots,
+      "建立指定目录索引？",
+      `确认后将把索引范围切换为 ${roots.length} 个指定目录，并重新建立可搜索的文件列表。`,
+      "该目录已在当前索引范围中，索引已经建立",
+    );
   };
 
   const updateShortcut = (
@@ -2710,7 +2872,26 @@ function EnhancedSettingsPage({
         colors?: Record<string, string>;
       };
       const required = ["paper", "panel", "card", "ink", "muted", "accent", "moss"];
-      if (!parsed.name || !parsed.colors || required.some((key) => !/^#[0-9a-f]{6}$/i.test(parsed.colors?.[key] ?? ""))) {
+      const optional = [
+        "sidebar",
+        "sidebarActive",
+        "sidebarInk",
+        "sidebarMuted",
+        "line",
+        "lineStrong",
+        "brandSurface",
+        "brandInk",
+      ];
+      if (
+        !parsed.name ||
+        !parsed.colors ||
+        required.some((key) => !/^#[0-9a-f]{6}$/i.test(parsed.colors?.[key] ?? "")) ||
+        optional.some(
+          (key) =>
+            parsed.colors?.[key] !== undefined &&
+            !/^#[0-9a-f]{6}$/i.test(parsed.colors[key]),
+        )
+      ) {
         throw new Error("主题需要名称及 paper、panel、card、ink、muted、accent、moss 七个十六进制颜色");
       }
       const theme = {
@@ -2721,8 +2902,14 @@ function EnhancedSettingsPage({
       };
       model.setSetting("customThemes", [...model.snapshot.settings.customThemes, theme]);
       model.setSetting("activeCustomThemeId", theme.id);
+      recordRuntimeEvent(
+        "appearance.theme.import",
+        "success",
+        `theme_id=${theme.id} mode=${theme.mode}`,
+      );
       notify("主题已导入并启用");
     } catch (error) {
+      recordRuntimeEvent("appearance.theme.import", "failed", String(error));
       notify(`主题导入失败：${String(error)}`);
     }
   };
@@ -2747,6 +2934,25 @@ function EnhancedSettingsPage({
               <code>{model.snapshot.settings.dataDirectory}</code>
               <small>存储位置跟随软件安装目录</small>
             </div>
+          </div>
+          <div className="setting-row">
+            <div>
+              <strong>运行日志</strong>
+              <small>
+                记录功能调用、耗时、执行结果和错误；日志保存在当前 data\logs 目录。
+              </small>
+            </div>
+            <button
+              type="button"
+              className="button secondary"
+              onClick={() =>
+                void openRuntimeLog().catch((error) =>
+                  notify(`打开运行日志失败：${String(error)}`),
+                )
+              }
+            >
+              <FileText size={16} /> 查看日志
+            </button>
           </div>
         </section>
 
@@ -3154,7 +3360,10 @@ function EnhancedSettingsPage({
                 </section>
               </div>
               <div className="personalization-footer">
-                <small>默认字体不可删除。主题 JSON 中需提供 name、mode 和 colors。</small>
+                <small>
+                  默认字体不可删除。主题还可设置 sidebar、sidebarActive、sidebarInk、
+                  sidebarMuted、line、brandSurface 等颜色。
+                </small>
                 <button
                   type="button"
                   className="button ghost"
@@ -3204,14 +3413,37 @@ function EnhancedSettingsPage({
                   ? "所有可用磁盘"
                   : model.snapshot.settings.indexRoots.join("、")}
               </small>
+              <span
+                className={`index-scope-status ${
+                  indexBuilding ? "building" : indexReady ? "ready" : "missing"
+                }`}
+              >
+                {indexBuilding
+                  ? "正在建立索引"
+                  : indexReady
+                    ? "索引已建立"
+                    : "未建立索引"}
+              </span>
             </div>
             <div className="setting-actions">
               <button
+                className="button primary"
+                disabled={indexBuilding}
+                onClick={() => onStartIndex(model.snapshot.settings.indexRoots)}
+              >
+                <FileSearch size={16} />
+                {indexReady ? "重建索引" : "建立索引"}
+              </button>
+              <button
                 className="button secondary"
-                onClick={() => {
-                  model.setSetting("indexRoots", ["*"]);
-                  notify("索引范围已更新为所有可用磁盘");
-                }}
+                onClick={() =>
+                  requestIndexScope(
+                    ["*"],
+                    "建立全部磁盘索引？",
+                    "确认后将索引电脑上的所有可用磁盘，并替换当前索引范围。建立期间仍可继续使用其他工具。",
+                    "当前全盘索引已经建立，无需重复建立",
+                  )
+                }
               >
                 <HardDrive size={16} /> 全部磁盘
               </button>
@@ -3325,6 +3557,37 @@ function EnhancedSettingsPage({
           </div>
         </section>
       </div>
+      {pendingIndexScope ? (
+        <div className="modal-backdrop">
+          <section
+            className="confirm-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="confirm-index-scope-title"
+          >
+            <span className="confirm-dialog-icon"><FileSearch size={20} /></span>
+            <div>
+              <h2 id="confirm-index-scope-title">{pendingIndexScope.title}</h2>
+              <p>{pendingIndexScope.description}</p>
+            </div>
+            <footer>
+              <button className="button ghost" onClick={() => setPendingIndexScope(null)}>
+                取消
+              </button>
+              <button
+                className="button primary"
+                onClick={() => {
+                  const roots = pendingIndexScope.roots;
+                  setPendingIndexScope(null);
+                  onStartIndex(roots);
+                }}
+              >
+                确认建立
+              </button>
+            </footer>
+          </section>
+        </div>
+      ) : null}
     </>
   );
 }

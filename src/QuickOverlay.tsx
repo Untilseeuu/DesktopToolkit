@@ -1,6 +1,7 @@
 import { Clipboard, FileText, Image as ImageIcon, Search, Sparkles, Trash2, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { ResultGlyph } from "./components";
+import { installCustomFont, installTheme } from "./appearance";
 import { SearchQueryInput } from "./SearchQueryInput";
 import { SearchFilterControls } from "./SearchFilterControls";
 import {
@@ -61,16 +62,50 @@ export default function QuickOverlay({ mode: initialMode }: { mode: OverlayMode 
   const pendingClipboardHistory = useRef<ClipboardEntry[] | null>(null);
   const meta = modeMeta[mode];
   const Icon = meta.icon;
+  const customFont = snapshot?.settings.customFonts.find(
+    (font) => font.id === snapshot.settings.activeCustomFontId,
+  );
+  const customTheme = snapshot?.settings.customThemes.find(
+    (theme) => theme.id === snapshot.settings.activeCustomThemeId,
+  );
+
+  useEffect(() => installCustomFont(customFont?.path), [customFont]);
+  useEffect(() => {
+    if (!snapshot) return;
+    const root = document.documentElement;
+    root.dataset.font = snapshot.settings.fontFamily;
+    root.style.setProperty("--font-scale", String(snapshot.settings.fontScale));
+    const cleanup = installTheme(customTheme, snapshot.settings.theme);
+    return () => {
+      cleanup();
+      root.style.removeProperty("--font-scale");
+    };
+  }, [
+    customTheme,
+    snapshot?.settings.fontFamily,
+    snapshot?.settings.fontScale,
+    snapshot?.settings.theme,
+  ]);
 
   useEffect(() => {
     document.documentElement.dataset.overlay = "true";
     let disposed = false;
     let snapshotRetryTimer: number | undefined;
     let snapshotRetryDelay = 120;
+    const loadLatestSnapshot = () =>
+      Promise.race([
+        loadSnapshot(),
+        new Promise<never>((_, reject) => {
+          window.setTimeout(
+            () => reject(new Error("snapshot read timed out")),
+            650,
+          );
+        }),
+      ]);
     const refreshSnapshot = () => {
       const requestId = ++snapshotRequestSequence.current;
       const revisionBeforeRead = clipboardRevision.current;
-      void loadSnapshot()
+      void loadLatestSnapshot()
         .then((stored) => {
           if (
             !stored ||
@@ -346,7 +381,15 @@ export default function QuickOverlay({ mode: initialMode }: { mode: OverlayMode 
           onChange={updateFilters}
         />
       ) : null}
-      <section className="quick-results">
+      <section
+        className={`quick-results ${
+          snapshot &&
+          ((mode === "prompts" && !displayedPrompts.length) ||
+            (mode === "clipboard" && !displayedClipboard.length))
+            ? "is-empty"
+            : ""
+        }`}
+      >
         {!snapshot && mode !== "search" ? (
           <div className="quick-empty">正在同步最新内容…</div>
         ) : null}

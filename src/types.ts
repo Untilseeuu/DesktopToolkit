@@ -92,11 +92,19 @@ export interface SearchFilters {
 
 export interface IndexProgress {
   status: "idle" | "indexing" | "ready" | "failed";
-  phase: "idle" | "scanning" | "complete" | "failed";
+  phase:
+    | "idle"
+    | "authorizing"
+    | "mft"
+    | "scanning"
+    | "finalizing"
+    | "complete"
+    | "failed";
   indexedItems: number;
   completedRoots: number;
   totalRoots: number;
   currentRoot?: string;
+  fallbackReason?: string;
 }
 
 export interface ClipboardEntry {
@@ -162,6 +170,14 @@ export interface CustomTheme {
     muted: string;
     accent: string;
     moss: string;
+    sidebar?: string;
+    sidebarActive?: string;
+    sidebarInk?: string;
+    sidebarMuted?: string;
+    line?: string;
+    lineStrong?: string;
+    brandSurface?: string;
+    brandInk?: string;
   };
 }
 
@@ -175,6 +191,7 @@ export interface AppSettings {
     clipboard: string;
   };
   dataDirectory: string;
+  indexSetup: "pending" | "deferred" | "ready";
   indexRoots: string[];
   excludedPatterns: string[];
   searchFilters: SearchFilters;
