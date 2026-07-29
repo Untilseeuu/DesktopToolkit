@@ -6,8 +6,15 @@ import mainCapability from "../src-tauri/capabilities/default.json";
 import WindowChrome from "./WindowChrome";
 import stylesheet from "./styles.css?inline";
 
-const { closeRequestedHandler, quitApplication, windowActions } = vi.hoisted(() => ({
+const { closeRequestedHandler, getSearchIndexProgress, quitApplication, windowActions } = vi.hoisted(() => ({
   closeRequestedHandler: { current: undefined as undefined | (() => void) },
+  getSearchIndexProgress: vi.fn(async () => ({
+    status: "ready",
+    phase: "complete",
+    indexedItems: 1,
+    completedRoots: 1,
+    totalRoots: 1,
+  })),
   quitApplication: vi.fn(async () => undefined),
   windowActions: {
     minimize: vi.fn(async () => undefined),
@@ -21,6 +28,7 @@ vi.mock("@tauri-apps/api/window", () => ({
 }));
 
 vi.mock("./native", () => ({
+  getSearchIndexProgress,
   quitApplication,
 }));
 
@@ -37,6 +45,14 @@ describe("custom desktop window chrome", () => {
   beforeEach(() => {
     Object.values(windowActions).forEach((action) => action.mockClear());
     quitApplication.mockClear();
+    getSearchIndexProgress.mockClear();
+    getSearchIndexProgress.mockResolvedValue({
+      status: "ready",
+      phase: "complete",
+      indexedItems: 1,
+      completedRoots: 1,
+      totalRoots: 1,
+    });
     closeRequestedHandler.current = undefined;
   });
 
@@ -94,7 +110,9 @@ describe("custom desktop window chrome", () => {
     );
 
     await user.click(screen.getByRole("button", { name: "关闭" }));
-    expect(screen.getByRole("dialog", { name: "确认关闭 Atlas" })).toBeInTheDocument();
+    expect(
+      await screen.findByRole("dialog", { name: "确认关闭 Atlas" }),
+    ).toBeInTheDocument();
     await user.click(screen.getByRole("checkbox", { name: "以后关闭时不再提醒" }));
     await user.click(screen.getByRole("button", { name: "确认关闭" }));
 
@@ -113,7 +131,9 @@ describe("custom desktop window chrome", () => {
 
     act(() => closeRequestedHandler.current?.());
 
-    expect(screen.getByRole("dialog", { name: "确认关闭 Atlas" })).toBeInTheDocument();
+    expect(
+      await screen.findByRole("dialog", { name: "确认关闭 Atlas" }),
+    ).toBeInTheDocument();
     expect(quitApplication).not.toHaveBeenCalled();
     await user.click(screen.getByRole("button", { name: "确认关闭" }));
     expect(quitApplication).toHaveBeenCalledOnce();
@@ -135,5 +155,45 @@ describe("custom desktop window chrome", () => {
     expect(stylesheet).toMatch(
       /\.window-close-backdrop\s*\{[^}]*z-index:\s*600/,
     );
+  });
+
+  it("renders close confirmation on an opaque high-contrast surface", async () => {
+    const user = userEvent.setup();
+    render(<WindowChrome confirmOnClose />);
+
+    await user.click(screen.getByRole("button", { name: "关闭" }));
+
+    expect(await screen.findByRole("dialog", { name: "确认关闭 Atlas" }))
+      .toHaveClass("window-close-dialog");
+    expect(stylesheet).toMatch(
+      /\.window-close-backdrop\s*\{[^}]*background:\s*rgba\(8,\s*10,\s*9,\s*0\.72\)/,
+    );
+    expect(stylesheet).toMatch(
+      /\.window-close-dialog\s*\{[\s\S]*?isolation:\s*isolate[\s\S]*?background:\s*var\(--card\)/,
+    );
+    expect(stylesheet).toMatch(
+      /\.window-close-dialog\s+\.confirm-dialog-copy\s*\{[\s\S]*?min-width:\s*0/,
+    );
+  });
+
+  it("always distinguishes an active index build from the optional close reminder", async () => {
+    getSearchIndexProgress.mockResolvedValue({
+      status: "indexing",
+      phase: "mft",
+      indexedItems: 12_000,
+      completedRoots: 0,
+      totalRoots: 2,
+    });
+    const user = userEvent.setup();
+    render(<WindowChrome confirmOnClose={false} />);
+
+    await user.click(screen.getByRole("button", { name: "关闭" }));
+
+    expect(
+      await screen.findByRole("dialog", { name: "索引正在建立" }),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("checkbox", { name: "以后关闭时不再提醒" }))
+      .not.toBeInTheDocument();
+    expect(quitApplication).not.toHaveBeenCalled();
   });
 });

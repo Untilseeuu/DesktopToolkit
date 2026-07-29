@@ -423,6 +423,28 @@ describe("QuickOverlay", () => {
     await waitFor(() => expect(screen.getByText("New result")).toBeInTheDocument());
   });
 
+  it("shows a compact loading indicator while native search is still running", async () => {
+    let finishSearch: (value: never[]) => void = () => undefined;
+    searchNative.mockImplementationOnce(
+      () => new Promise((resolve) => {
+        finishSearch = resolve;
+      }),
+    );
+    const user = userEvent.setup();
+    render(<QuickOverlay mode="search" />);
+
+    await user.type(
+      await screen.findByPlaceholderText("搜索所有磁盘中的应用、文件或文件夹"),
+      "毕业设计",
+    );
+    expect(await screen.findByRole("status", { name: "正在搜索" })).toBeInTheDocument();
+
+    finishSearch([]);
+    await waitFor(() =>
+      expect(screen.queryByRole("status", { name: "正在搜索" })).not.toBeInTheDocument(),
+    );
+  });
+
   it("clears stale results when the native search rejects", async () => {
     searchNative
       .mockResolvedValueOnce([

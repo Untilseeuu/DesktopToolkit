@@ -626,6 +626,40 @@ describe("Atlas desktop toolkit", () => {
     expect(screen.getByText("论文仓库")).toBeInTheDocument();
     expect(screen.getByText("论文")).toBeInTheDocument();
     expect(screen.getByText("Ctrl+Alt+D")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "编辑 论文仓库" }));
+    const group = screen.getByRole("combobox", { name: "文件夹分组" });
+    expect(within(group).getByRole("option", { name: "学习" })).toBeInTheDocument();
+  });
+
+  it("orders startup applications automatically by their configured delay", async () => {
+    localStorage.setItem(
+      "atlas-toolkit-state-v1",
+      JSON.stringify({
+        ...defaultSnapshot,
+        startupItems: [
+          { id: "slow", name: "慢启动", path: "D:\\slow.exe", delaySeconds: 8, enabled: true, order: 0 },
+          { id: "fast", name: "快启动", path: "D:\\fast.exe", delaySeconds: 1, enabled: true, order: 1 },
+        ],
+        startupScenes: [{
+          ...defaultSnapshot.startupScenes[0],
+          itemIds: ["slow", "fast"],
+        }],
+      }),
+    );
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole("button", { name: "启动编排" }));
+
+    const fast = (await screen.findAllByText("快启动")).find(
+      (element) => element.matches(".startup-main strong"),
+    )!;
+    const slow = screen.getAllByText("慢启动").find(
+      (element) => element.matches(".startup-main strong"),
+    )!;
+    expect(
+      fast.compareDocumentPosition(slow) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /拖动.*调整顺序/ })).not.toBeInTheDocument();
   });
 
   it("creates an empty folder group and shows descriptions on cards", async () => {
@@ -712,6 +746,15 @@ describe("Atlas desktop toolkit", () => {
     expect(container.querySelector(".clipboard-list")).toHaveClass("is-empty");
     expect(stylesheet).toMatch(
       /\.clipboard-list\.is-empty\s*\{[^}]*border:\s*0[^}]*background:\s*transparent/,
+    );
+  });
+
+  it("uses one control typography scale across toolbars and editors", () => {
+    expect(stylesheet).toMatch(
+      /\.favorites-filter\s*\{[\s\S]*?font-size:\s*calc\(11px \* var\(--font-scale\)\)/,
+    );
+    expect(stylesheet).toMatch(
+      /\.folder-filter-bar input,\s*[\r\n]+\s*\.folder-filter-bar select\s*\{[\s\S]*?font-size:\s*calc\(11px \* var\(--font-scale\)\)/,
     );
   });
 
@@ -847,63 +890,6 @@ describe("Atlas desktop toolkit", () => {
     expect(screen.getByText("640 × 480")).toBeInTheDocument();
   });
 
-  it("reorders startup applications by dragging the handle", async () => {
-    localStorage.setItem(
-      "atlas-toolkit-state-v1",
-      JSON.stringify({
-        ...defaultSnapshot,
-        startupItems: [
-          {
-            id: "first",
-            name: "First",
-            path: "C:\\First.exe",
-            args: [],
-            delaySeconds: 0,
-            enabled: true,
-            order: 0,
-          },
-          {
-            id: "second",
-            name: "Second",
-            path: "C:\\Second.exe",
-            args: [],
-            delaySeconds: 0,
-            enabled: true,
-            order: 1,
-          },
-        ],
-        startupScenes: [{
-          id: "default-scene",
-          name: "默认场景",
-          description: "",
-          itemIds: ["first", "second"],
-        }],
-      }),
-    );
-    const user = userEvent.setup();
-    const { container } = render(<App />);
-    await user.click(await screen.findByRole("button", { name: "启动编排" }));
-    await screen.findAllByText("First");
-
-    const handles = container.querySelectorAll<HTMLButtonElement>(".drag-handle");
-    fireEvent.dragStart(handles[0], {
-      dataTransfer: { effectAllowed: "", dropEffect: "", setData: () => undefined },
-    });
-    fireEvent.dragOver(handles[1], {
-      dataTransfer: { effectAllowed: "", dropEffect: "", setData: () => undefined },
-    });
-    fireEvent.drop(handles[1], {
-      dataTransfer: { effectAllowed: "", dropEffect: "", setData: () => undefined },
-    });
-
-    await waitFor(() => {
-      const names = [...container.querySelectorAll(".startup-main strong")].map(
-        (element) => element.textContent,
-      );
-      expect(names).toEqual(["Second", "First"]);
-    });
-  });
-
   it("opens overview tool cards with the keyboard without toggling the tool", async () => {
     const user = userEvent.setup();
     render(<App />);
@@ -918,10 +904,45 @@ describe("Atlas desktop toolkit", () => {
     expect(screen.getByRole("switch", { name: "全局搜索" })).toBeChecked();
   });
 
-  it("keeps large text layouts adaptive instead of forcing horizontal page scrolling", () => {
-    expect(stylesheet).toContain(":root[data-font-size=\"large\"] .overview-hero");
-    expect(stylesheet).toContain(":root[data-font-size=\"large\"] .activity-strip");
-    expect(stylesheet).toContain("overflow-x: hidden");
-    expect(stylesheet).toContain("scrollbar-gutter: stable");
+    it("keeps large text layouts adaptive instead of forcing horizontal page scrolling", () => {
+      expect(stylesheet).toContain(":root[data-font-size=\"large\"] .overview-hero");
+      expect(stylesheet).toContain(":root[data-font-size=\"large\"] .activity-strip");
+      expect(stylesheet).toContain("overflow-x: hidden");
+      expect(stylesheet).toContain("scrollbar-gutter: stable");
+    });
+
+    it("keeps index progress copy on one line at every supported font scale", () => {
+      expect(stylesheet).toMatch(
+        /\.index-progress-summary\s*\{[\s\S]*?display:\s*grid[\s\S]*?grid-template-columns:\s*minmax\(0,\s*1fr\)\s+auto/,
+      );
+      expect(stylesheet).toMatch(
+        /\.index-progress-title\s*\{[\s\S]*?white-space:\s*nowrap[\s\S]*?text-overflow:\s*ellipsis/,
+      );
+      expect(stylesheet).toMatch(
+        /\.index-progress-banner\s*\{[\s\S]*?width:\s*min\(clamp\(/,
+      );
+    });
+
+    it("keeps compact control labels intact while allowing their toolbars to wrap", () => {
+      expect(stylesheet).toMatch(
+        /:is\(\.button,\s*\.nav-item,\s*\.filter-button,\s*\.favorites-filter,\s*\.shortcut-recorder\)\s*\{[\s\S]*?white-space:\s*nowrap/,
+      );
+      expect(stylesheet).toMatch(
+        /:root\[data-font-size="large"\]\s+:is\(\.folder-filter-bar,\s*\.toolbar-actions,\s*\.setting-actions\)\s*\{[\s\S]*?flex-wrap:\s*wrap/,
+      );
+    });
+
+  it("uses one full-window background layer and exposes an opacity control", async () => {
+    expect(stylesheet).toMatch(
+      /\.desktop-frame::before\s*\{[\s\S]*?position:\s*fixed[\s\S]*?inset:\s*0/,
+    );
+    expect(stylesheet).toMatch(
+      /:root\[data-background="true"\]\s+\.sidebar[\s\S]*?background:/,
+    );
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole("button", { name: "设置" }));
+    await user.click(await screen.findByRole("button", { name: "打开配置" }));
+    expect(screen.getByRole("slider", { name: "背景图片透明度" })).toBeInTheDocument();
   });
 });

@@ -1,9 +1,7 @@
 #[cfg(all(target_os = "windows", not(test)))]
-use std::collections::HashMap;
-#[cfg(all(target_os = "windows", not(test)))]
 use std::sync::OnceLock;
 use std::{
-    collections::{BTreeSet, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     sync::{
@@ -906,6 +904,61 @@ fn kind_for_path(path: &Path, is_dir: bool) -> &'static str {
     }
 }
 
+pub(crate) fn exact_absolute_path_result(
+    query: &str,
+    kind_filter: &str,
+    extension_filter: &str,
+    drive_filter: &str,
+    roots: &[String],
+) -> Option<SearchResult> {
+    let unquoted = query.trim().trim_matches('"');
+    let path = Path::new(unquoted);
+    if !path.is_absolute() || !path_matches_roots(path, roots) {
+        return None;
+    }
+    let metadata = path.metadata().ok()?;
+    let kind = kind_for_path(path, metadata.is_dir());
+    if !kind_filter.is_empty() && kind_filter != kind {
+        return None;
+    }
+    if !extension_filter.trim().is_empty()
+        && path
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_none_or(|value| {
+                !value.eq_ignore_ascii_case(extension_filter.trim_start_matches('.'))
+            })
+    {
+        return None;
+    }
+    let display = display_path(path);
+    if !drive_filter.trim().is_empty()
+        && !display
+            .to_ascii_lowercase()
+            .starts_with(&drive_filter.trim().to_ascii_lowercase())
+    {
+        return None;
+    }
+    let name = if kind == "app" {
+        application_display_name(path)
+    } else {
+        path.file_name()
+            .map(|value| value.to_string_lossy().to_string())
+            .unwrap_or_else(|| display.clone())
+    };
+    Some(SearchResult {
+        id: format!("absolute-path-{display}"),
+        name,
+        path: display,
+        kind: kind.to_string(),
+        modified_at: metadata
+            .modified()
+            .ok()
+            .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+            .map(|value| value.as_secs()),
+    })
+}
+
 fn reconcile_path_in_table(
     transaction: &Transaction<'_>,
     table: &str,
@@ -960,15 +1013,151 @@ fn reconcile_path_in_table(
 
 fn reconcile_dirty_paths(
     transaction: &Transaction<'_>,
+    data_dir: &Path,
     paths: impl IntoIterator<Item = PathBuf>,
 ) -> Result<(), String> {
-    for path in paths {
-        reconcile_path_in_table(transaction, "search_fts_next", &path)?;
+    let mut paths = paths
+        .into_iter()
+        .filter(|path| {
+            !is_index_internal_path(data_dir, path) && !is_atlas_runtime_cache_path(path)
+        })
+        .map(|path| (display_path(&path), path))
+        .collect::<HashMap<_, _>>()
+        .into_values()
+        .collect::<Vec<_>>();
+    if paths.is_empty() {
+        return Ok(());
     }
-    Ok(())
+    paths.sort_unstable_by(|left, right| display_path(left).cmp(&display_path(right)));
+    transaction
+        .execute_batch(
+            "
+            DROP TABLE IF EXISTS temp_dirty_paths;
+            CREATE TEMP TABLE temp_dirty_paths(
+                path TEXT PRIMARY KEY COLLATE NOCASE,
+                child_prefix TEXT NOT NULL,
+                remove_descendants INTEGER NOT NULL
+            ) WITHOUT ROWID;
+            ",
+        )
+        .map_err(|error| error.to_string())?;
+    {
+        let mut insert = transaction
+            .prepare(
+                "INSERT OR REPLACE INTO temp_dirty_paths(path, child_prefix, remove_descendants)
+                 VALUES (?1, ?2, ?3)",
+            )
+            .map_err(|error| error.to_string())?;
+        for path in &paths {
+            let display = display_path(path);
+            let child_prefix = format!(
+                "{}{}",
+                display.trim_end_matches(['\\', '/']),
+                std::path::MAIN_SEPARATOR
+            );
+            insert
+                .execute(params![display, child_prefix, !path.exists()])
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    // `path` is intentionally UNINDEXED in the FTS table to keep searches
+    // compact. Deleting each dirty path separately would therefore scan the
+    // multi-million-row staging table once per path. Join all exact paths
+    // through a tiny indexed temp table so staging is scanned only once.
+    transaction
+        .execute(
+            "
+            DELETE FROM search_fts_next
+            WHERE rowid IN (
+                SELECT target.rowid
+                FROM search_fts_next AS target
+                JOIN temp_dirty_paths AS dirty
+                  ON target.path = dirty.path COLLATE NOCASE
+            )
+            ",
+            [],
+        )
+        .map_err(|error| error.to_string())?;
+    let removed_parent_exists = transaction
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM temp_dirty_paths WHERE remove_descendants = 1
+            )",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .unwrap_or(false);
+    if removed_parent_exists {
+        transaction
+            .execute(
+                "
+                DELETE FROM search_fts_next
+                WHERE rowid IN (
+                    SELECT target.rowid
+                    FROM search_fts_next AS target
+                    JOIN temp_dirty_paths AS dirty
+                      ON dirty.remove_descendants = 1
+                     AND substr(target.path, 1, length(dirty.child_prefix)) =
+                         dirty.child_prefix COLLATE NOCASE
+                )
+                ",
+                [],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    for path in paths {
+        if !path.exists() {
+            continue;
+        }
+        let display = display_path(&path);
+        let is_dir = path.is_dir();
+        let kind = kind_for_path(&path, is_dir);
+        if kind == "app" && is_noisy_application(&path) {
+            continue;
+        }
+        let name = if kind == "app" {
+            application_display_name(&path)
+        } else {
+            path.file_name()
+                .map(|value| value.to_string_lossy().to_string())
+                .unwrap_or_else(|| display.clone())
+        };
+        if !name.is_empty() {
+            transaction
+                .execute(
+                    "INSERT INTO search_fts_next(name, path, kind, modified_at)
+                     VALUES (?1, ?2, ?3, NULL)",
+                    params![encode_indexed_name(&name, kind), display, kind],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    transaction
+        .execute_batch("DROP TABLE temp_dirty_paths")
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+pub(crate) fn reconcile_dirty_paths_for_test(
+    connection: &mut Connection,
+    paths: Vec<PathBuf>,
+) -> Result<(), String> {
+    let transaction = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
+    reconcile_dirty_paths(&transaction, Path::new("__atlas_test_data__"), paths)?;
+    transaction.commit().map_err(|error| error.to_string())
 }
 
 fn refresh_paths(storage: &StorageManager, paths: &[PathBuf]) -> Result<(), String> {
+    let data_dir = storage.data_dir();
+    let paths = paths
+        .iter()
+        .filter(|path| {
+            !is_index_internal_path(&data_dir, path) && !is_atlas_runtime_cache_path(path)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
     if paths.is_empty() {
         return Ok(());
     }
@@ -976,7 +1165,8 @@ fn refresh_paths(storage: &StorageManager, paths: &[PathBuf]) -> Result<(), Stri
     // the rebuild initialization barrier. Then any watcher/scanner overlap is
     // guaranteed to be reconciled before the staging table is published.
     let _writer = storage.index_write_guard();
-    if INDEX_STATE.lock().running {
+    let build_running = INDEX_STATE.lock().running;
+    if build_running {
         INDEX_DIRTY_PATHS.lock().extend(paths.iter().cloned());
     }
     let mut connection =
@@ -991,10 +1181,12 @@ fn refresh_paths(storage: &StorageManager, paths: &[PathBuf]) -> Result<(), Stri
             |row| row.get::<_, bool>(0),
         )
         .unwrap_or(false);
-    for path in paths {
+    for path in &paths {
         reconcile_path_in_table(&transaction, "search_fts", path)?;
-        if next_exists {
+        if next_exists && !build_running {
             reconcile_path_in_table(&transaction, "search_fts_next", path)?;
+        }
+        if next_exists {
             transaction
                 .execute(
                     "INSERT OR IGNORE INTO search_build_dirty_paths(path) VALUES (?1)",
@@ -1200,6 +1392,9 @@ pub fn start_watchers(storage: Arc<StorageManager>, requested_roots: Vec<String>
                     if is_index_internal_path(&data_dir, &path) {
                         continue;
                     }
+                    if is_atlas_runtime_cache_path(&path) {
+                        continue;
+                    }
                     refresh_batch.push(path.clone());
                     if path.is_dir()
                         && matches!(action, FILE_ACTION_ADDED | FILE_ACTION_RENAMED_NEW_NAME)
@@ -1210,6 +1405,7 @@ pub fn start_watchers(storage: Arc<StorageManager>, requested_roots: Vec<String>
                             .filter_entry(|entry| {
                                 should_descend(entry)
                                     && !is_index_internal_path(&data_dir, entry.path())
+                                    && !is_atlas_runtime_cache_path(entry.path())
                             })
                             .filter_map(Result::ok)
                             .skip(1)
@@ -1441,9 +1637,15 @@ pub(crate) fn fast_ntfs_volumes_for_build(
     completed_roots: usize,
     total_roots: usize,
 ) -> Option<Vec<char>> {
-    (completed_roots < total_roots)
-        .then(|| fast_ntfs_volumes(roots))
-        .flatten()
+    if completed_roots >= total_roots {
+        return None;
+    }
+    fast_ntfs_volumes(roots).map(|volumes| {
+        volumes
+            .into_iter()
+            .skip(completed_roots.min(roots.len()))
+            .collect()
+    })
 }
 
 pub(crate) fn scope_key(requested_roots: &[String]) -> String {
@@ -1620,6 +1822,62 @@ fn flush_index_batch(
     transaction.commit().map_err(|error| error.to_string())
 }
 
+fn begin_fast_volume_transaction(connection: &Connection) -> Result<(), String> {
+    connection
+        .execute_batch("BEGIN IMMEDIATE")
+        .map_err(|error| error.to_string())
+}
+
+fn flush_index_batch_in_transaction(
+    connection: &Connection,
+    records: &mut Vec<(String, String, &'static str)>,
+    revision: u64,
+) -> Result<(), String> {
+    if records.is_empty() {
+        return Ok(());
+    }
+    if index_build_cancelled(revision) {
+        return Err("索引任务已取消".into());
+    }
+    let mut statement = connection
+        .prepare(
+            "INSERT INTO search_fts_next(name, path, kind, modified_at)
+             VALUES (?1, ?2, ?3, ?4)",
+        )
+        .map_err(|error| error.to_string())?;
+    for (index, (name, path, kind)) in records.drain(..).enumerate() {
+        if index % 1024 == 0 && index_build_cancelled(revision) {
+            return Err("索引任务已取消".into());
+        }
+        statement
+            .execute(params![name, path, kind, Option::<u64>::None])
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn commit_fast_volume_transaction(
+    connection: &Connection,
+    completed_roots: usize,
+    indexed_items: usize,
+) -> Result<(), String> {
+    connection
+        .execute(
+            "UPDATE search_build_meta
+             SET completed_roots = ?1, indexed_items = ?2, updated_at = unixepoch()
+             WHERE id = 1",
+            params![completed_roots, indexed_items],
+        )
+        .map_err(|error| error.to_string())?;
+    connection
+        .execute_batch("COMMIT")
+        .map_err(|error| error.to_string())
+}
+
+fn rollback_fast_volume_transaction(connection: &Connection) {
+    let _ = connection.execute_batch("ROLLBACK");
+}
+
 #[cfg(target_os = "windows")]
 fn try_fast_ntfs_index(
     storage: &StorageManager,
@@ -1635,52 +1893,103 @@ fn try_fast_ntfs_index(
         .iter()
         .map(|volume| format!("{volume}:\\").to_ascii_lowercase())
         .collect::<HashSet<_>>();
-    let _writer = storage.index_write_guard();
-    let transaction = connection
-        .transaction()
-        .map_err(|error| error.to_string())?;
-    transaction
-        .execute("DELETE FROM search_fts_next", [])
-        .map_err(|error| error.to_string())?;
-    let mut statement = transaction
-        .prepare(
-            "INSERT INTO search_fts_next(name, path, kind, modified_at)
-             VALUES (?1, ?2, ?3, NULL)",
-        )
-        .map_err(|error| error.to_string())?;
-    let mut fast_indexed_app_paths = HashSet::new();
-    let mut count = 0usize;
-    for app in system_apps {
-        let normalized = app.path.replace('/', "\\").to_ascii_lowercase();
-        if !root_paths.iter().any(|root| normalized.starts_with(root))
-            || is_noisy_application(Path::new(&app.path))
-            || is_noisy_app_name(&app.name)
-            || !fast_indexed_app_paths.insert(normalized)
-        {
-            continue;
-        }
-        statement
-            .execute(params![
-                encode_indexed_name(&app.name, "app"),
-                app.path,
-                "app"
-            ])
-            .map_err(|error| error.to_string())?;
-        count = count.saturating_add(1);
-    }
-    let registered_app_count = count;
-    let mut preview_count = count;
-    let mut largest_discovered = 0usize;
-    update_index_progress(4, preview_count, 0, total_roots, None);
+    let completed_before_fast = total_roots.saturating_sub(volumes.len());
+    let mut completed = completed_before_fast;
+    let mut count = connection
+        .query_row("SELECT COUNT(*) FROM search_fts_next", [], |row| row.get(0))
+        .unwrap_or(0usize);
+    let mut records = Vec::with_capacity(INDEX_BATCH_SIZE);
+    let mut fast_indexed_app_paths = indexed_app_paths.clone();
+    let mut current_discovered = 0usize;
+    let mut current_indexed = 0usize;
+    let mut current_volume = None;
+    let mut volume_transaction_open = false;
+    let mut volume_writer_guard = None;
+    let mut last_progress_log = Instant::now()
+        .checked_sub(Duration::from_secs(10))
+        .unwrap_or_else(Instant::now);
+    update_index_progress(4, count, completed, total_roots, None);
     let result = crate::ntfs::scan_volumes_elevated(volumes, |event| {
         if index_build_cancelled(revision) {
             return Err("索引任务已取消".into());
         }
         match event {
             crate::ntfs::FastIndexEvent::Progress { discovered } => {
-                largest_discovered = largest_discovered.max(discovered);
-                preview_count = preview_count.max(count.saturating_add(discovered));
-                update_index_progress(5, preview_count, 0, total_roots, None);
+                current_discovered = current_discovered.max(discovered);
+                let visible_count =
+                    count.max(count.saturating_add(discovered.saturating_sub(current_indexed)));
+                update_index_progress(
+                    5,
+                    visible_count,
+                    completed,
+                    total_roots,
+                    current_volume.map(|volume| format!("{volume}:\\")),
+                );
+                if last_progress_log.elapsed() >= Duration::from_secs(5) {
+                    crate::runtime_log::append_event(
+                        data_dir,
+                        "INFO",
+                        "search.index.fast.progress",
+                        "reading_mft",
+                        &format!(
+                            "volume={} discovered={} indexed={} visible_items={visible_count}",
+                            current_volume.unwrap_or('?'),
+                            current_discovered,
+                            current_indexed,
+                        ),
+                    );
+                    last_progress_log = Instant::now();
+                }
+            }
+            crate::ntfs::FastIndexEvent::VolumeStart { volume } => {
+                let prefix = format!("{}:\\", volume.to_ascii_lowercase());
+                volume_writer_guard = Some(storage.index_write_guard());
+                begin_fast_volume_transaction(connection)?;
+                volume_transaction_open = true;
+                let removed = connection
+                    .execute(
+                        "DELETE FROM search_fts_next
+                         WHERE substr(lower(replace(path, '/', '\\')), 1, 3) = ?1",
+                        params![prefix],
+                    )
+                    .map_err(|error| error.to_string())?;
+                count = count.saturating_sub(removed);
+                crate::runtime_log::append_event(
+                    data_dir,
+                    "INFO",
+                    "search.index.fast.volume",
+                    "started",
+                    &format!("volume={volume} removed_stale_items={removed} base_items={count}"),
+                );
+                fast_indexed_app_paths.retain(|path| !path.starts_with(&prefix));
+                for app in system_apps {
+                    let normalized = app.path.replace('/', "\\").to_ascii_lowercase();
+                    if !normalized.starts_with(&prefix)
+                        || is_noisy_application(Path::new(&app.path))
+                        || is_noisy_app_name(&app.name)
+                        || !fast_indexed_app_paths.insert(normalized)
+                    {
+                        continue;
+                    }
+                    records.push((
+                        encode_indexed_name(&app.name, "app"),
+                        app.path.clone(),
+                        "app",
+                    ));
+                }
+                let app_count = records.len();
+                flush_index_batch_in_transaction(connection, &mut records, revision)?;
+                count = count.saturating_add(app_count);
+                current_volume = Some(volume);
+                current_discovered = 0;
+                current_indexed = 0;
+                update_index_progress(
+                    5,
+                    count,
+                    completed,
+                    total_roots,
+                    Some(format!("{volume}:\\")),
+                );
             }
             crate::ntfs::FastIndexEvent::Entry { path, is_directory } => {
                 if is_index_internal_path(data_dir, &path)
@@ -1716,41 +2025,87 @@ fn try_fast_ntfs_index(
                 if name.is_empty() {
                     return Ok(());
                 }
-                statement
-                    .execute(params![
-                        encode_indexed_name(&name, kind),
-                        display_path(&path),
-                        kind
-                    ])
-                    .map_err(|error| error.to_string())?;
+                records.push((encode_indexed_name(&name, kind), display_path(&path), kind));
                 count = count.saturating_add(1);
-                if count % 8192 == 0 {
-                    update_index_progress(5, preview_count.max(count), 0, total_roots, None);
+                current_indexed = current_indexed.saturating_add(1);
+                if records.len() >= INDEX_BATCH_SIZE {
+                    flush_index_batch_in_transaction(connection, &mut records, revision)?;
+                    update_index_progress(
+                        5,
+                        count,
+                        completed,
+                        total_roots,
+                        current_volume.map(|volume| format!("{volume}:\\")),
+                    );
+                    if last_progress_log.elapsed() >= Duration::from_secs(5) {
+                        crate::runtime_log::append_event(
+                            data_dir,
+                            "INFO",
+                            "search.index.fast.progress",
+                            "building_index",
+                            &format!(
+                                "volume={} discovered={} indexed={} committed_items={count}",
+                                current_volume.unwrap_or('?'),
+                                current_discovered,
+                                current_indexed,
+                            ),
+                        );
+                        last_progress_log = Instant::now();
+                    }
                 }
+            }
+            crate::ntfs::FastIndexEvent::VolumeComplete { volume, discovered } => {
+                flush_index_batch_in_transaction(connection, &mut records, revision)?;
+                current_discovered = current_discovered.max(discovered);
+                if !fast_index_coverage_is_credible(current_discovered, current_indexed) {
+                    return Err(format!(
+                        "{volume}: NTFS 文件路径还原不完整（发现 {current_discovered} 项，仅还原 {current_indexed} 项）"
+                    ));
+                }
+                completed = completed.saturating_add(1).min(total_roots);
+                let commit_started = Instant::now();
+                crate::runtime_log::append_event(
+                    data_dir,
+                    "INFO",
+                    "search.index.fast.volume",
+                    "commit_started",
+                    &format!("volume={volume} indexed={current_indexed} total_items={count}"),
+                );
+                commit_fast_volume_transaction(connection, completed, count)?;
+                volume_transaction_open = false;
+                volume_writer_guard = None;
+                crate::runtime_log::append_event(
+                    data_dir,
+                    "INFO",
+                    "search.index.fast.volume",
+                    "completed",
+                    &format!(
+                        "volume={volume} discovered={current_discovered} indexed={current_indexed} total_items={count} commit_ms={}",
+                        commit_started.elapsed().as_millis()
+                    ),
+                );
+                update_index_progress(5, count, completed, total_roots, None);
+                current_volume = None;
             }
         }
         Ok(())
     });
-    drop(statement);
-    result?;
-    let indexed_file_tree_items = count.saturating_sub(registered_app_count);
-    if !fast_index_coverage_is_credible(largest_discovered, indexed_file_tree_items) {
-        return Err(format!(
-            "NTFS 文件路径还原不完整（发现 {largest_discovered} 项，仅还原 {indexed_file_tree_items} 项）"
-        ));
+    if let Err(error) = result {
+        if volume_transaction_open {
+            rollback_fast_volume_transaction(connection);
+        }
+        return Err(error);
     }
-    transaction
-        .execute("DELETE FROM search_build_directories", [])
-        .map_err(|error| error.to_string())?;
-    transaction
-        .execute(
-            "UPDATE search_build_meta
-             SET completed_roots = ?1, indexed_items = ?2, updated_at = unixepoch()
-             WHERE id = 1",
-            params![total_roots, count],
-        )
-        .map_err(|error| error.to_string())?;
-    transaction.commit().map_err(|error| error.to_string())?;
+    if volume_transaction_open {
+        rollback_fast_volume_transaction(connection);
+        return Err("NTFS 快速索引未收到磁盘完成信号".into());
+    }
+    {
+        let _writer = storage.index_write_guard();
+        connection
+            .execute("DELETE FROM search_build_directories", [])
+            .map_err(|error| error.to_string())?;
+    }
     *indexed_app_paths = fast_indexed_app_paths;
     Ok(count)
 }
@@ -1797,6 +2152,7 @@ fn is_regenerable_cache_path(path: &Path) -> bool {
         "\\program files\\microsoft office\\updates\\download\\packagefiles",
         "\\appdata\\local\\temp",
         "\\appdata\\local\\cache",
+        "\\appdata\\local\\com.atlas.desktop-toolkit\\ebwebview",
         "\\appdata\\local\\yarn\\cache",
         "\\node_cache\\_cacache",
         "\\npm-cache\\_cacache",
@@ -1816,6 +2172,15 @@ fn is_regenerable_cache_path(path: &Path) -> bool {
             || normalized.ends_with(excluded)
             || normalized.contains(&format!("{excluded}\\"))
     })
+}
+
+fn is_atlas_runtime_cache_path(path: &Path) -> bool {
+    let normalized = path
+        .to_string_lossy()
+        .replace('/', "\\")
+        .to_ascii_lowercase();
+    normalized.contains("\\appdata\\local\\com.atlas.desktop-toolkit\\ebwebview\\")
+        || normalized.ends_with("\\appdata\\local\\com.atlas.desktop-toolkit\\ebwebview")
 }
 
 fn pending_directory_chunk(connection: &Connection) -> Result<Vec<(String, usize, bool)>, String> {
@@ -2435,6 +2800,16 @@ fn rebuild_inner(
     {
         if let Some(volumes) = fast_ntfs_volumes_for_build(&roots, completed_roots, total_roots) {
             set_fast_index_fallback_reason(None);
+            crate::runtime_log::append_event(
+                &data_dir,
+                "INFO",
+                "search.index.fast",
+                "started",
+                &format!(
+                    "volumes={} resume_after_roots={completed_roots}",
+                    volumes.iter().collect::<String>()
+                ),
+            );
             match try_fast_ntfs_index(
                 storage,
                 &mut index_connection,
@@ -2448,11 +2823,33 @@ fn rebuild_inner(
                 Ok(indexed) => {
                     count = indexed;
                     completed = total_roots;
+                    crate::runtime_log::append_event(
+                        &data_dir,
+                        "INFO",
+                        "search.index.fast",
+                        "success",
+                        &format!("indexed_items={indexed} completed_roots={total_roots}"),
+                    );
                     update_index_progress(1, count, completed, total_roots, None);
                 }
                 Err(error) => {
                     eprintln!("NTFS MFT fast index unavailable; using directory fallback: {error}");
+                    crate::runtime_log::append_event(
+                        &data_dir,
+                        "ERROR",
+                        "search.index.fast",
+                        "fallback",
+                        &error,
+                    );
                     set_fast_index_fallback_reason(Some(error));
+                    if let Ok((saved_completed, saved_count)) = index_connection.query_row(
+                        "SELECT completed_roots, indexed_items FROM search_build_meta WHERE id = 1",
+                        [],
+                        |row| Ok((row.get::<_, usize>(0)?, row.get::<_, usize>(1)?)),
+                    ) {
+                        completed = saved_completed.min(total_roots);
+                        count = saved_count.max(count);
+                    }
                     update_index_progress(1, count, completed, total_roots, None);
                 }
             }
@@ -2505,7 +2902,34 @@ fn rebuild_inner(
             .map_err(|error| error.to_string())?;
         dirty_paths.extend(persisted.filter_map(Result::ok).map(PathBuf::from));
     }
-    reconcile_dirty_paths(&transaction, dirty_paths)?;
+    let dirty_count = dirty_paths.len();
+    let reconcile_started = Instant::now();
+    crate::runtime_log::append_event(
+        &data_dir,
+        "INFO",
+        "search.index.publish",
+        "reconcile_started",
+        &format!("queued_paths={dirty_count}"),
+    );
+    reconcile_dirty_paths(&transaction, &data_dir, dirty_paths)?;
+    crate::runtime_log::append_event(
+        &data_dir,
+        "INFO",
+        "search.index.publish",
+        "reconcile_completed",
+        &format!(
+            "queued_paths={dirty_count} duration_ms={}",
+            reconcile_started.elapsed().as_millis()
+        ),
+    );
+    let publish_started = Instant::now();
+    crate::runtime_log::append_event(
+        &data_dir,
+        "INFO",
+        "search.index.publish",
+        "swap_started",
+        "publishing_staging_table",
+    );
     transaction
         .execute_batch(
             "
@@ -2537,6 +2961,13 @@ fn rebuild_inner(
         .execute("DELETE FROM search_build_directories", [])
         .map_err(|error| error.to_string())?;
     transaction.commit().map_err(|error| error.to_string())?;
+    crate::runtime_log::append_event(
+        &data_dir,
+        "INFO",
+        "search.index.publish",
+        "swap_completed",
+        &format!("duration_ms={}", publish_started.elapsed().as_millis()),
+    );
     let indexed_count = index_connection
         .query_row("SELECT COUNT(*) FROM search_fts", [], |row| {
             row.get::<_, usize>(0)
@@ -2851,6 +3282,11 @@ fn query_inner(
     let terms = expanded_search_terms(normalized);
     let mut application_results =
         registered_app_results(registered_apps(), normalized, kind, extension, drive, roots);
+    if let Some(exact_path) = exact_absolute_path_result(normalized, kind, extension, drive, roots)
+    {
+        application_results.retain(|result| !result.path.eq_ignore_ascii_case(&exact_path.path));
+        application_results.insert(0, exact_path);
+    }
     if query_revision.is_some_and(|revision| QUERY_REVISION.load(Ordering::Acquire) != revision) {
         return Ok(Vec::new());
     }

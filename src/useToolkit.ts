@@ -7,7 +7,7 @@ import {
   type Dispatch,
   type SetStateAction,
 } from "react";
-import { DEFAULT_SHORTCUTS, mergeSnapshotDefaults, reorderItems } from "./domain";
+import { DEFAULT_SHORTCUTS, mergeSnapshotDefaults } from "./domain";
 import {
   shouldReportPersistenceError,
   shouldSkipNativePersistence,
@@ -117,6 +117,7 @@ export const defaultSnapshot: AppSnapshot = {
     activeCustomFontId: "",
     customThemes: [],
     activeCustomThemeId: "",
+    backgroundOpacity: 0.35,
     confirmOnClose: true,
   },
 };
@@ -352,17 +353,6 @@ export function useToolkit() {
     [],
   );
 
-  const reorderStartupItems = useCallback((fromId: string, toId: string) => {
-    setSnapshot((current) => {
-      const fromIndex = current.startupItems.findIndex((item) => item.id === fromId);
-      const toIndex = current.startupItems.findIndex((item) => item.id === toId);
-      return {
-        ...current,
-        startupItems: reorderItems(current.startupItems, fromIndex, toIndex),
-      };
-    });
-  }, []);
-
   const removeStartupItem = useCallback((id: string) => {
     setSnapshot((current) => ({
       ...current,
@@ -499,7 +489,6 @@ export function useToolkit() {
       setToolEnabled,
       addStartupItem,
       updateStartupItem,
-      reorderStartupItems,
       removeStartupItem,
       upsertPrompt,
       removePrompt,
@@ -520,7 +509,6 @@ export function useToolkit() {
       setToolEnabled,
       addStartupItem,
       updateStartupItem,
-      reorderStartupItems,
       removeStartupItem,
       upsertPrompt,
       removePrompt,

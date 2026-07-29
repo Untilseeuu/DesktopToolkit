@@ -110,8 +110,19 @@ select {
   font: inherit;
 }
 
+input:not([type="range"]),
+textarea,
+select {
+  font-family: inherit;
+  font-size: calc(11px * var(--font-scale));
+}
+
 button {
   color: inherit;
+}
+
+:is(.button, .nav-item, .filter-button, .favorites-filter, .shortcut-recorder) {
+  white-space: nowrap;
 }
 
 button:focus-visible,
@@ -124,12 +135,39 @@ a:focus-visible {
 }
 
 .desktop-frame {
+  position: relative;
+  isolation: isolate;
   display: grid;
   grid-template-rows: 38px minmax(0, 1fr);
   width: 100%;
   height: 100%;
   overflow: hidden;
   background: var(--paper);
+}
+
+.desktop-frame::before {
+  position: fixed;
+  z-index: -1;
+  inset: 0;
+  background-image: var(--appearance-background-image);
+  background-position: center;
+  background-size: cover;
+  opacity: var(--appearance-background-opacity, 0);
+  content: "";
+  pointer-events: none;
+}
+
+:root[data-background="true"] .desktop-frame {
+  background: var(--paper);
+}
+
+:root[data-background="true"] .desktop-frame::before {
+  z-index: 0;
+}
+
+:root[data-background="true"] .desktop-frame > * {
+  position: relative;
+  z-index: 1;
 }
 
 .window-chrome {
@@ -594,6 +632,19 @@ a:focus-visible {
   background: color-mix(in srgb, var(--card) 94%, transparent);
 }
 
+:root[data-background="true"] .app-shell {
+  background: transparent;
+}
+
+:root[data-background="true"] .window-chrome {
+  background:
+    linear-gradient(
+      90deg,
+      color-mix(in srgb, var(--sidebar) 72%, transparent) 0 218px,
+      color-mix(in srgb, var(--paper) 65%, transparent) 218px
+    );
+}
+
 .quick-results.is-empty {
   overflow: hidden;
   border: 0;
@@ -829,6 +880,10 @@ a:focus-visible {
 .nav-item:hover {
   color: var(--sidebar-ink);
   background: color-mix(in srgb, var(--sidebar-ink) 6%, transparent);
+}
+
+:root[data-background="true"] .sidebar {
+  background: color-mix(in srgb, var(--sidebar) 72%, transparent);
 }
 
 .nav-item.active {
@@ -1358,6 +1413,10 @@ kbd {
   background: var(--card);
 }
 
+:root[data-background="true"] .main-panel {
+  background: color-mix(in srgb, var(--paper) 65%, transparent);
+}
+
 .button.ghost {
   background: transparent;
 }
@@ -1437,7 +1496,7 @@ kbd {
 .startup-row {
   position: relative;
   display: grid;
-  grid-template-columns: 18px 37px minmax(180px, 1fr) 150px 70px 38px;
+  grid-template-columns: 37px minmax(180px, 1fr) 150px 70px 38px;
   align-items: center;
   gap: 12px;
   min-height: 72px;
@@ -1474,34 +1533,6 @@ kbd {
 
 .startup-row:last-child {
   border-bottom: 0;
-}
-
-.drag-handle {
-  display: grid;
-  place-items: center;
-  width: 24px;
-  height: 34px;
-  padding: 0;
-  color: var(--line-strong);
-  border: 0;
-  border-radius: 7px;
-  background: transparent;
-  cursor: grab;
-}
-
-.drag-handle:hover,
-.drag-handle:focus-visible {
-  color: var(--ink);
-  background: color-mix(in srgb, var(--ink) 6%, transparent);
-}
-
-.drag-handle:active {
-  cursor: grabbing;
-}
-
-.startup-row.dragging {
-  opacity: 0.5;
-  background: color-mix(in srgb, var(--vermillion) 6%, transparent);
 }
 
 :root[data-font-size="large"] .nav-item {
@@ -1573,6 +1604,10 @@ kbd {
 :root[data-font-size="large"] .setting-row {
   flex-wrap: wrap;
   row-gap: 12px;
+}
+
+:root[data-font-size="large"] :is(.folder-filter-bar, .toolbar-actions, .setting-actions) {
+  flex-wrap: wrap;
 }
 
 :root[data-font-size="large"] .startup-row {
@@ -1724,6 +1759,18 @@ kbd {
 
 .search-box input::placeholder {
   color: color-mix(in srgb, var(--muted) 72%, transparent);
+}
+
+.search-loading-indicator {
+  flex: 0 0 auto;
+  color: var(--vermillion);
+  animation: atlas-search-spin 720ms linear infinite;
+}
+
+@keyframes atlas-search-spin {
+  to {
+    transform: rotate(1turn);
+  }
 }
 
 .search-query-clear {
@@ -2059,7 +2106,7 @@ kbd {
   border: 0;
   outline: 0;
   background: transparent;
-  font-size: calc(10px * var(--font-scale));
+  font-size: calc(11px * var(--font-scale));
 }
 
 .filter-button {
@@ -2114,6 +2161,7 @@ kbd {
   background: var(--card);
   cursor: pointer;
   transition: 160ms ease;
+  font-size: calc(11px * var(--font-scale));
 }
 
 .favorites-filter:hover,
@@ -2843,6 +2891,59 @@ kbd {
 
 .window-close-backdrop {
   z-index: 600;
+  background: rgba(8, 10, 9, 0.72);
+  backdrop-filter: blur(10px) saturate(0.72);
+}
+
+.window-close-dialog {
+  position: relative;
+  isolation: isolate;
+  width: min(500px, calc(100vw - 48px));
+  padding: 24px;
+  overflow: hidden;
+  border-color: color-mix(in srgb, var(--vermillion) 28%, var(--line-strong));
+  background: var(--card);
+  box-shadow:
+    0 34px 100px rgba(0, 0, 0, 0.48),
+    0 0 0 1px color-mix(in srgb, var(--ink) 5%, transparent);
+}
+
+.window-close-dialog::before {
+  position: absolute;
+  z-index: -1;
+  inset: 0 auto 0 0;
+  width: 4px;
+  background: var(--vermillion);
+  content: "";
+}
+
+.window-close-dialog .confirm-dialog-copy {
+  min-width: 0;
+}
+
+.window-close-dialog h2 {
+  color: var(--ink);
+  font-weight: 650;
+}
+
+.window-close-dialog p {
+  max-width: 42em;
+  color: color-mix(in srgb, var(--ink) 72%, var(--muted));
+}
+
+.window-close-dialog > footer {
+  padding-top: 14px;
+  margin-top: 2px;
+  border-top: 1px solid var(--line);
+}
+
+.window-close-dialog > footer .button {
+  min-width: 96px;
+}
+
+:root[data-font-size="large"] .window-close-dialog {
+  grid-template-columns: 42px minmax(0, 1fr);
+  width: min(560px, calc(100vw - 40px));
 }
 
 .index-deferred-notice > span {
@@ -2871,9 +2972,9 @@ kbd {
   right: 18px;
   bottom: 18px;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto auto;
+  grid-template-columns: minmax(0, 1fr) auto;
   gap: 8px 14px;
-  width: min(390px, calc(100vw - 36px));
+  width: min(clamp(390px, calc(330px + 8vw), 470px), calc(100vw - 36px));
   padding: 13px 15px;
   color: var(--ink);
   border: 1px solid var(--line-strong);
@@ -2881,6 +2982,31 @@ kbd {
   background: color-mix(in srgb, var(--card) 96%, transparent);
   box-shadow: 0 18px 44px color-mix(in srgb, var(--ink) 16%, transparent);
   backdrop-filter: blur(14px);
+}
+
+.index-progress-summary {
+  grid-column: 1;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+  gap: 12px;
+  min-width: 0;
+}
+
+.index-progress-copy {
+  min-width: 0;
+}
+
+.index-progress-title {
+  overflow: hidden;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.index-progress-position {
+  align-self: end;
+  white-space: nowrap;
 }
 
 .index-progress-banner strong,
@@ -2904,13 +3030,6 @@ kbd {
   overflow: hidden;
   color: var(--vermillion);
   text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.index-progress-banner > span {
-  grid-row: 1;
-  grid-column: 2;
-  align-self: end;
   white-space: nowrap;
 }
 
@@ -2957,7 +3076,7 @@ kbd {
 
 .index-progress-banner > button {
   grid-row: 1;
-  grid-column: 3;
+  grid-column: 2;
   display: grid;
   align-self: center;
   place-items: center;
@@ -2988,7 +3107,7 @@ kbd {
 
 .index-progress-banner.collapsed > strong {
   flex: 1;
-  font-size: calc(10px * var(--font-scale));
+  font-size: calc(11px * var(--font-scale));
 }
 
 .index-progress-pulse {
@@ -3645,7 +3764,7 @@ kbd {
   color: var(--ink);
   border: 0;
   background: transparent;
-  font-size: calc(9px * var(--font-scale));
+  font-size: calc(11px * var(--font-scale));
 }
 
 .folder-filter-bar input {
@@ -3704,6 +3823,7 @@ kbd {
 }
 
 .folder-editor-grid input,
+.folder-editor-grid select,
 .folder-description-field input {
   width: 100%;
   min-height: 36px;
@@ -3712,7 +3832,17 @@ kbd {
   border: 1px solid var(--line);
   border-radius: 8px;
   background: var(--panel);
-  font-size: calc(9px * var(--font-scale));
+  font-size: calc(11px * var(--font-scale));
+}
+
+.folder-editor-grid select {
+  width: 100%;
+  min-height: 36px;
+  padding: 0 10px;
+  color: var(--ink);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
 }
 
 .folder-shortcut-field .shortcut-recorder {

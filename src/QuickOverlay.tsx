@@ -1,7 +1,12 @@
-import { Clipboard, FileText, Image as ImageIcon, Search, Sparkles, Trash2, X } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { Clipboard, FileText, Image as ImageIcon, LoaderCircle, Search, Sparkles, Trash2, X } from "lucide-react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { ResultGlyph } from "./components";
-import { installCustomFont, installTheme } from "./appearance";
+import {
+  installCustomFont,
+  installTheme,
+  readAppearancePreview,
+  type AppearancePreview,
+} from "./appearance";
 import { SearchQueryInput } from "./SearchQueryInput";
 import { SearchFilterControls } from "./SearchFilterControls";
 import {
@@ -46,9 +51,12 @@ const modeMeta = {
 export default function QuickOverlay({ mode: initialMode }: { mode: OverlayMode }) {
   const [mode, setMode] = useState<OverlayMode>(initialMode);
   const [snapshot, setSnapshot] = useState<AppSnapshot | null>(null);
+  const [appearancePreview, setAppearancePreview] =
+    useState<AppearancePreview | null>(() => readAppearancePreview());
   const [query, setQuery] = useState("");
   const [inputResetSignal, setInputResetSignal] = useState(0);
   const [results, setResults] = useState<SearchResult[]>([]);
+  const [searching, setSearching] = useState(false);
   const [filters, setFilters] = useState<SearchFilters>({
     kind: "all",
     extension: "",
@@ -62,30 +70,37 @@ export default function QuickOverlay({ mode: initialMode }: { mode: OverlayMode 
   const pendingClipboardHistory = useRef<ClipboardEntry[] | null>(null);
   const meta = modeMeta[mode];
   const Icon = meta.icon;
-  const customFont = snapshot?.settings.customFonts.find(
-    (font) => font.id === snapshot.settings.activeCustomFontId,
+  const appearanceSettings = snapshot?.settings ?? appearancePreview;
+  const customFont = appearanceSettings?.customFonts.find(
+    (font) => font.id === appearanceSettings.activeCustomFontId,
   );
-  const customTheme = snapshot?.settings.customThemes.find(
-    (theme) => theme.id === snapshot.settings.activeCustomThemeId,
+  const customTheme = appearanceSettings?.customThemes.find(
+    (theme) => theme.id === appearanceSettings.activeCustomThemeId,
   );
 
-  useEffect(() => installCustomFont(customFont?.path), [customFont]);
-  useEffect(() => {
-    if (!snapshot) return;
+  useLayoutEffect(() => installCustomFont(customFont?.path), [customFont]);
+  useLayoutEffect(() => {
+    if (!appearanceSettings) return;
     const root = document.documentElement;
-    root.dataset.font = snapshot.settings.fontFamily;
-    root.style.setProperty("--font-scale", String(snapshot.settings.fontScale));
-    const cleanup = installTheme(customTheme, snapshot.settings.theme);
+    root.dataset.font = appearanceSettings.fontFamily;
+    root.style.setProperty("--font-scale", String(appearanceSettings.fontScale));
+    const cleanup = installTheme(customTheme, appearanceSettings.theme);
     return () => {
       cleanup();
       root.style.removeProperty("--font-scale");
     };
   }, [
     customTheme,
-    snapshot?.settings.fontFamily,
-    snapshot?.settings.fontScale,
-    snapshot?.settings.theme,
+    appearanceSettings?.fontFamily,
+    appearanceSettings?.fontScale,
+    appearanceSettings?.theme,
   ]);
+
+  useEffect(() => {
+    const refresh = () => setAppearancePreview(readAppearancePreview());
+    window.addEventListener("storage", refresh);
+    return () => window.removeEventListener("storage", refresh);
+  }, []);
 
   useEffect(() => {
     document.documentElement.dataset.overlay = "true";
@@ -242,8 +257,10 @@ export default function QuickOverlay({ mode: initialMode }: { mode: OverlayMode 
     const requestId = ++requestSequence.current;
     if (mode !== "search" || !query.trim()) {
       setResults([]);
+      setSearching(false);
       return;
     }
+    setSearching(true);
     void searchNative(query, filters)
       .then((items) => {
         if (requestId !== requestSequence.current) return;
@@ -276,6 +293,9 @@ export default function QuickOverlay({ mode: initialMode }: { mode: OverlayMode 
       })
       .catch(() => {
         if (requestId === requestSequence.current) setResults([]);
+      })
+      .finally(() => {
+        if (requestId === requestSequence.current) setSearching(false);
       });
   }, [filters, mode, query, snapshot?.quickLinks]);
 
@@ -373,6 +393,14 @@ export default function QuickOverlay({ mode: initialMode }: { mode: OverlayMode 
               : undefined
           }
         />
+        {searching ? (
+          <LoaderCircle
+            className="search-loading-indicator"
+            size={17}
+            aria-label="正在搜索"
+            role="status"
+          />
+        ) : null}
       </label>
       {mode === "search" ? (
         <SearchFilterControls

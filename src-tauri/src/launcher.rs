@@ -279,7 +279,7 @@ where
         return Err("启动队列正在运行，请稍候".into());
     }
     let _guard = QueueGuard;
-    items.sort_by_key(|item| item.order);
+    items.sort_by_key(|item| (item.delay_seconds, item.order));
     let mut results = Vec::new();
     for item in items.into_iter().filter(|item| item.enabled) {
         if item.delay_seconds > 0 {

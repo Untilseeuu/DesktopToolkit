@@ -387,6 +387,10 @@ export function mergeSnapshotDefaults(snapshot: AppSnapshot): AppSnapshot {
       activeCustomFontId: snapshot.settings?.activeCustomFontId ?? "",
       customThemes: snapshot.settings?.customThemes ?? [],
       activeCustomThemeId: snapshot.settings?.activeCustomThemeId ?? "",
+      backgroundOpacity: Math.min(
+        0.9,
+        Math.max(0.05, snapshot.settings?.backgroundOpacity ?? 0.35),
+      ),
       confirmOnClose: snapshot.settings?.confirmOnClose ?? true,
     },
   };

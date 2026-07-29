@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, VecDeque},
     io::{BufReader, BufWriter, Read, Write},
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
@@ -29,18 +29,78 @@ impl MftRecord {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct DirectoryRecord {
-    parent_reference: u64,
+#[derive(Debug)]
+struct PendingMftRecord {
+    file_reference: u64,
     name: String,
+    is_directory: bool,
 }
 
-impl DirectoryRecord {
-    pub(crate) fn new(parent_reference: u64, name: impl Into<String>) -> Self {
+pub(crate) struct MftPathResolver {
+    directory_paths: HashMap<u64, PathBuf>,
+    pending_by_parent: HashMap<u64, Vec<PendingMftRecord>>,
+    pending_count: usize,
+}
+
+impl MftPathResolver {
+    pub(crate) fn new(volume_root: &str) -> Self {
         Self {
-            parent_reference,
-            name: name.into(),
+            directory_paths: HashMap::from([(
+                NTFS_ROOT_FILE_RECORD_INDEX,
+                PathBuf::from(volume_root),
+            )]),
+            pending_by_parent: HashMap::new(),
+            pending_count: 0,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_count(&self) -> usize {
+        self.pending_count
+    }
+
+    pub(crate) fn accept(
+        &mut self,
+        record: &MftRecord,
+        mut callback: impl FnMut(PathBuf, bool) -> Result<(), String>,
+    ) -> Result<(), String> {
+        if record.file_reference == NTFS_ROOT_FILE_RECORD_INDEX {
+            return Ok(());
+        }
+        let pending = PendingMftRecord {
+            file_reference: record.file_reference,
+            name: record.name.clone(),
+            is_directory: record.is_directory(),
+        };
+        let Some(parent_path) = self.directory_paths.get(&record.parent_reference).cloned() else {
+            self.pending_by_parent
+                .entry(record.parent_reference)
+                .or_default()
+                .push(pending);
+            self.pending_count = self.pending_count.saturating_add(1);
+            return Ok(());
+        };
+
+        let mut ready = VecDeque::from([(pending, parent_path)]);
+        while let Some((record, parent_path)) = ready.pop_front() {
+            let path = parent_path.join(&record.name);
+            callback(path.clone(), record.is_directory)?;
+            if !record.is_directory {
+                continue;
+            }
+            let first_resolution = self
+                .directory_paths
+                .insert(record.file_reference, path.clone())
+                .is_none();
+            if !first_resolution {
+                continue;
+            }
+            if let Some(children) = self.pending_by_parent.remove(&record.file_reference) {
+                self.pending_count = self.pending_count.saturating_sub(children.len());
+                ready.extend(children.into_iter().map(|child| (child, path.clone())));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -110,63 +170,6 @@ pub(crate) fn parse_usn_output(bytes: &[u8]) -> Result<(u64, Vec<MftRecord>), St
     Ok((next_reference, records))
 }
 
-pub(crate) fn resolve_all_directory_paths(
-    directories: &HashMap<u64, DirectoryRecord>,
-    volume_root: &str,
-) -> HashMap<u64, PathBuf> {
-    fn resolve_one(
-        reference: u64,
-        directories: &HashMap<u64, DirectoryRecord>,
-        volume_root: &str,
-        resolved: &mut HashMap<u64, PathBuf>,
-        visiting: &mut HashSet<u64>,
-    ) -> Option<PathBuf> {
-        if let Some(path) = resolved.get(&reference) {
-            return Some(path.clone());
-        }
-        if !visiting.insert(reference) {
-            return None;
-        }
-        if reference == NTFS_ROOT_FILE_RECORD_INDEX {
-            let path = PathBuf::from(volume_root);
-            resolved.insert(reference, path.clone());
-            visiting.remove(&reference);
-            return Some(path);
-        }
-        let directory = directories.get(&reference)?;
-        let path = if directory.parent_reference == reference {
-            PathBuf::from(volume_root)
-        } else {
-            let mut parent = resolve_one(
-                directory.parent_reference,
-                directories,
-                volume_root,
-                resolved,
-                visiting,
-            )?;
-            parent.push(&directory.name);
-            parent
-        };
-        visiting.remove(&reference);
-        resolved.insert(reference, path.clone());
-        Some(path)
-    }
-
-    let mut resolved = HashMap::with_capacity(directories.len());
-    let mut visiting = HashSet::new();
-    for reference in directories.keys().copied() {
-        visiting.clear();
-        let _ = resolve_one(
-            reference,
-            directories,
-            volume_root,
-            &mut resolved,
-            &mut visiting,
-        );
-    }
-    resolved
-}
-
 pub(crate) fn volume_letter(path: &Path) -> Option<char> {
     let value = path.to_string_lossy();
     let value = value.strip_prefix(r"\\?\").unwrap_or(&value);
@@ -186,6 +189,8 @@ pub(crate) fn volume_letter(path: &Path) -> Option<char> {
 pub(crate) enum FastIndexEvent {
     Entry { path: PathBuf, is_directory: bool },
     Progress { discovered: usize },
+    VolumeStart { volume: char },
+    VolumeComplete { volume: char, discovered: usize },
 }
 
 fn write_event(stream: &mut impl Write, event: &FastIndexEvent) -> Result<(), String> {
@@ -201,6 +206,15 @@ fn write_event(stream: &mut impl Write, event: &FastIndexEvent) -> Result<(), St
         }
         FastIndexEvent::Progress { discovered } => stream
             .write_all(&[3])
+            .and_then(|_| stream.write_all(&(*discovered as u64).to_le_bytes()))
+            .and_then(|_| stream.flush())
+            .map_err(|error| error.to_string()),
+        FastIndexEvent::VolumeStart { volume } => stream
+            .write_all(&[4, *volume as u8])
+            .and_then(|_| stream.flush())
+            .map_err(|error| error.to_string()),
+        FastIndexEvent::VolumeComplete { volume, discovered } => stream
+            .write_all(&[5, *volume as u8])
             .and_then(|_| stream.write_all(&(*discovered as u64).to_le_bytes()))
             .and_then(|_| stream.flush())
             .map_err(|error| error.to_string()),
@@ -239,6 +253,25 @@ fn read_event(stream: &mut impl Read) -> Result<Option<FastIndexEvent>, String> 
                 .map_err(|error| error.to_string())?;
             Ok(Some(FastIndexEvent::Progress {
                 discovered: u64::from_le_bytes(value) as usize,
+            }))
+        }
+        4 => {
+            let mut volume = [0u8; 1];
+            stream
+                .read_exact(&mut volume)
+                .map_err(|error| error.to_string())?;
+            Ok(Some(FastIndexEvent::VolumeStart {
+                volume: volume[0] as char,
+            }))
+        }
+        5 => {
+            let mut payload = [0u8; 9];
+            stream
+                .read_exact(&mut payload)
+                .map_err(|error| error.to_string())?;
+            Ok(Some(FastIndexEvent::VolumeComplete {
+                volume: payload[0] as char,
+                discovered: u64::from_le_bytes(payload[1..].try_into().unwrap()) as usize,
             }))
         }
         255 => {
@@ -357,43 +390,22 @@ mod windows_fast_index {
     fn scan_volume(
         volume: char,
         callback: &mut impl FnMut(FastIndexEvent) -> Result<(), String>,
-    ) -> Result<(), String> {
-        let mut directories = HashMap::<u64, DirectoryRecord>::new();
+    ) -> Result<usize, String> {
+        let root = format!("{volume}:\\");
+        let mut resolver = MftPathResolver::new(&root);
         let mut discovered = 0usize;
         enumerate_raw(volume, |record| {
             discovered = discovered.saturating_add(1);
-            if record.is_directory() {
-                directories.insert(
-                    record.file_reference,
-                    DirectoryRecord::new(record.parent_reference, record.name.clone()),
-                );
-            }
-            if discovered % 65_536 == 0 {
+            resolver.accept(record, |path, is_directory| {
+                callback(FastIndexEvent::Entry { path, is_directory })
+            })?;
+            if discovered % 8_192 == 0 {
                 callback(FastIndexEvent::Progress { discovered })?;
             }
             Ok(())
         })?;
         callback(FastIndexEvent::Progress { discovered })?;
-
-        let root = format!("{volume}:\\");
-        let directory_paths = resolve_all_directory_paths(&directories, &root);
-        enumerate_raw(volume, |record| {
-            let path = if record.is_directory() {
-                directory_paths.get(&record.file_reference).cloned()
-            } else {
-                directory_paths
-                    .get(&record.parent_reference)
-                    .map(|parent| parent.join(&record.name))
-            };
-            if let Some(path) = path {
-                callback(FastIndexEvent::Entry {
-                    path,
-                    is_directory: record.is_directory(),
-                })?;
-            }
-            Ok(())
-        })?;
-        Ok(())
+        Ok(discovered)
     }
 
     pub(super) fn run_helper(port: u16, token: &str, volumes: &[char]) -> Result<(), String> {
@@ -405,7 +417,18 @@ mod windows_fast_index {
         // before the first potentially expensive MFT pass begins.
         write_event(&mut stream, &FastIndexEvent::Progress { discovered: 0 })?;
         let result = volumes.iter().try_for_each(|volume| {
-            scan_volume(*volume, &mut |event| write_event(&mut stream, &event))
+            write_event(
+                &mut stream,
+                &FastIndexEvent::VolumeStart { volume: *volume },
+            )?;
+            let discovered = scan_volume(*volume, &mut |event| write_event(&mut stream, &event))?;
+            write_event(
+                &mut stream,
+                &FastIndexEvent::VolumeComplete {
+                    volume: *volume,
+                    discovered,
+                },
+            )
         });
         match result {
             Ok(()) => stream

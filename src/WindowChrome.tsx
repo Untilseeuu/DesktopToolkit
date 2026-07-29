@@ -1,7 +1,7 @@
 import { Maximize2, Minus, X } from "lucide-react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useCallback, useEffect, useState } from "react";
-import { quitApplication } from "./native";
+import { getSearchIndexProgress, quitApplication } from "./native";
 
 async function performWindowAction(
   action: "minimize" | "toggleMaximize",
@@ -26,7 +26,7 @@ export default function WindowChrome({
   onDisableCloseReminder?: () => void;
   onBeforeQuit?: (disableReminder: boolean) => Promise<void>;
 }) {
-  const [confirmingClose, setConfirmingClose] = useState(false);
+  const [closeReason, setCloseReason] = useState<"normal" | "indexing" | null>(null);
   const [dontRemindAgain, setDontRemindAgain] = useState(false);
   const quit = useCallback(async (disableReminder: boolean) => {
     if (disableReminder) onDisableCloseReminder?.();
@@ -36,10 +36,16 @@ export default function WindowChrome({
       await quitApplication();
     }
   }, [onBeforeQuit, onDisableCloseReminder]);
-  const requestClose = useCallback(() => {
+  const requestClose = useCallback(async () => {
+    const progress = await getSearchIndexProgress().catch(() => null);
+    if (progress?.status === "indexing") {
+      setDontRemindAgain(false);
+      setCloseReason("indexing");
+      return;
+    }
     if (confirmOnClose) {
       setDontRemindAgain(false);
-      setConfirmingClose(true);
+      setCloseReason("normal");
       return;
     }
     void quit(false);
@@ -47,7 +53,7 @@ export default function WindowChrome({
   useEffect(() => {
     let dispose: (() => void) | undefined;
     void import("@tauri-apps/api/event")
-      .then(({ listen }) => listen("atlas-close-requested", requestClose))
+      .then(({ listen }) => listen("atlas-close-requested", () => void requestClose()))
       .then((unlisten) => {
         dispose = unlisten;
       })
@@ -84,40 +90,47 @@ export default function WindowChrome({
             className="window-close"
             aria-label="关闭"
             title="关闭"
-            onClick={requestClose}
+            onClick={() => void requestClose()}
           >
             <X size={15} strokeWidth={1.8} />
           </button>
         </div>
       </header>
-      {confirmingClose ? (
+      {closeReason ? (
         <div className="modal-backdrop window-close-backdrop">
           <section
-            className="confirm-dialog"
+            className="confirm-dialog window-close-dialog"
             role="dialog"
             aria-modal="true"
             aria-labelledby="window-close-title"
           >
             <span className="confirm-dialog-icon"><X size={20} /></span>
-            <div>
-              <h2 id="window-close-title">确认关闭 Atlas</h2>
-              <p>退出后快捷键和后台工具会停止；未完成的索引会在下次启动时继续。</p>
+            <div className="confirm-dialog-copy">
+              <h2 id="window-close-title">
+                {closeReason === "indexing" ? "索引正在建立" : "确认关闭 Atlas"}
+              </h2>
+              <p>
+                {closeReason === "indexing"
+                  ? "当前正在建立搜索索引。已完成的磁盘会保留，当前磁盘将在下次启动时继续处理。仍要关闭吗？"
+                  : "退出后快捷键和后台工具会停止。"}
+              </p>
             </div>
-            <label className="confirm-dialog-check">
+            {closeReason === "normal" ? <label className="confirm-dialog-check">
               <input
                 type="checkbox"
                 checked={dontRemindAgain}
                 onChange={(event) => setDontRemindAgain(event.target.checked)}
               />
               以后关闭时不再提醒
-            </label>
+            </label> : null}
             <footer>
-              <button className="button ghost" onClick={() => setConfirmingClose(false)}>取消</button>
+              <button className="button ghost" onClick={() => setCloseReason(null)}>取消</button>
               <button
                 className="button primary"
                 onClick={() => {
-                  setConfirmingClose(false);
-                  void quit(dontRemindAgain);
+                  const disableReminder = closeReason === "normal" && dontRemindAgain;
+                  setCloseReason(null);
+                  void quit(disableReminder);
                 }}
               >
                 确认关闭

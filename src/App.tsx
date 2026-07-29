@@ -19,7 +19,6 @@ import {
   FileSearch,
   Folder,
   FolderOpen,
-  GripVertical,
   HardDrive,
   Heart,
   Home,
@@ -30,6 +29,7 @@ import {
   LayoutGrid,
   Link2,
   ListFilter,
+  LoaderCircle,
   Monitor,
   MoreHorizontal,
   Pencil,
@@ -78,7 +78,7 @@ import {
   normalizeFolderShortcut,
   normalizeFolderTags,
 } from "./folderFavorites";
-import { installCustomFont, installTheme } from "./appearance";
+import { installCustomFont, installTheme, writeAppearancePreview } from "./appearance";
 import {
   activateClipboardEntry,
   bindNativeSearchShortcut,
@@ -89,6 +89,7 @@ import {
   copyText,
   deleteClipboardEntry,
   getSearchIndexProgress,
+  getSearchIndexCount,
   getAppIcons,
   importAppearanceAsset,
   invokeNative,
@@ -261,23 +262,42 @@ function MainApp({ model }: { model: ToolkitModel }) {
 
   useEffect(() => {
     let active = true;
-    const paths = [
+    const essentialPaths = [
       ["logo", branding.logoPath],
       ["avatar", branding.avatarPath],
-      ["background", branding.backgroundPath],
     ] as const;
     void Promise.all(
-      paths.map(async ([key, path]) => [
+      essentialPaths.map(async ([key, path]) => [
         key,
         path ? await loadAppearanceAsset(path).catch(() => "") : "",
       ] as const),
     ).then((loaded) => {
       if (active) {
-        setAppearanceAssets(Object.fromEntries(loaded) as typeof appearanceAssets);
+        setAppearanceAssets((current) => ({
+          ...current,
+          ...Object.fromEntries(loaded),
+        }));
       }
     });
+    setAppearanceAssets((current) => ({ ...current, background: "" }));
+    let backgroundTimer: number | undefined;
+    const loadBackground = async () => {
+      if (!branding.backgroundPath) return;
+      const source = await loadAppearanceAsset(branding.backgroundPath).catch(() => "");
+      if (!source || !active) return;
+      const image = new Image();
+      image.src = source;
+      if (typeof image.decode === "function") {
+        await image.decode().catch(() => undefined);
+      }
+      if (active) {
+        setAppearanceAssets((current) => ({ ...current, background: source }));
+      }
+    };
+    backgroundTimer = window.setTimeout(() => void loadBackground(), 650);
     return () => {
       active = false;
+      if (backgroundTimer !== undefined) window.clearTimeout(backgroundTimer);
     };
   }, [branding.avatarPath, branding.backgroundPath, branding.logoPath]);
 
@@ -292,6 +312,50 @@ function MainApp({ model }: { model: ToolkitModel }) {
     );
     return cleanup;
   }, [customTheme, model.snapshot.settings.theme]);
+
+  useEffect(() => {
+    writeAppearancePreview({
+      theme: model.snapshot.settings.theme,
+      fontFamily: model.snapshot.settings.fontFamily,
+      fontScale: model.snapshot.settings.fontScale,
+      customFonts: model.snapshot.settings.customFonts,
+      activeCustomFontId: model.snapshot.settings.activeCustomFontId,
+      customThemes: model.snapshot.settings.customThemes,
+      activeCustomThemeId: model.snapshot.settings.activeCustomThemeId,
+    });
+  }, [
+    model.snapshot.settings.activeCustomFontId,
+    model.snapshot.settings.activeCustomThemeId,
+    model.snapshot.settings.customFonts,
+    model.snapshot.settings.customThemes,
+    model.snapshot.settings.fontFamily,
+    model.snapshot.settings.fontScale,
+    model.snapshot.settings.theme,
+  ]);
+
+  useEffect(() => {
+    const root = document.documentElement;
+    if (appearanceAssets.background) {
+      root.dataset.background = "true";
+      root.style.setProperty(
+        "--appearance-background-image",
+        `url("${appearanceAssets.background}")`,
+      );
+      root.style.setProperty(
+        "--appearance-background-opacity",
+        String(model.snapshot.settings.backgroundOpacity),
+      );
+    } else {
+      delete root.dataset.background;
+      root.style.removeProperty("--appearance-background-image");
+      root.style.removeProperty("--appearance-background-opacity");
+    }
+    return () => {
+      delete root.dataset.background;
+      root.style.removeProperty("--appearance-background-image");
+      root.style.removeProperty("--appearance-background-opacity");
+    };
+  }, [appearanceAssets.background, model.snapshot.settings.backgroundOpacity]);
 
   useEffect(() => {
     if (!customFont) {
@@ -355,18 +419,19 @@ function MainApp({ model }: { model: ToolkitModel }) {
     ) {
       return;
     }
-    model.setSetting("indexSetup", "ready");
     const scopeName = model.snapshot.settings.indexRoots.includes("*")
       ? "全盘索引"
       : "目录索引";
-    setToast(
-      `${scopeName}已经建立，共 ${indexProgress.indexedItems.toLocaleString()} 项`,
-    );
-    recordRuntimeEvent(
-      "search.index.complete",
-      "success",
-      `scope=${scopeName} indexed_items=${indexProgress.indexedItems}`,
-    );
+    void getSearchIndexCount().then((storedCount) => {
+      const count = Math.max(storedCount, indexProgress.indexedItems);
+      model.setSetting("indexSetup", "ready");
+      setToast(`${scopeName}已经建立，共 ${count.toLocaleString()} 项`);
+      recordRuntimeEvent(
+        "search.index.complete",
+        "success",
+        `scope=${scopeName} indexed_items=${count}`,
+      );
+    });
   }, [
     indexProgress?.indexedItems,
     indexProgress?.status,
@@ -389,7 +454,11 @@ function MainApp({ model }: { model: ToolkitModel }) {
       setIndexProgress(next);
       timer = window.setTimeout(
         refresh,
-        next.status === "indexing" || next.status === "idle" ? 750 : 5_000,
+        next.status === "indexing"
+          ? 1_000
+          : next.status === "idle"
+            ? 2_500
+            : 30_000,
       );
     };
     void refresh();
@@ -424,7 +493,10 @@ function MainApp({ model }: { model: ToolkitModel }) {
         ...buildingSnapshot,
         settings: { ...buildingSnapshot.settings, indexSetup: "ready" },
       });
-      setToast(`搜索索引已建立，共 ${count.toLocaleString()} 项`);
+      const storedCount = await getSearchIndexCount();
+      setToast(
+        `搜索索引已经建立，共 ${Math.max(count, storedCount).toLocaleString()} 项`,
+      );
       setIndexProgress(await getSearchIndexProgress());
     } catch (error) {
       model.setSetting("indexSetup", "deferred");
@@ -550,13 +622,7 @@ function MainApp({ model }: { model: ToolkitModel }) {
         </div>
       </aside>
 
-      <main
-        className="main-panel"
-        ref={mainPanelRef}
-        style={appearanceAssets.background ? {
-          backgroundImage: `linear-gradient(var(--appearance-wash), var(--appearance-wash)), url("${appearanceAssets.background}")`,
-        } : undefined}
-      >
+      <main className="main-panel" ref={mainPanelRef}>
         <div className="page">{page}</div>
       </main>
 
@@ -602,25 +668,38 @@ export function IndexProgressBanner({ progress }: { progress: IndexProgress }) {
   }
   return (
     <aside className="index-progress-banner" role="status" aria-label="后台索引进度">
-      <div>
-        <strong>
-          {progress.phase === "authorizing"
-            ? "正在等待管理员授权"
-            : finalizing
-              ? "正在整理搜索索引"
-            : fastNtfs
-              ? "正在建立 NTFS 快速索引"
-              : "正在建立全盘索引"}
-        </strong>
-        <small>
-          {progress.currentRoot ? `${progress.currentRoot} · ` : ""}
-          已发现 {progress.indexedItems.toLocaleString("zh-CN")} 项
-        </small>
-        {progress.fallbackReason ? (
-          <small className="index-progress-fallback">
-            快速索引未生效：{progress.fallbackReason}，已切换兼容扫描
+      <div className="index-progress-summary">
+        <div className="index-progress-copy">
+          <strong className="index-progress-title">
+            {progress.phase === "authorizing"
+              ? "正在等待管理员授权"
+              : finalizing
+                ? "正在整理搜索索引"
+              : fastNtfs
+                ? "正在建立 NTFS 快速索引"
+                : "正在建立全盘索引"}
+          </strong>
+          <small>
+            {progress.currentRoot ? `${progress.currentRoot} · ` : ""}
+            已发现 {progress.indexedItems.toLocaleString("zh-CN")} 项
           </small>
-        ) : null}
+          {progress.fallbackReason ? (
+            <small className="index-progress-fallback">
+              快速索引未生效：{progress.fallbackReason}，已切换兼容扫描
+            </small>
+          ) : null}
+        </div>
+        <span className="index-progress-position">
+          {finalizing
+            ? "文件读取已完成，正在安全切换索引"
+            : fastNtfs
+              ? progress.phase === "authorizing"
+                ? "等待系统确认"
+                : "读取磁盘文件表"
+              : progress.completedRoots > 0
+                ? `${progress.completedRoots} / ${progress.totalRoots} 个位置`
+                : `第 ${Math.min(1, progress.totalRoots)} / ${progress.totalRoots} 个位置`}
+        </span>
       </div>
       {activityOnly ? (
         <div className="index-progress-activity" aria-label="快速索引正在运行">
@@ -640,17 +719,6 @@ export function IndexProgressBanner({ progress }: { progress: IndexProgress }) {
           {...(progress.completedRoots > 0 ? { value: progress.completedRoots } : {})}
         />
       )}
-      <span>
-        {finalizing
-          ? "文件读取已完成，正在安全切换索引"
-          : fastNtfs
-          ? progress.phase === "authorizing"
-            ? "请在系统提示中允许访问 NTFS 文件表"
-            : `正在读取磁盘文件表，无需逐个扫描目录`
-          : progress.completedRoots > 0
-          ? `${progress.completedRoots} / ${progress.totalRoots} 个位置`
-          : `正在扫描第 ${Math.min(1, progress.totalRoots)} / ${progress.totalRoots} 个位置`}
-      </span>
       <button type="button" aria-label="隐藏索引详情" onClick={() => setCollapsed(true)}>
         <ChevronDown size={15} />
       </button>
@@ -797,7 +865,6 @@ function StartupPage({
   notify: (message: string) => void;
 }) {
   const enabled = model.snapshot.tools.startup.enabled;
-  const [draggedItemId, setDraggedItemId] = useState<string | null>(null);
   const [activeSceneId, setActiveSceneId] = useState(
     model.snapshot.startupScenes[0]?.id ?? "default-scene",
   );
@@ -816,7 +883,7 @@ function StartupPage({
   const sceneItems = (activeScene?.itemIds ?? [])
     .map((id) => model.snapshot.startupItems.find((item) => item.id === id))
     .filter((item): item is NonNullable<typeof item> => Boolean(item))
-    .sort((a, b) => a.order - b.order);
+    .sort((a, b) => a.delaySeconds - b.delaySeconds || a.order - b.order);
   useEffect(() => {
     let cancelled = false;
     void listStartupSceneMonitors()
@@ -922,7 +989,7 @@ function StartupPage({
       <SectionHeading
         eyebrow="TOOL 01 · STARTUP"
         title={model.snapshot.settings.branding.toolNames.startup}
-        description="为工作、学习或自定义场景安排不同的应用组合，并按顺序启动。"
+        description="为工作、学习或自定义场景安排应用组合，并按启动延迟自动排序。"
         action={<Switch checked={enabled} onChange={(value) => model.setToolEnabled("startup", value)} label={model.snapshot.settings.branding.toolNames.startup} />}
       />
       <section className="scene-switcher">
@@ -1137,37 +1204,7 @@ function StartupPage({
         </div>
         {sceneItems.length ? (
           sceneItems.map((item, index) => (
-            <div
-              className={`startup-row ${draggedItemId === item.id ? "dragging" : ""}`}
-              key={item.id}
-              onDragOver={(event) => {
-                if (draggedItemId && draggedItemId !== item.id) {
-                  event.preventDefault();
-                  event.dataTransfer.dropEffect = "move";
-                }
-              }}
-              onDrop={(event) => {
-                event.preventDefault();
-                if (draggedItemId && draggedItemId !== item.id) {
-                  model.reorderStartupItems(draggedItemId, item.id);
-                }
-                setDraggedItemId(null);
-              }}
-            >
-              <button
-                type="button"
-                className="drag-handle"
-                draggable
-                aria-label={`拖动 ${item.name} 调整顺序`}
-                onDragStart={(event) => {
-                  setDraggedItemId(item.id);
-                  event.dataTransfer.effectAllowed = "move";
-                  event.dataTransfer.setData("text/plain", item.id);
-                }}
-                onDragEnd={() => setDraggedItemId(null)}
-              >
-                <GripVertical size={17} />
-              </button>
+            <div className="startup-row" key={item.id}>
               <span className="app-avatar">{item.name.slice(0, 1).toUpperCase()}</span>
               <div className="startup-main">
                 <strong>{item.name}</strong>
@@ -1350,7 +1387,7 @@ function SearchPage({
       <SectionHeading
         eyebrow="TOOL 02 · FINDER"
         title={model.snapshot.settings.branding.toolNames.search}
-        description="搜索应用、文件与文件夹；支持拼音、首字母、常见错拼和同义词。"
+        description="搜索应用、文件与文件夹；支持绝对路径、拼音、首字母、常见错拼和同义词。"
         action={
           <Switch
             checked={enabled}
@@ -1399,6 +1436,14 @@ function SearchPage({
               }
             }}
           />
+          {loading ? (
+            <LoaderCircle
+              className="search-loading-indicator"
+              size={18}
+              aria-label="正在搜索"
+              role="status"
+            />
+          ) : null}
         </div>
         <SearchFilterControls
           className="search-filter-bar"
@@ -2470,8 +2515,15 @@ function FolderFavoritesPage({
             <label><span>别名</span><input aria-label="文件夹别名" placeholder={draft.name} value={draft.alias ?? ""} onChange={(event) => setDraft({ ...draft, alias: event.target.value })} /></label>
             <label>
               <span>分组</span>
-              <input aria-label="文件夹分组" list="folder-groups" value={draft.group ?? ""} onChange={(event) => setDraft({ ...draft, group: event.target.value })} />
-              <datalist id="folder-groups">{availableGroups.map((group) => <option value={group} key={group} />)}</datalist>
+              <select
+                aria-label="文件夹分组"
+                value={draft.group || DEFAULT_FOLDER_GROUP}
+                onChange={(event) => setDraft({ ...draft, group: event.target.value })}
+              >
+                {availableGroups.map((group) => (
+                  <option value={group} key={group}>{group}</option>
+                ))}
+              </select>
             </label>
             <label><span>标签（最多 5 个，每个 12 字）</span><input aria-label="文件夹标签" placeholder="项目，常用" value={(draft.tags ?? []).join("，")} onChange={(event) => setDraft({ ...draft, tags: event.target.value.split(/[,，]/) })} /></label>
             <label className="folder-shortcut-field"><span>快捷键</span><ShortcutRecorder value={draft.shortcut || "点击录制"} onChange={(shortcut) => setDraft({ ...draft, shortcut })} /></label>
@@ -2832,6 +2884,7 @@ function EnhancedSettingsPage({
       ...model.snapshot.settings.shortcuts,
       [key]: value,
     });
+    notify("快捷键已更新");
   };
   const updateBranding = (
     patch: Partial<typeof model.snapshot.settings.branding>,
@@ -2858,7 +2911,15 @@ function EnhancedSettingsPage({
       } else {
         updateBranding({ [`${kind}Path`]: path });
       }
-      notify("外观资源已导入");
+      notify(
+        kind === "font"
+          ? "字体已导入并启用"
+          : kind === "background"
+            ? "背景图片已导入"
+            : kind === "logo"
+              ? "软件图标已更新"
+              : "工作区头像已更新",
+      );
     } catch (error) {
       notify(`导入失败：${String(error)}`);
     }
@@ -3246,6 +3307,7 @@ function EnhancedSettingsPage({
                     onChange={(event) => {
                       if (event.target.value.startsWith("custom:")) {
                         model.setSetting("activeCustomFontId", event.target.value.slice(7));
+                        notify("界面字体已更新");
                         return;
                       }
                       model.setSetting("activeCustomFontId", "");
@@ -3253,6 +3315,7 @@ function EnhancedSettingsPage({
                         "fontFamily",
                         event.target.value.slice(8) as typeof model.snapshot.settings.fontFamily,
                       );
+                      notify("界面字体已更新");
                     }}
                   >
                     <option value="builtin:system">系统黑体</option>
@@ -3278,6 +3341,7 @@ function EnhancedSettingsPage({
                       if (!font) return;
                       model.setSetting("customFonts", model.snapshot.settings.customFonts.filter((item) => item.id !== font.id));
                       model.setSetting("activeCustomFontId", "");
+                      notify("导入字体已删除，已恢复默认字体");
                     }}
                    >
                     <Trash2 size={14} /> 删除导入字体
@@ -3319,10 +3383,12 @@ function EnhancedSettingsPage({
                     onChange={(event) => {
                       if (event.target.value.startsWith("custom:")) {
                         model.setSetting("activeCustomThemeId", event.target.value.slice(7));
+                        notify("界面主题已更新");
                         return;
                       }
                       model.setSetting("activeCustomThemeId", "");
                       model.setTheme(event.target.value.slice(8) as "light" | "dark");
+                      notify("界面主题已更新");
                     }}
                   >
                     <option value="builtin:light">浅色</option>
@@ -3352,10 +3418,40 @@ function EnhancedSettingsPage({
                         model.snapshot.settings.customThemes.filter((theme) => theme.id !== themeId),
                       );
                       model.setSetting("activeCustomThemeId", "");
+                      notify("导入主题已删除，已恢复内置主题");
                     }}
                    >
                     <Trash2 size={14} /> 删除导入主题
                    </button>
+                  </div>
+                </section>
+                <section className="appearance-control-card">
+                  <div>
+                    <strong>背景图片透明度</strong>
+                    <small>
+                      {Math.round(model.snapshot.settings.backgroundOpacity * 100)}%，
+                      背景会覆盖标题栏与侧边栏
+                    </small>
+                  </div>
+                  <div
+                    className="font-scale-slider"
+                    style={{
+                      "--font-scale-progress":
+                        `${((model.snapshot.settings.backgroundOpacity - 0.05) / 0.85) * 100}%`,
+                    } as CSSProperties}
+                  >
+                    <input
+                      aria-label="背景图片透明度"
+                      type="range"
+                      min="0.05"
+                      max="0.9"
+                      step="0.05"
+                      value={model.snapshot.settings.backgroundOpacity}
+                      disabled={!model.snapshot.settings.branding.backgroundPath}
+                      onChange={(event) =>
+                        model.setSetting("backgroundOpacity", Number(event.target.value))
+                      }
+                    />
                   </div>
                 </section>
               </div>
@@ -3390,6 +3486,7 @@ function EnhancedSettingsPage({
                     model.setTheme("light");
                     model.setSetting("fontFamily", "system");
                     model.setSetting("fontScale", 1);
+                    model.setSetting("backgroundOpacity", 0.35);
                     notify("已恢复默认外观与品牌文字");
                   }}
                 >

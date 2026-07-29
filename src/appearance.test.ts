@@ -1,5 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { customThemeVariables, installCustomFont } from "./appearance";
+import {
+  customThemeVariables,
+  installCustomFont,
+  readAppearancePreview,
+  writeAppearancePreview,
+} from "./appearance";
 import tauriConfig from "../src-tauri/tauri.conf.json";
 
 const { loadAppearanceAsset } = vi.hoisted(() => ({
@@ -15,6 +20,7 @@ afterEach(() => {
   document.documentElement.style.removeProperty("--custom-font");
   delete document.documentElement.dataset.customFont;
   vi.clearAllMocks();
+  localStorage.clear();
 });
 
 describe("custom font installation", () => {
@@ -65,6 +71,24 @@ describe("custom font installation", () => {
       "--sidebar-active": "#2b3133",
       "--sidebar-ink": "#f7f2e8",
       "--sidebar-muted": "#9aa4a5",
+    });
+  });
+
+  it("publishes the latest appearance synchronously for a newly opened overlay", () => {
+    writeAppearancePreview({
+      theme: "dark",
+      fontFamily: "yahei",
+      fontScale: 1.1,
+      activeCustomFontId: "",
+      customFonts: [],
+      activeCustomThemeId: "",
+      customThemes: [],
+    });
+
+    expect(readAppearancePreview()).toMatchObject({
+      theme: "dark",
+      fontFamily: "yahei",
+      fontScale: 1.1,
     });
   });
 });

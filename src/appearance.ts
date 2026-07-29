@@ -1,7 +1,52 @@
 import { loadAppearanceAsset } from "./native";
-import type { CustomTheme } from "./types";
+import type { AppSettings, CustomTheme } from "./types";
 
 const CUSTOM_FONT_STYLE_ID = "atlas-custom-font";
+const APPEARANCE_PREVIEW_KEY = "atlas-appearance-preview-v1";
+
+export type AppearancePreview = Pick<
+  AppSettings,
+  | "theme"
+  | "fontFamily"
+  | "fontScale"
+  | "customFonts"
+  | "activeCustomFontId"
+  | "customThemes"
+  | "activeCustomThemeId"
+>;
+
+export function writeAppearancePreview(settings: AppearancePreview): void {
+  try {
+    localStorage.setItem(APPEARANCE_PREVIEW_KEY, JSON.stringify(settings));
+  } catch {
+    // Native persistence remains authoritative when browser storage is unavailable.
+  }
+}
+
+export function readAppearancePreview(): AppearancePreview | null {
+  try {
+    const value = JSON.parse(localStorage.getItem(APPEARANCE_PREVIEW_KEY) ?? "null");
+    if (
+      !value ||
+      !["light", "dark"].includes(value.theme) ||
+      !["system", "serif", "yahei"].includes(value.fontFamily) ||
+      !Number.isFinite(value.fontScale)
+    ) {
+      return null;
+    }
+    return {
+      theme: value.theme,
+      fontFamily: value.fontFamily,
+      fontScale: value.fontScale,
+      customFonts: Array.isArray(value.customFonts) ? value.customFonts : [],
+      activeCustomFontId: String(value.activeCustomFontId ?? ""),
+      customThemes: Array.isArray(value.customThemes) ? value.customThemes : [],
+      activeCustomThemeId: String(value.activeCustomThemeId ?? ""),
+    };
+  } catch {
+    return null;
+  }
+}
 
 function customFontFamily(path: string): string {
   let hash = 2166136261;

@@ -74,6 +74,19 @@ function hasTauriRuntime(): boolean {
   return "__TAURI_INTERNALS__" in window;
 }
 
+export function formatLocalTimestamp(date = new Date()): string {
+  const pad = (value: number, width = 2) => String(value).padStart(width, "0");
+  const offsetMinutes = -date.getTimezoneOffset();
+  const sign = offsetMinutes >= 0 ? "+" : "-";
+  const absoluteOffset = Math.abs(offsetMinutes);
+  return (
+    `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}` +
+    `T${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}.` +
+    `${pad(date.getMilliseconds(), 3)}${sign}${pad(Math.floor(absoluteOffset / 60))}:` +
+    pad(absoluteOffset % 60)
+  );
+}
+
 function runtimeLogLine(
   level: "INFO" | "ERROR",
   action: string,
@@ -82,7 +95,7 @@ function runtimeLogLine(
   durationMs?: number,
 ) {
   const fields = [
-    new Date().toISOString(),
+    `[${formatLocalTimestamp()}]`,
     `[${level}]`,
     `action=${action}`,
     `result=${result}`,

@@ -206,6 +206,7 @@ export interface AppSettings {
   activeCustomFontId: string;
   customThemes: CustomTheme[];
   activeCustomThemeId: string;
+  backgroundOpacity: number;
   confirmOnClose: boolean;
 }
 

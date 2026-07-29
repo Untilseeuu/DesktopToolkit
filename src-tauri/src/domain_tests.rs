@@ -14,7 +14,7 @@ mod tests {
     use rusqlite::params;
     use serde_json::Value;
     use std::{
-        collections::{BTreeMap, HashMap},
+        collections::BTreeMap,
         fs,
         path::{Path, PathBuf},
         str::FromStr,
@@ -1133,20 +1133,22 @@ mod tests {
         assert_eq!(records[1].file_reference, 11);
         assert_eq!(records[1].parent_reference, 10);
 
-        let directories = HashMap::from([(
-            records[0].file_reference,
-            ntfs::DirectoryRecord::new(records[0].parent_reference, records[0].name.clone()),
-        )]);
-        let resolved = ntfs::resolve_all_directory_paths(&directories, "C:\\");
+        let mut resolver = ntfs::MftPathResolver::new("C:\\");
+        let mut resolved = Vec::new();
+        for record in &records {
+            resolver
+                .accept(record, |path, _| {
+                    resolved.push(path);
+                    Ok(())
+                })
+                .unwrap();
+        }
         assert_eq!(
-            resolved.get(&10),
-            Some(&PathBuf::from("C:\\").join("Users"))
-        );
-        assert_eq!(
-            resolved
-                .get(&records[1].parent_reference)
-                .map(|parent| parent.join(&records[1].name)),
-            Some(PathBuf::from("C:\\Users\\毕业设计课题拟定.docx"))
+            resolved,
+            vec![
+                PathBuf::from("C:\\Users"),
+                PathBuf::from("C:\\Users\\毕业设计课题拟定.docx"),
+            ]
         );
     }
 
@@ -1183,36 +1185,132 @@ mod tests {
 
     #[test]
     fn ntfs_fast_index_reconstructs_paths_from_parent_references() {
-        let directories = [
-            (5, ntfs::DirectoryRecord::new(5, "")),
-            (10, ntfs::DirectoryRecord::new(5, "Users")),
-            (20, ntfs::DirectoryRecord::new(10, "Alice")),
-        ]
-        .into_iter()
-        .collect();
-
-        let parent = ntfs::resolve_all_directory_paths(&directories, "C:\\")
-            .remove(&20)
-            .unwrap();
-
-        assert_eq!(parent, PathBuf::from("C:\\Users\\Alice"));
+        let mut resolver = ntfs::MftPathResolver::new("C:\\");
+        let mut resolved = Vec::new();
+        for record in [
+            ntfs::MftRecord {
+                file_reference: 10,
+                parent_reference: 5,
+                attributes: 0x10,
+                name: "Users".into(),
+            },
+            ntfs::MftRecord {
+                file_reference: 20,
+                parent_reference: 10,
+                attributes: 0x10,
+                name: "Alice".into(),
+            },
+        ] {
+            resolver
+                .accept(&record, |path, _| {
+                    resolved.push(path);
+                    Ok(())
+                })
+                .unwrap();
+        }
+        assert_eq!(resolved.last(), Some(&PathBuf::from("C:\\Users\\Alice")));
     }
 
     #[test]
     fn ntfs_directory_paths_are_resolved_once_and_reused_for_all_files() {
-        let directories = [
-            (5, ntfs::DirectoryRecord::new(5, "")),
-            (10, ntfs::DirectoryRecord::new(5, "Users")),
-            (20, ntfs::DirectoryRecord::new(10, "Atlas")),
-        ]
-        .into_iter()
-        .collect();
+        let mut resolver = ntfs::MftPathResolver::new("C:\\");
+        let records = [
+            ntfs::MftRecord {
+                file_reference: 10,
+                parent_reference: 5,
+                attributes: 0x10,
+                name: "Users".into(),
+            },
+            ntfs::MftRecord {
+                file_reference: 20,
+                parent_reference: 10,
+                attributes: 0x10,
+                name: "Atlas".into(),
+            },
+            ntfs::MftRecord {
+                file_reference: 21,
+                parent_reference: 20,
+                attributes: 0,
+                name: "one.txt".into(),
+            },
+            ntfs::MftRecord {
+                file_reference: 22,
+                parent_reference: 20,
+                attributes: 0,
+                name: "two.txt".into(),
+            },
+        ];
+        let mut resolved = Vec::new();
+        for record in &records {
+            resolver
+                .accept(record, |path, _| {
+                    resolved.push(path);
+                    Ok(())
+                })
+                .unwrap();
+        }
+        assert_eq!(resolved[0], PathBuf::from("C:\\Users"));
+        assert_eq!(resolved[1], PathBuf::from("C:\\Users\\Atlas"));
+        assert_eq!(resolved[2], PathBuf::from("C:\\Users\\Atlas\\one.txt"));
+        assert_eq!(resolved[3], PathBuf::from("C:\\Users\\Atlas\\two.txt"));
+    }
 
-        let resolved = ntfs::resolve_all_directory_paths(&directories, "C:\\");
+    #[test]
+    fn ntfs_streaming_resolver_releases_children_when_their_parent_arrives() {
+        let mut resolver = ntfs::MftPathResolver::new("D:\\");
+        let records = [
+            ntfs::MftRecord {
+                file_reference: 30,
+                parent_reference: 20,
+                attributes: 0,
+                name: "毕业设计.docx".into(),
+            },
+            ntfs::MftRecord {
+                file_reference: 20,
+                parent_reference: 10,
+                attributes: 0x10,
+                name: "课题".into(),
+            },
+            ntfs::MftRecord {
+                file_reference: 10,
+                parent_reference: 5,
+                attributes: 0x10,
+                name: "学习".into(),
+            },
+        ];
+        let mut emitted = Vec::new();
 
-        assert_eq!(resolved.get(&5), Some(&PathBuf::from("C:\\")));
-        assert_eq!(resolved.get(&10), Some(&PathBuf::from("C:\\Users")));
-        assert_eq!(resolved.get(&20), Some(&PathBuf::from("C:\\Users\\Atlas")));
+        for record in &records {
+            resolver
+                .accept(record, |path, is_directory| {
+                    emitted.push((path, is_directory));
+                    Ok(())
+                })
+                .unwrap();
+        }
+
+        assert_eq!(
+            emitted,
+            vec![
+                (PathBuf::from("D:\\学习"), true),
+                (PathBuf::from("D:\\学习\\课题"), true),
+                (PathBuf::from("D:\\学习\\课题\\毕业设计.docx"), false),
+            ]
+        );
+        assert_eq!(resolver.pending_count(), 0);
+    }
+
+    #[test]
+    fn ntfs_fast_index_reads_each_volume_file_table_only_once() {
+        let source = include_str!("ntfs.rs");
+        let scan_volume = source
+            .split("fn scan_volume(")
+            .nth(1)
+            .and_then(|value| value.split("pub(super) fn run_helper").next())
+            .unwrap();
+
+        assert_eq!(scan_volume.matches("enumerate_raw(volume").count(), 1);
+        assert!(scan_volume.contains("MftPathResolver::new"));
     }
 
     #[test]
@@ -1237,7 +1335,7 @@ mod tests {
     }
 
     #[test]
-    fn a_partial_directory_fallback_can_be_replaced_by_the_mft_fast_path() {
+    fn a_partial_fast_build_resumes_at_the_first_unfinished_volume() {
         let roots = [PathBuf::from("C:\\"), PathBuf::from("D:\\")];
         assert_eq!(
             search::fast_ntfs_volumes_for_build(&roots, 0, 2),
@@ -1245,7 +1343,7 @@ mod tests {
         );
         assert_eq!(
             search::fast_ntfs_volumes_for_build(&roots, 1, 2),
-            Some(vec!['C', 'D'])
+            Some(vec!['D'])
         );
         assert_eq!(search::fast_ntfs_volumes_for_build(&roots, 2, 2), None);
     }
@@ -1256,6 +1354,163 @@ mod tests {
         assert!(source.contains("BufWriter::with_capacity"));
         assert!(source.contains("BufReader::with_capacity"));
         assert!(!source.contains("set_nodelay(true)"));
+    }
+
+    #[test]
+    fn fast_ntfs_build_commits_once_per_volume_instead_of_once_per_batch() {
+        let source = include_str!("search.rs");
+        let worker = source
+            .split("fn try_fast_ntfs_index")
+            .nth(1)
+            .and_then(|value| value.split("pub(crate) fn should_descend_path").next())
+            .unwrap();
+
+        assert!(worker.contains("begin_fast_volume_transaction"));
+        assert!(worker.contains("commit_fast_volume_transaction"));
+        assert!(worker.contains("flush_index_batch_in_transaction"));
+        assert!(worker.contains("volume_writer_guard = Some(storage.index_write_guard())"));
+        assert!(!worker.contains("flush_index_batch(storage, connection, &mut records, revision)?"));
+    }
+
+    #[test]
+    fn fast_ntfs_volume_start_never_relocks_the_non_reentrant_index_gate() {
+        let source = include_str!("search.rs");
+        let volume_start = source
+            .split("FastIndexEvent::VolumeStart { volume } =>")
+            .nth(1)
+            .and_then(|value| value.split("FastIndexEvent::Entry").next())
+            .unwrap();
+
+        assert_eq!(
+            volume_start.matches("storage.index_write_guard()").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn fast_ntfs_progress_is_frequent_and_leaves_diagnostic_heartbeats() {
+        let ntfs = include_str!("ntfs.rs");
+        let search = include_str!("search.rs");
+
+        assert!(ntfs.contains("discovered % 8_192 == 0"));
+        assert!(search.contains("\"search.index.fast.progress\""));
+        assert!(search.contains("last_progress_log"));
+        assert!(search.contains("\"search.index.fast.volume\""));
+    }
+
+    #[test]
+    fn watcher_defers_staging_table_updates_while_a_full_index_is_running() {
+        let source = include_str!("search.rs");
+        let refresh = source
+            .split("fn refresh_paths(")
+            .nth(1)
+            .and_then(|value| value.split("#[cfg(test)]").next())
+            .unwrap();
+
+        assert!(refresh.contains("let build_running = INDEX_STATE.lock().running"));
+        assert!(refresh.contains("if next_exists && !build_running"));
+        assert!(refresh.contains("INSERT OR IGNORE INTO search_build_dirty_paths"));
+    }
+
+    #[test]
+    fn final_dirty_paths_are_reconciled_with_one_staging_table_scan() {
+        let source = include_str!("search.rs");
+        let reconcile = source
+            .split("fn reconcile_dirty_paths(")
+            .nth(1)
+            .and_then(|value| value.split("fn refresh_paths").next())
+            .unwrap();
+
+        assert!(reconcile.contains("CREATE TEMP TABLE temp_dirty_paths"));
+        assert!(reconcile.contains("DELETE FROM search_fts_next"));
+        assert!(reconcile.contains("SELECT target.rowid"));
+        assert!(
+            !reconcile.contains("reconcile_path_in_table(transaction, \"search_fts_next\", &path)")
+        );
+    }
+
+    #[test]
+    fn watcher_and_final_reconciliation_ignore_atlas_webview_cache() {
+        assert!(!search::should_descend_full_disk_path(
+            Path::new(
+                r"C:\Users\Atlas\AppData\Local\com.atlas.desktop-toolkit\EBWebView\Default\Cache"
+            ),
+            true,
+        ));
+
+        let source = include_str!("search.rs");
+        let refresh = source
+            .split("fn refresh_paths(")
+            .nth(1)
+            .and_then(|value| value.split("#[cfg(test)]").next())
+            .unwrap();
+        assert!(refresh.contains("is_index_internal_path"));
+        assert!(refresh.contains("is_atlas_runtime_cache_path"));
+    }
+
+    #[test]
+    fn bulk_dirty_reconciliation_updates_files_and_removes_deleted_children() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join("test-temp")
+            .join(format!("atlas-dirty-bulk-{nonce}"));
+        fs::create_dir_all(&directory).unwrap();
+        let existing = directory.join("updated.txt");
+        fs::write(&existing, "updated").unwrap();
+        let removed = directory.join("removed");
+        let removed_child = removed.join("child.txt");
+        let mut connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "
+                CREATE VIRTUAL TABLE search_fts_next USING fts5(
+                    name,
+                    path UNINDEXED,
+                    kind UNINDEXED,
+                    modified_at UNINDEXED,
+                    tokenize = 'trigram'
+                );
+                ",
+            )
+            .unwrap();
+        for (name, path) in [
+            ("stale.txt", existing.clone()),
+            ("child.txt", removed_child.clone()),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO search_fts_next(name, path, kind, modified_at)
+                     VALUES (?1, ?2, 'file', NULL)",
+                    params![name, path.to_string_lossy()],
+                )
+                .unwrap();
+        }
+
+        search::reconcile_dirty_paths_for_test(&mut connection, vec![existing.clone(), removed])
+            .unwrap();
+
+        let existing_rows = connection
+            .query_row(
+                "SELECT COUNT(*) FROM search_fts_next WHERE path = ?1",
+                [existing.to_string_lossy().as_ref()],
+                |row| row.get::<_, usize>(0),
+            )
+            .unwrap();
+        let removed_rows = connection
+            .query_row(
+                "SELECT COUNT(*) FROM search_fts_next WHERE path = ?1",
+                [removed_child.to_string_lossy().as_ref()],
+                |row| row.get::<_, usize>(0),
+            )
+            .unwrap();
+        assert_eq!(existing_rows, 1);
+        assert_eq!(removed_rows, 0);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -1294,6 +1549,7 @@ mod tests {
             .and_then(|value| value.split("}").next())
             .unwrap();
         assert!(progress_writer.contains("stream.flush()"));
+        assert!(helper.contains("FastIndexEvent::VolumeComplete"));
     }
 
     #[test]
@@ -2276,6 +2532,12 @@ mod tests {
     }
 
     #[test]
+    fn startup_queue_orders_items_by_delay_before_the_legacy_manual_order() {
+        let source = include_str!("launcher.rs");
+        assert!(source.contains("items.sort_by_key(|item| (item.delay_seconds, item.order))"));
+    }
+
+    #[test]
     fn search_index_streams_files_directly_into_the_next_fts_table() {
         let _search_test = SEARCH_TEST_LOCK.lock().unwrap();
         let nonce = SystemTime::now()
@@ -2535,6 +2797,33 @@ mod tests {
         assert!(!results
             .iter()
             .any(|result| result.name == "unrelated-helper"));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn an_existing_absolute_file_path_is_returned_without_scanning_the_name_index() {
+        let directory = std::env::temp_dir().join(format!(
+            "atlas-absolute-path-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let file = directory.join("毕业设计课题.docx");
+        fs::write(&file, b"test").unwrap();
+
+        let result = search::exact_absolute_path_result(
+            &format!("\"{}\"", file.display()),
+            "file",
+            "docx",
+            "",
+            &["*".to_string()],
+        )
+        .unwrap();
+        assert_eq!(result.name, "毕业设计课题.docx");
+        assert_eq!(PathBuf::from(result.path), file);
+
         fs::remove_dir_all(directory).unwrap();
     }
 
