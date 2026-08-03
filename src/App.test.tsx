@@ -5,8 +5,12 @@ import { vi } from "vitest";
 import App from "./App";
 import { defaultSnapshot } from "./useToolkit";
 import stylesheet from "./styles.css?inline";
+import * as native from "./native";
 
-afterEach(() => localStorage.clear());
+afterEach(() => {
+  vi.restoreAllMocks();
+  localStorage.clear();
+});
 
 describe("Atlas desktop toolkit", () => {
   it("never blocks first use with an index initialization dialog", async () => {
@@ -94,14 +98,14 @@ describe("Atlas desktop toolkit", () => {
     expect(screen.queryByText("代码助手")).not.toBeInTheDocument();
   });
 
-  it("keeps data inside the selected software installation folder", async () => {
+  it("lets the user move the active data directory", async () => {
     const user = userEvent.setup();
     render(<App />);
 
     await user.click(await screen.findByRole("button", { name: "设置" }));
     expect(await screen.findByText("数据与存储")).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "更改位置" })).not.toBeInTheDocument();
-    expect(screen.getByText("存储位置跟随软件安装目录")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "更改位置" })).toBeInTheDocument();
+    expect(screen.getByText(/选择目标文件夹后/)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "查看日志" })).toBeInTheDocument();
     expect(screen.getByText(/data\\logs/)).toBeInTheDocument();
     expect(screen.getByText("全局快捷键")).toBeInTheDocument();
@@ -116,7 +120,27 @@ describe("Atlas desktop toolkit", () => {
     expect(screen.queryByText("登录启动")).not.toBeInTheDocument();
   });
 
-  it("shows whether an index exists and confirms before building the selected scope", async () => {
+  it("offers only one full-disk index and no directory scope controls", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole("button", { name: "设置" }));
+
+    expect(await screen.findByText("所有可用磁盘")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "添加目录" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "全部磁盘" })).not.toBeInTheDocument();
+  });
+
+  it("uses the shared tool toolbar spacing for clipboard search", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole("button", { name: "剪贴板历史" }));
+
+    expect(
+      screen.getByPlaceholderText("搜索复制过的文字或图片").closest(".library-toolbar"),
+    ).not.toBeNull();
+  });
+
+  it("shows whether the full-disk index exists", async () => {
     localStorage.setItem(
       "atlas-toolkit-state-v1",
       JSON.stringify({
@@ -124,7 +148,6 @@ describe("Atlas desktop toolkit", () => {
         settings: {
           ...defaultSnapshot.settings,
           indexSetup: "deferred",
-          indexRoots: ["*"],
         },
       }),
     );
@@ -133,23 +156,16 @@ describe("Atlas desktop toolkit", () => {
     await user.click(await screen.findByRole("button", { name: "设置" }));
 
     expect(await screen.findByText("未建立索引")).toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: "全部磁盘" }));
-    expect(
-      screen.getByRole("dialog", { name: "建立全部磁盘索引？" }),
-    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "建立索引" })).toBeInTheDocument();
   });
 
-  it("does not rebuild an already indexed full-disk scope without a reason", async () => {
+  it("offers an explicit rebuild for an existing full-disk index", async () => {
     const user = userEvent.setup();
     render(<App />);
     await user.click(await screen.findByRole("button", { name: "设置" }));
 
     expect(await screen.findByText("索引已建立")).toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: "全部磁盘" }));
-    expect(await screen.findByText("当前全盘索引已经建立，无需重复建立")).toBeInTheDocument();
-    expect(
-      screen.queryByRole("dialog", { name: "建立全部磁盘索引？" }),
-    ).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "重建索引" })).toBeInTheDocument();
   });
 
   it("applies global branding and custom tool names immediately", async () => {
@@ -215,6 +231,90 @@ describe("Atlas desktop toolkit", () => {
 
     expect(await screen.findByText("安装依赖")).toBeInTheDocument();
     expect(screen.getByText("2 步")).toBeInTheDocument();
+  });
+
+  it("allows different automation tasks to run at the same time", async () => {
+    let finishFirst: ((value: native.CommandExecution[]) => void) | undefined;
+    let finishSecond: ((value: native.CommandExecution[]) => void) | undefined;
+    const firstRun = new Promise<native.CommandExecution[]>((resolve) => {
+      finishFirst = resolve;
+    });
+    const secondRun = new Promise<native.CommandExecution[]>((resolve) => {
+      finishSecond = resolve;
+    });
+    const run = vi
+      .spyOn(native, "runCommandTask")
+      .mockReturnValueOnce(firstRun)
+      .mockReturnValueOnce(secondRun);
+    localStorage.setItem(
+      "atlas-toolkit-state-v1",
+      JSON.stringify({
+        ...defaultSnapshot,
+        commandTasks: [
+          {
+            id: "frontend",
+            name: "前端启动",
+            description: "",
+            commands: ["npm run dev"],
+            showTerminal: false,
+            closeTerminalOnFinish: true,
+            createdAt: 1,
+            updatedAt: 1,
+          },
+          {
+            id: "backend",
+            name: "后端启动",
+            description: "",
+            commands: ["mvn spring-boot:run"],
+            showTerminal: false,
+            closeTerminalOnFinish: true,
+            createdAt: 2,
+            updatedAt: 2,
+          },
+        ],
+      }),
+    );
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole("button", { name: "自动化命令" }));
+
+    const frontendCard = screen.getByText("前端启动").closest("article")!;
+    const backendCard = screen.getByText("后端启动").closest("article")!;
+    await user.click(within(frontendCard).getByRole("button", { name: "运行" }));
+
+    expect(within(frontendCard).getByRole("button", { name: "执行中…" })).toBeDisabled();
+    expect(within(backendCard).getByRole("button", { name: "运行" })).toBeEnabled();
+    await user.click(within(backendCard).getByRole("button", { name: "运行" }));
+    expect(run).toHaveBeenCalledTimes(2);
+
+    finishFirst?.([]);
+    finishSecond?.([]);
+  });
+
+  it("prevents opening a second automation draft while one is being edited", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole("button", { name: "自动化命令" }));
+
+    const create = await screen.findByRole("button", { name: "新建任务" });
+    await user.click(create);
+
+    expect(create).toBeDisabled();
+    expect(screen.getAllByRole("textbox", { name: "任务名称" })).toHaveLength(1);
+  });
+
+  it("uses the shared typography hierarchy throughout startup orchestration", async () => {
+    const user = userEvent.setup();
+    const { container } = render(<App />);
+    await user.click(await screen.findByRole("button", { name: "启动编排" }));
+
+    expect(container.querySelector(".startup-page")).not.toBeNull();
+    expect(stylesheet).toMatch(
+      /\.startup-page\s+:is\([\s\S]*?\.scene-tabs button[\s\S]*?\.scene-membership label[\s\S]*?\)\s*\{[\s\S]*?font-size:\s*calc\(10px\s*\*\s*var\(--font-scale\)\)/,
+    );
+    expect(stylesheet).toMatch(
+      /\.startup-page\s+:is\([\s\S]*?\.scene-tabs small[\s\S]*?\.startup-main small[\s\S]*?\)\s*\{[\s\S]*?font-size:\s*calc\(9px\s*\*\s*var\(--font-scale\)\)/,
+    );
   });
 
   it("offers Microsoft YaHei and removes the monospace interface font", async () => {

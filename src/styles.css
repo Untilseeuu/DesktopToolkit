@@ -366,7 +366,11 @@ a:focus-visible {
 
 .clipboard-search {
   max-width: 520px;
-  margin-bottom: 14px;
+  margin: 0;
+}
+
+.clipboard-toolbar {
+  justify-content: flex-start;
 }
 
 .clipboard-list {
@@ -3194,6 +3198,46 @@ kbd {
   border: 1px solid var(--line);
   border-radius: 15px;
   background: color-mix(in srgb, var(--card) 90%, transparent);
+}
+
+.startup-page :is(
+  .scene-tabs button,
+  .scene-summary,
+  .scene-behavior,
+  .startup-list,
+  .scene-membership label,
+  .note-panel
+) {
+  font-size: calc(10px * var(--font-scale));
+  line-height: 1.5;
+}
+
+.startup-page :is(
+  .scene-tabs strong,
+  .scene-summary strong,
+  .scene-behavior strong,
+  .startup-main strong,
+  .scene-membership header strong
+) {
+  font-size: calc(11px * var(--font-scale));
+  line-height: 1.35;
+}
+
+.startup-page :is(
+  .scene-tabs small,
+  .scene-summary small,
+  .scene-behavior small,
+  .startup-main small,
+  .scene-layout-empty,
+  .scene-membership header small
+) {
+  font-size: calc(9px * var(--font-scale));
+  line-height: 1.55;
+}
+
+.startup-page .list-header {
+  font-size: calc(9px * var(--font-scale));
+  letter-spacing: 0.08em;
 }
 
 .scene-tabs {

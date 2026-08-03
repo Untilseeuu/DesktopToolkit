@@ -96,6 +96,7 @@ import {
   launchStartupItems,
   listStartupSceneMonitors,
   loadAppearanceAsset,
+  migrateDataDirectory,
   openRuntimeLog,
   openTarget,
   recordRuntimeEvent,
@@ -419,9 +420,7 @@ function MainApp({ model }: { model: ToolkitModel }) {
     ) {
       return;
     }
-    const scopeName = model.snapshot.settings.indexRoots.includes("*")
-      ? "全盘索引"
-      : "目录索引";
+    const scopeName = "全盘索引";
     void getSearchIndexCount().then((storedCount) => {
       const count = Math.max(storedCount, indexProgress.indexedItems);
       model.setSetting("indexSetup", "ready");
@@ -435,7 +434,6 @@ function MainApp({ model }: { model: ToolkitModel }) {
   }, [
     indexProgress?.indexedItems,
     indexProgress?.status,
-    model.snapshot.settings.indexRoots,
     model.snapshot.settings.indexSetup,
   ]);
 
@@ -472,14 +470,12 @@ function MainApp({ model }: { model: ToolkitModel }) {
     if (mainPanelRef.current) mainPanelRef.current.scrollTop = 0;
   }, [activeNav]);
 
-  const startIndexBuild = async (roots: string[]) => {
-    model.setSetting("indexRoots", roots);
+  const startIndexBuild = async () => {
     model.setSetting("indexSetup", "pending");
     const buildingSnapshot = {
       ...model.snapshot,
       settings: {
         ...model.snapshot.settings,
-        indexRoots: roots,
         indexSetup: "pending" as const,
       },
     };
@@ -487,7 +483,7 @@ function MainApp({ model }: { model: ToolkitModel }) {
       // Persist the selected scope before scanning so an interrupted first-run
       // build resumes the same scope instead of falling back to all disks.
       await saveSnapshot(buildingSnapshot);
-      const count = await rebuildSearchIndex(roots);
+      const count = await rebuildSearchIndex();
       model.setSetting("indexSetup", "ready");
       await saveSnapshot({
         ...buildingSnapshot,
@@ -540,7 +536,7 @@ function MainApp({ model }: { model: ToolkitModel }) {
             model={model}
             notify={setToast}
             indexProgress={indexProgress}
-            onStartIndex={() => void startIndexBuild(model.snapshot.settings.indexRoots)}
+            onStartIndex={() => void startIndexBuild()}
           />
         );
       case "prompts":
@@ -557,7 +553,7 @@ function MainApp({ model }: { model: ToolkitModel }) {
             model={model}
             notify={setToast}
             indexProgress={indexProgress}
-            onStartIndex={(roots) => void startIndexBuild(roots)}
+            onStartIndex={() => void startIndexBuild()}
           />
         );
       default:
@@ -985,7 +981,7 @@ function StartupPage({
   };
 
   return (
-    <>
+    <div className="startup-page">
       <SectionHeading
         eyebrow="TOOL 01 · STARTUP"
         title={model.snapshot.settings.branding.toolNames.startup}
@@ -1298,7 +1294,7 @@ function StartupPage({
           是否让 Atlas 随 Windows 开机自启动由“设置 → 开机自启动”单独控制；启动编排开关只控制开机后是否执行所选场景。
         </p>
       </aside>
-    </>
+    </div>
   );
 }
 
@@ -1869,14 +1865,16 @@ function ClipboardPage({
           />
         }
       />
-      <label className="compact-search clipboard-search">
-        <Search size={17} />
-        <input
-          value={query}
-          onChange={(event) => setQuery(event.target.value)}
-          placeholder="搜索复制过的文字或图片"
-        />
-      </label>
+      <div className="library-toolbar clipboard-toolbar">
+        <label className="compact-search clipboard-search">
+          <Search size={17} />
+          <input
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+            placeholder="搜索复制过的文字或图片"
+          />
+        </label>
+      </div>
       <section className={`clipboard-list ${entries.length ? "" : "is-empty"}`}>
         {entries.length ? (
           entries.map((entry) => {
@@ -1996,7 +1994,7 @@ function AutomationPage({
 }) {
   const enabled = model.snapshot.tools.automation.enabled;
   const [draft, setDraft] = useState<CommandTask | null>(null);
-  const [runningId, setRunningId] = useState<string | null>(null);
+  const [runningIds, setRunningIds] = useState<Set<string>>(() => new Set());
   const [logs, setLogs] = useState<Array<{
     command: string;
     success: boolean;
@@ -2051,6 +2049,8 @@ function AutomationPage({
         </div>
         <button
           className="button primary"
+          disabled={draft !== null}
+          title={draft ? "请先保存或取消当前任务" : undefined}
           onClick={() =>
             setDraft({
               id: `command-${Date.now()}`,
@@ -2191,9 +2191,9 @@ function AutomationPage({
               </button>
               <button
                 className="button primary run-task"
-                disabled={runningId !== null}
+                disabled={runningIds.has(task.id)}
                 onClick={() => {
-                  setRunningId(task.id);
+                  setRunningIds((current) => new Set(current).add(task.id));
                   setLogs([]);
                   void runCommandTask(task)
                     .then((results) => {
@@ -2208,11 +2208,17 @@ function AutomationPage({
                        );
                     })
                     .catch((error: unknown) => notify(`执行失败：${String(error)}`))
-                    .finally(() => setRunningId(null));
+                    .finally(() =>
+                      setRunningIds((current) => {
+                        const next = new Set(current);
+                        next.delete(task.id);
+                        return next;
+                      }),
+                    );
                 }}
               >
                 <Play size={15} />
-                {runningId === task.id ? "执行中…" : "运行"}
+                {runningIds.has(task.id) ? "执行中…" : "运行"}
               </button>
             </footer>
           </article>
@@ -2784,17 +2790,12 @@ function EnhancedSettingsPage({
   model: ToolkitModel;
   notify: (message: string) => void;
   indexProgress: IndexProgress | null;
-  onStartIndex: (roots: string[]) => void;
+  onStartIndex: () => void;
 }) {
-  type PendingIndexScope = {
-    roots: string[];
-    title: string;
-    description: string;
-  };
   const [linkDraft, setLinkDraft] = useState<QuickLink | null>(null);
   const [personalizationOpen, setPersonalizationOpen] = useState(false);
-  const [pendingIndexScope, setPendingIndexScope] =
-    useState<PendingIndexScope | null>(null);
+  const [pendingDataParent, setPendingDataParent] = useState<string | null>(null);
+  const [dataMoving, setDataMoving] = useState(false);
   const [excludedAppsText, setExcludedAppsText] = useState(
     model.snapshot.settings.clipboardExcludedApps.join(", "),
   );
@@ -2813,59 +2814,32 @@ function EnhancedSettingsPage({
     setRetentionDaysText(String(model.snapshot.settings.clipboardRetentionDays));
   }, [model.snapshot.settings.clipboardRetentionDays]);
 
-  const normalizeIndexRoots = (roots: string[]) => {
-    if (roots.includes("*")) return ["*"];
-    return Array.from(
-      new Set(
-        roots.map((root) =>
-          root.replaceAll("/", "\\").replace(/\\+$/, "").toLocaleLowerCase(),
-        ),
-      ),
-    ).sort();
-  };
-  const sameIndexScope = (left: string[], right: string[]) =>
-    JSON.stringify(normalizeIndexRoots(left)) === JSON.stringify(normalizeIndexRoots(right));
   const indexBuilding = indexProgress?.status === "indexing";
   const indexReady =
     model.snapshot.settings.indexSetup === "ready" &&
     !indexBuilding &&
     indexProgress?.status !== "failed";
 
-  const requestIndexScope = (
-    roots: string[],
-    title: string,
-    description: string,
-    alreadyBuiltMessage: string,
-  ) => {
-    if (
-      indexBuilding &&
-      sameIndexScope(roots, model.snapshot.settings.indexRoots)
-    ) {
-      notify(`${roots.includes("*") ? "全盘" : "当前目录"}索引正在建立，请稍候`);
-      return;
-    }
-    if (indexReady && sameIndexScope(roots, model.snapshot.settings.indexRoots)) {
-      notify(alreadyBuiltMessage);
-      return;
-    }
-    setPendingIndexScope({ roots, title, description });
+  const chooseDataDestination = async () => {
+    const parent = await chooseDirectory();
+    if (parent) setPendingDataParent(parent);
   };
 
-  const addRoot = async () => {
-    const root = await chooseDirectory();
-    if (!root) return;
-    const roots = Array.from(
-      new Set([
-        ...model.snapshot.settings.indexRoots.filter((item) => item !== "*"),
-        root,
-      ]),
-    );
-    requestIndexScope(
-      roots,
-      "建立指定目录索引？",
-      `确认后将把索引范围切换为 ${roots.length} 个指定目录，并重新建立可搜索的文件列表。`,
-      "该目录已在当前索引范围中，索引已经建立",
-    );
+  const confirmDataMigration = async () => {
+    if (!pendingDataParent) return;
+    const parent = pendingDataParent;
+    setPendingDataParent(null);
+    setDataMoving(true);
+    notify("正在移动数据，请勿关闭软件");
+    try {
+      const directory = await migrateDataDirectory(parent);
+      model.setDataDirectory(directory);
+      notify("数据已移动到新的存储位置");
+    } catch (error) {
+      notify(`移动数据失败：${String(error)}`);
+    } finally {
+      setDataMoving(false);
+    }
   };
 
   const updateShortcut = (
@@ -2986,15 +2960,23 @@ function EnhancedSettingsPage({
         <section className="settings-section">
           <header>
             <Database size={19} />
-            <div><h2>数据与存储</h2><p>固定保存在软件安装目录内部的 data 文件夹。</p></div>
+            <div><h2>数据与存储</h2><p>默认保存在软件安装目录，也可以完整迁移到其他磁盘。</p></div>
           </header>
           <div className="setting-row storage-row">
             <span className="drive-icon"><HardDrive size={22} /></span>
             <div>
               <strong>当前存储位置</strong>
               <code>{model.snapshot.settings.dataDirectory}</code>
-              <small>存储位置跟随软件安装目录</small>
+              <small>选择目标文件夹后，Atlas 会在其中创建 data 文件夹并移动现有数据。</small>
             </div>
+            <button
+              type="button"
+              className="button secondary"
+              disabled={dataMoving}
+              onClick={() => void chooseDataDestination()}
+            >
+              <FolderOpen size={16} /> {dataMoving ? "正在移动" : "更改位置"}
+            </button>
           </div>
           <div className="setting-row">
             <div>
@@ -3500,16 +3482,12 @@ function EnhancedSettingsPage({
         <section className="settings-section">
           <header>
             <FileSearch size={19} />
-            <div><h2>全盘索引</h2><p>默认扫描所有可用磁盘，也可以只索引指定目录。</p></div>
+            <div><h2>全盘索引</h2><p>统一索引电脑上的所有可用磁盘，持续响应文件变化。</p></div>
           </header>
           <div className="setting-row">
             <div>
               <strong>当前索引范围</strong>
-              <small>
-                {model.snapshot.settings.indexRoots.includes("*")
-                  ? "所有可用磁盘"
-                  : model.snapshot.settings.indexRoots.join("、")}
-              </small>
+              <small>所有可用磁盘</small>
               <span
                 className={`index-scope-status ${
                   indexBuilding ? "building" : indexReady ? "ready" : "missing"
@@ -3526,26 +3504,10 @@ function EnhancedSettingsPage({
               <button
                 className="button primary"
                 disabled={indexBuilding}
-                onClick={() => onStartIndex(model.snapshot.settings.indexRoots)}
+                onClick={onStartIndex}
               >
                 <FileSearch size={16} />
                 {indexReady ? "重建索引" : "建立索引"}
-              </button>
-              <button
-                className="button secondary"
-                onClick={() =>
-                  requestIndexScope(
-                    ["*"],
-                    "建立全部磁盘索引？",
-                    "确认后将索引电脑上的所有可用磁盘，并替换当前索引范围。建立期间仍可继续使用其他工具。",
-                    "当前全盘索引已经建立，无需重复建立",
-                  )
-                }
-              >
-                <HardDrive size={16} /> 全部磁盘
-              </button>
-              <button className="button secondary" onClick={() => void addRoot()}>
-                <Plus size={16} /> 添加目录
               </button>
             </div>
           </div>
@@ -3654,32 +3616,31 @@ function EnhancedSettingsPage({
           </div>
         </section>
       </div>
-      {pendingIndexScope ? (
+      {pendingDataParent ? (
         <div className="modal-backdrop">
           <section
             className="confirm-dialog"
             role="dialog"
             aria-modal="true"
-            aria-labelledby="confirm-index-scope-title"
+            aria-labelledby="confirm-data-migration-title"
           >
-            <span className="confirm-dialog-icon"><FileSearch size={20} /></span>
+            <span className="confirm-dialog-icon"><Database size={20} /></span>
             <div>
-              <h2 id="confirm-index-scope-title">{pendingIndexScope.title}</h2>
-              <p>{pendingIndexScope.description}</p>
+              <h2 id="confirm-data-migration-title">移动数据存储位置？</h2>
+              <p>
+                Atlas 将把现有数据完整移动到 {pendingDataParent} 下的 data 文件夹。
+                移动期间会暂停索引更新，请勿关闭软件。
+              </p>
             </div>
             <footer>
-              <button className="button ghost" onClick={() => setPendingIndexScope(null)}>
+              <button className="button ghost" onClick={() => setPendingDataParent(null)}>
                 取消
               </button>
               <button
                 className="button primary"
-                onClick={() => {
-                  const roots = pendingIndexScope.roots;
-                  setPendingIndexScope(null);
-                  onStartIndex(roots);
-                }}
+                onClick={() => void confirmDataMigration()}
               >
-                确认建立
+                确认移动
               </button>
             </footer>
           </section>

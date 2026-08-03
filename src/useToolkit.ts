@@ -82,7 +82,6 @@ export const defaultSnapshot: AppSnapshot = {
     shortcuts: { ...DEFAULT_SHORTCUTS },
     dataDirectory: "应用目录\\data",
     indexSetup: "ready",
-    indexRoots: ["*"],
     excludedPatterns: ["node_modules", ".git", "Windows\\WinSxS"],
     searchFilters: { kind: "all", extension: "", drive: "" },
     clipboardLimit: 50,

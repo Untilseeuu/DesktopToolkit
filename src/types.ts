@@ -192,7 +192,6 @@ export interface AppSettings {
   };
   dataDirectory: string;
   indexSetup: "pending" | "deferred" | "ready";
-  indexRoots: string[];
   excludedPatterns: string[];
   searchFilters: SearchFilters;
   clipboardLimit: number;

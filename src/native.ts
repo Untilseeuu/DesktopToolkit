@@ -224,6 +224,13 @@ export async function getDataDirectory(): Promise<string | null> {
   return invokeNative<string>("get_data_directory");
 }
 
+export async function migrateDataDirectory(destinationParent: string): Promise<string> {
+  return (
+    (await invokeNative<string>("migrate_data_directory", { destinationParent }))
+    ?? `${destinationParent.replace(/[\\/]+$/, "")}\\data`
+  );
+}
+
 export async function quitApplication(): Promise<void> {
   recordRuntimeEvent("application.quit", "started");
   await flushRuntimeLogs();
@@ -376,8 +383,8 @@ export async function getAppIcons(paths: string[]): Promise<Record<string, strin
   }
 }
 
-export async function rebuildSearchIndex(roots: string[]): Promise<number> {
-  return (await invokeNative<number>("rebuild_search_index", { roots })) ?? 0;
+export async function rebuildSearchIndex(): Promise<number> {
+  return (await invokeNative<number>("rebuild_search_index")) ?? 0;
 }
 
 export async function getSearchIndexStatus(): Promise<string> {

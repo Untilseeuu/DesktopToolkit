@@ -253,9 +253,7 @@ describe("mergeSnapshotDefaults clipboard privacy", () => {
     const legacy = structuredClone({
       ...({} as AppSnapshot),
       tools: {},
-      settings: {
-        indexRoots: ["*"],
-      },
+      settings: {},
     }) as AppSnapshot;
 
     const migrated = mergeSnapshotDefaults(legacy);
@@ -374,7 +372,6 @@ describe("mergeSnapshotDefaults", () => {
         theme: "light",
         shortcut: "Alt+Space",
         dataDirectory: "D:\\Atlas\\data",
-        indexRoots: [],
         excludedPatterns: [],
       },
     } as unknown as AppSnapshot;
@@ -403,10 +400,7 @@ describe("mergeSnapshotDefaults", () => {
       quickLinks: [],
       clipboardHistory: [],
       activity: { searches: [], copies: [] },
-      settings: {
-        ...({} as AppSnapshot["settings"]),
-        indexRoots: ["*"],
-      },
+      settings: { ...({} as AppSnapshot["settings"]) },
     });
 
     expect(merged.tools.automation.enabled).toBe(true);
@@ -471,7 +465,6 @@ function defaultSnapshotForMigration(): AppSnapshot {
         clipboard: "Alt+Shift+V",
       },
       dataDirectory: "",
-      indexRoots: ["*"],
       excludedPatterns: [],
       searchFilters: { kind: "all", extension: "", drive: "" },
       clipboardLimit: 50,

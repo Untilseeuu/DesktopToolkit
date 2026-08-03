@@ -701,7 +701,7 @@ mod tests {
     }
 
     #[test]
-    fn installed_storage_ignores_legacy_data_and_retires_its_pointer() {
+    fn installed_storage_uses_a_valid_selected_data_pointer() {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -733,10 +733,13 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(storage.data_dir(), install_dir.join("data"));
-        assert_eq!(storage.load_snapshot().unwrap(), serde_json::Value::Null);
+        assert_eq!(storage.data_dir(), legacy_data);
+        assert_eq!(
+            storage.load_snapshot().unwrap(),
+            serde_json::json!({ "marker": "legacy-appdata" })
+        );
         assert!(legacy_data.join("atlas.db").is_file());
-        assert!(!legacy_pointer.exists());
+        assert!(legacy_pointer.exists());
         drop(storage);
         fs::remove_dir_all(root).unwrap();
     }
@@ -810,6 +813,60 @@ mod tests {
                 .get("marker")
                 .and_then(Value::as_str),
             Some("existing-data")
+        );
+        drop(reopened);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn storage_migration_moves_state_and_reopens_from_the_location_pointer() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("atlas-storage-move-{nonce}"));
+        let install_dir = root.join("Atlas");
+        let executable = install_dir.join("atlas.exe");
+        let pointer = root.join("config").join("data-location.json");
+        let destination_parent = root.join("PortableData");
+        let storage =
+            StorageManager::for_installed_test_with_legacy_pointer(&executable, &pointer).unwrap();
+        storage
+            .update_snapshot(|snapshot| {
+                *snapshot = serde_json::json!({
+                    "marker": "moved",
+                    "settings": { "dataDirectory": storage.data_dir() }
+                });
+                Ok(())
+            })
+            .unwrap();
+        let original = storage.data_dir();
+
+        let moved = storage.migrate_to_parent(&destination_parent).unwrap();
+
+        assert_eq!(moved, destination_parent.join("data"));
+        assert_eq!(storage.data_dir(), moved);
+        assert!(!original.exists());
+        assert_eq!(
+            storage
+                .load_snapshot()
+                .unwrap()
+                .pointer("/marker")
+                .and_then(Value::as_str),
+            Some("moved")
+        );
+        drop(storage);
+
+        let reopened =
+            StorageManager::for_installed_test_with_legacy_pointer(&executable, &pointer).unwrap();
+        assert_eq!(reopened.data_dir(), destination_parent.join("data"));
+        assert_eq!(
+            reopened
+                .load_snapshot()
+                .unwrap()
+                .pointer("/settings/dataDirectory")
+                .and_then(Value::as_str),
+            Some(destination_parent.join("data").to_string_lossy().as_ref())
         );
         drop(reopened);
         fs::remove_dir_all(root).unwrap();
@@ -1711,9 +1768,14 @@ mod tests {
         );
         assert!(search_source.contains("INDEX_DIRTY_PATHS"));
         assert!(search_source.contains("reconcile_dirty_paths"));
-        assert!(search_source.contains("without another overflow"));
-        assert!(search_source.contains("latest_requests == observed_requests"));
-        assert!(search_source.contains("256 * 1024"));
+        let overflow = search_source
+            .split("fn handle_watcher_overflow")
+            .nth(1)
+            .and_then(|value| value.split("pub fn start_watchers").next())
+            .unwrap();
+        assert!(!overflow.contains("rebuild("));
+        assert!(overflow.contains("search.index.watcher_overflow"));
+        assert!(search_source.contains("1024 * 1024"));
     }
 
     #[test]
@@ -1739,10 +1801,23 @@ mod tests {
             .and_then(|value| value.split("pub fn stop_watchers").next())
             .unwrap();
         assert!(watcher.contains("is_index_internal_path"));
-        assert!(watcher.contains("queue_overflow_validation"));
+        assert!(watcher.contains("handle_watcher_overflow"));
         assert!(source.contains("search_build_dirty_paths"));
         assert!(source.contains("INDEX_ENTRY_CHUNK"));
         assert!(source.contains("WATCH_REFRESH_BATCH_SIZE"));
+    }
+
+    #[test]
+    fn completed_index_validation_reads_metadata_without_scanning_every_fts_path() {
+        let source = include_str!("search.rs");
+        let validation = source
+            .split("pub fn has_index")
+            .nth(1)
+            .and_then(|value| value.split("pub fn has_full_disk_index").next())
+            .unwrap();
+        assert!(validation.contains("FROM search_fts LIMIT 1"));
+        assert!(!validation.contains("substr(path"));
+        assert!(validation.contains("FROM search_meta"));
     }
 
     #[test]
@@ -1936,7 +2011,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_search_cache_excludes_large_user_collections() {
+    fn runtime_search_cache_excludes_scopes_and_large_user_collections() {
         let source = serde_json::json!({
             "tools": { "search": { "enabled": false } },
             "settings": {
@@ -1955,12 +2030,7 @@ mod tests {
                 .and_then(Value::as_bool),
             Some(false)
         );
-        assert_eq!(
-            cached
-                .pointer("/settings/indexRoots/0")
-                .and_then(Value::as_str),
-            Some("D:\\学习资料")
-        );
+        assert!(cached.get("settings").is_none());
         assert!(cached.get("clipboardHistory").is_none());
         assert!(cached.get("prompts").is_none());
         assert!(cached.pointer("/settings/clipboardLimit").is_none());
@@ -2619,21 +2689,6 @@ mod tests {
                 search::query(&storage, "quarterly", "", "", &drive, &["*".into()]).unwrap();
             assert_eq!(drive_results.len(), 2);
         }
-        storage
-            .with_search_connection(|connection| {
-                connection
-                    .execute(
-                        "INSERT INTO search_fts(name, path, kind) VALUES (?1, ?2, ?3)",
-                        ["legacy.txt", r"\\?\C:\legacy.txt", "file"],
-                    )
-                    .map_err(|error| error.to_string())?;
-                Ok(())
-            })
-            .unwrap();
-        assert!(!search::has_index(
-            &storage,
-            &[files.to_string_lossy().to_string()]
-        ));
         fs::remove_dir_all(directory).unwrap();
     }
 

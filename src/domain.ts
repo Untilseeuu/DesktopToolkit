@@ -268,17 +268,6 @@ export function clipboardEntrySearchText(entry: ClipboardEntry): string {
 export function mergeSnapshotDefaults(snapshot: AppSnapshot): AppSnapshot {
   const legacyShortcut = (snapshot.settings as AppSnapshot["settings"] & { shortcut?: string })
     .shortcut;
-  const savedRoots = snapshot.settings?.indexRoots ?? [];
-  const indexRoots =
-    savedRoots.length === 0 ||
-    savedRoots.some(
-      (root) =>
-        root === "用户目录" ||
-        root === "开始菜单" ||
-        (!root.includes(":\\") && !root.startsWith("/") && root !== "*"),
-    )
-      ? ["*"]
-      : savedRoots;
   const startupItems = snapshot.startupItems ?? [];
   const startupScenes = (snapshot.startupScenes?.length
     ? snapshot.startupScenes
@@ -340,7 +329,6 @@ export function mergeSnapshotDefaults(snapshot: AppSnapshot): AppSnapshot {
       },
       dataDirectory: snapshot.settings?.dataDirectory ?? "",
       indexSetup: snapshot.settings?.indexSetup ?? "ready",
-      indexRoots,
       excludedPatterns: snapshot.settings?.excludedPatterns ?? [
         "node_modules",
         ".git",

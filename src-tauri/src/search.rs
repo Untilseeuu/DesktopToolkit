@@ -52,9 +52,6 @@ static INDEX_REVISION: AtomicU64 = AtomicU64::new(0);
 static QUERY_REVISION: AtomicU64 = AtomicU64::new(0);
 #[cfg(all(target_os = "windows", not(test)))]
 static WATCH_REVISION: AtomicU64 = AtomicU64::new(0);
-#[cfg(all(target_os = "windows", not(test)))]
-static WATCH_OVERFLOW_REBUILD_QUEUED: LazyLock<Mutex<HashMap<u64, u64>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
 static LAST_QUERY_AT_MS: AtomicU64 = AtomicU64::new(0);
 static QUERY_GATE: Mutex<()> = Mutex::new(());
 static INDEX_DIRTY_PATHS: LazyLock<Mutex<HashSet<PathBuf>>> =
@@ -1204,47 +1201,18 @@ pub fn refresh_path(storage: &StorageManager, path: &Path) -> Result<(), String>
 }
 
 #[cfg(all(target_os = "windows", not(test)))]
-fn queue_overflow_validation(
-    storage: Arc<StorageManager>,
-    watcher_scope: Vec<String>,
-    watcher_revision: u64,
-) {
-    {
-        let mut queued = WATCH_OVERFLOW_REBUILD_QUEUED.lock();
-        let requests = queued.entry(watcher_revision).or_default();
-        *requests = requests.saturating_add(1);
-        if *requests > 1 {
-            return;
-        }
-    }
-    std::thread::spawn(move || {
-        // Keep coalescing overflows until a complete validation finishes
-        // without another overflow. Stopping after a fixed number of passes
-        // can publish a stale index when an overflow occurs behind the final
-        // scan cursor.
-        loop {
-            while WATCH_REVISION.load(Ordering::Acquire) == watcher_revision
-                && status() == "indexing"
-            {
-                std::thread::sleep(Duration::from_millis(250));
-            }
-            if WATCH_REVISION.load(Ordering::Acquire) != watcher_revision {
-                break;
-            }
-            let observed_requests = WATCH_OVERFLOW_REBUILD_QUEUED
-                .lock()
-                .get(&watcher_revision)
-                .copied()
-                .unwrap_or_default();
-            let _ = rebuild(&storage, watcher_scope.clone());
-            let mut queued = WATCH_OVERFLOW_REBUILD_QUEUED.lock();
-            let latest_requests = queued.get(&watcher_revision).copied().unwrap_or_default();
-            if latest_requests == observed_requests {
-                queued.remove(&watcher_revision);
-                return;
-            }
-        }
-    });
+fn handle_watcher_overflow(storage: &StorageManager, watcher_revision: u64) {
+    // A notification overflow must never silently launch another multi-million
+    // item rebuild. Keep the completed index available and continue consuming
+    // subsequent notifications. The event is recorded so a manual rebuild can
+    // be requested if the user observes a stale entry.
+    crate::runtime_log::append_event(
+        &storage.data_dir(),
+        "WARN",
+        "search.index.watcher_overflow",
+        "notifications_dropped",
+        &format!("watcher_revision={watcher_revision} action=keep_existing_index"),
+    );
 }
 
 #[cfg(all(target_os = "windows", not(test)))]
@@ -1269,11 +1237,6 @@ pub fn start_watchers(storage: Arc<StorageManager>, requested_roots: Vec<String>
     };
 
     let revision = WATCH_REVISION.fetch_add(1, Ordering::AcqRel) + 1;
-    let watcher_scope = if requested_roots.is_empty() {
-        vec!["*".to_string()]
-    } else {
-        requested_roots.clone()
-    };
     let roots = if requested_roots.is_empty() || requested_roots.iter().any(|root| root == "*") {
         default_roots()
     } else {
@@ -1281,7 +1244,6 @@ pub fn start_watchers(storage: Arc<StorageManager>, requested_roots: Vec<String>
     };
     for root in distinct_roots(roots) {
         let storage = storage.clone();
-        let watcher_scope = watcher_scope.clone();
         std::thread::spawn(move || {
             let data_dir = storage.data_dir();
             let mut wide = root.as_os_str().encode_wide().collect::<Vec<_>>();
@@ -1307,7 +1269,7 @@ pub fn start_watchers(storage: Arc<StorageManager>, requested_roots: Vec<String>
                 }
                 return;
             }
-            let mut buffer = vec![0u8; 256 * 1024];
+            let mut buffer = vec![0u8; 1024 * 1024];
             'watch: while WATCH_REVISION.load(Ordering::Acquire) == revision {
                 let mut returned = 0u32;
                 let mut overlapped = unsafe { std::mem::zeroed::<OVERLAPPED>() };
@@ -1362,7 +1324,7 @@ pub fn start_watchers(storage: Arc<StorageManager>, requested_roots: Vec<String>
                     // into one validation pass. The watcher keeps consuming
                     // notifications instead of synchronously blocking on a
                     // second full scan or starting an endless rebuild loop.
-                    queue_overflow_validation(storage.clone(), watcher_scope.clone(), revision);
+                    handle_watcher_overflow(&storage, revision);
                     continue;
                 }
                 let mut offset = 0usize;
@@ -3033,19 +2995,14 @@ pub fn has_index(storage: &StorageManager, requested_roots: &[String]) -> bool {
                 .query_row(
                     "
                     SELECT EXISTS(SELECT 1 FROM search_fts LIMIT 1)
-                       AND NOT EXISTS(
-                           SELECT 1 FROM search_fts
-                           WHERE substr(path, 1, 4) = ?1
-                           LIMIT 1
-                       )
                        AND EXISTS(
                            SELECT 1 FROM search_meta
                            WHERE id = 1
                              AND complete = 1
-                             AND (scope = ?2 OR (?3 IS NOT NULL AND scope = ?3))
+                             AND (scope = ?1 OR (?2 IS NOT NULL AND scope = ?2))
                        )
                     ",
-                    params![r"\\?\", expected_scope, reusable_full_scope],
+                    params![expected_scope, reusable_full_scope],
                     |row| row.get::<_, bool>(0),
                 )
                 .map_err(|error| error.to_string())

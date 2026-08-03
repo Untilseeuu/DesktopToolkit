@@ -879,6 +879,52 @@ fn get_data_directory(storage: State<'_, SharedStorage>) -> String {
 }
 
 #[tauri::command]
+async fn migrate_data_directory(
+    storage: State<'_, SharedStorage>,
+    destination_parent: String,
+) -> Result<String, String> {
+    let storage = storage.inner().clone();
+    let destination_parent = PathBuf::from(destination_parent);
+    let old_directory = storage.data_dir();
+    runtime_log::append_event(
+        &old_directory,
+        "INFO",
+        "storage.migrate",
+        "started",
+        &format!("destination_parent={}", destination_parent.display()),
+    );
+    search::cancel_indexing();
+    search::stop_watchers();
+    let migration_storage = storage.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        migration_storage.migrate_to_parent(&destination_parent)
+    })
+    .await
+    .map_err(|error| error.to_string())?;
+    search::start_watchers(storage.clone(), vec!["*".into()]);
+    match result {
+        Ok(directory) => {
+            runtime_log::append_event(
+                &directory,
+                "INFO",
+                "storage.migrate",
+                "success",
+                &format!(
+                    "source={} destination={}",
+                    old_directory.display(),
+                    directory.display()
+                ),
+            );
+            Ok(directory.to_string_lossy().to_string())
+        }
+        Err(error) => {
+            runtime_log::append_event(&old_directory, "ERROR", "storage.migrate", "failed", &error);
+            Err(error)
+        }
+    }
+}
+
+#[tauri::command]
 fn append_runtime_logs(
     storage: State<'_, SharedStorage>,
     lines: Vec<String>,
@@ -926,6 +972,9 @@ fn save_snapshot(
             .get("clipboardHistory")
             .cloned()
             .unwrap_or_else(|| serde_json::json!([]));
+        if let Some(settings) = sanitized.get_mut("settings").and_then(Value::as_object_mut) {
+            settings.remove("indexRoots");
+        }
         let clipboard_limit = sanitized
             .pointer("/settings/clipboardLimit")
             .and_then(Value::as_u64)
@@ -985,22 +1034,8 @@ fn save_snapshot(
                 .pointer("/tools/search/enabled")
                 .and_then(Value::as_bool)
                 .unwrap_or(true);
-        if index_setup_allows_background_build(&sanitized, false, false)
-            && (previous.pointer("/settings/indexRoots")
-                != sanitized.pointer("/settings/indexRoots")
-                || search_turned_on)
-        {
-            rebuild_roots = sanitized
-                .pointer("/settings/indexRoots")
-                .and_then(Value::as_array)
-                .map(|values| {
-                    values
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .map(str::to_string)
-                        .collect()
-                })
-                .map(|roots| (roots, !search_turned_on));
+        if index_setup_allows_background_build(&sanitized, false, false) && search_turned_on {
+            rebuild_roots = Some((vec!["*".into()], false));
         }
         if previous.pointer("/settings/searchFilters")
             != sanitized.pointer("/settings/searchFilters")
@@ -1229,24 +1264,12 @@ async fn search_index(
     drive: String,
 ) -> Result<Vec<search::SearchResult>, String> {
     let storage = storage.inner().clone();
-    let (enabled, roots) = {
+    let enabled = {
         let snapshot = RUNTIME_SEARCH_SNAPSHOT.read();
-        let enabled = snapshot
+        snapshot
             .pointer("/tools/search/enabled")
             .and_then(Value::as_bool)
-            .unwrap_or(true);
-        let roots = snapshot
-            .pointer("/settings/indexRoots")
-            .and_then(Value::as_array)
-            .map(|values| {
-                values
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_string)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_else(|| vec!["*".into()]);
-        (enabled, roots)
+            .unwrap_or(true)
     };
     if !enabled {
         return Err("全局搜索当前已暂停".into());
@@ -1259,7 +1282,7 @@ async fn search_index(
             &kind,
             &extension,
             &drive,
-            &roots,
+            &["*".into()],
             query_revision,
         )
     })
@@ -1288,11 +1311,9 @@ fn get_index_count(storage: State<'_, SharedStorage>) -> Result<usize, String> {
 }
 
 #[tauri::command]
-async fn rebuild_search_index(
-    storage: State<'_, SharedStorage>,
-    roots: Vec<String>,
-) -> Result<usize, String> {
+async fn rebuild_search_index(storage: State<'_, SharedStorage>) -> Result<usize, String> {
     let storage = storage.inner().clone();
+    let roots = vec!["*".to_string()];
     if search::status() != "indexing" && search::has_index(&storage, &roots) {
         let watcher_roots = if search::has_full_disk_index(&storage) {
             vec!["*".to_string()]
@@ -1708,12 +1729,6 @@ fn runtime_search_snapshot(snapshot: &Value) -> Value {
                     .and_then(Value::as_bool)
                     .unwrap_or(true)
             }
-        },
-        "settings": {
-            "indexRoots": snapshot
-                .pointer("/settings/indexRoots")
-                .cloned()
-                .unwrap_or_else(|| serde_json::json!(["*"]))
         }
     })
 }
@@ -2285,17 +2300,7 @@ pub fn run() -> Result<(), String> {
                 .pointer("/tools/search/enabled")
                 .and_then(Value::as_bool)
                 .unwrap_or(true);
-            let index_roots = startup_snapshot
-                .pointer("/settings/indexRoots")
-                .and_then(Value::as_array)
-                .map(|values| {
-                    values
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .map(str::to_string)
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_else(|| vec!["*".into()]);
+            let index_roots = vec!["*".to_string()];
             let partial_index = search::has_partial_index(&storage, &index_roots);
             let complete_index = search::has_index(&storage, &index_roots);
             if search_enabled
@@ -2393,6 +2398,7 @@ pub fn run() -> Result<(), String> {
         .invoke_handler(tauri::generate_handler![
             load_snapshot,
             get_data_directory,
+            migrate_data_directory,
             append_runtime_logs,
             open_runtime_log,
             save_snapshot,

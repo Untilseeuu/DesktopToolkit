@@ -3,7 +3,7 @@ use std::{
     fs::OpenOptions,
     io::Write,
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use parking_lot::{Mutex, MutexGuard, RwLock};
@@ -44,7 +44,7 @@ fn select_writable_default(preferred: &Path) -> Result<PathBuf, String> {
     Ok(preferred.to_path_buf())
 }
 
-fn retire_legacy_pointer(pointer: &Path) {
+fn retire_location_pointer(pointer: &Path) {
     for artifact in [
         pointer.to_path_buf(),
         pointer.with_file_name(LOCATION_BACKUP),
@@ -52,6 +52,105 @@ fn retire_legacy_pointer(pointer: &Path) {
     ] {
         let _ = fs::remove_file(artifact);
     }
+}
+
+fn read_location_pointer(pointer: &Path) -> Option<PathBuf> {
+    let value = serde_json::from_slice::<serde_json::Value>(&fs::read(pointer).ok()?).ok()?;
+    let path = value
+        .get("dataDirectory")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| value.as_str())?;
+    let directory = PathBuf::from(path);
+    directory.is_dir().then_some(directory)
+}
+
+fn write_location_pointer(pointer: &Path, data_dir: &Path) -> Result<(), String> {
+    if let Some(parent) = pointer.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let temporary = pointer.with_extension("tmp");
+    let payload = serde_json::to_vec_pretty(&serde_json::json!({
+        "dataDirectory": data_dir
+    }))
+    .map_err(|error| error.to_string())?;
+    fs::write(&temporary, payload).map_err(|error| error.to_string())?;
+    if pointer.exists() {
+        fs::remove_file(pointer).map_err(|error| error.to_string())?;
+    }
+    fs::rename(&temporary, pointer).map_err(|error| error.to_string())
+}
+
+fn copy_directory(source: &Path, destination: &Path) -> Result<(), String> {
+    fs::create_dir_all(destination).map_err(|error| error.to_string())?;
+    for entry in fs::read_dir(source).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        let file_type = entry.file_type().map_err(|error| error.to_string())?;
+        if file_type.is_dir() {
+            copy_directory(&source_path, &destination_path)?;
+        } else if file_type.is_file() {
+            let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+            if name.ends_with("-wal") || name.ends_with("-shm") || name == ".atlas-write-test" {
+                continue;
+            }
+            fs::copy(&source_path, &destination_path).map_err(|error| {
+                format!(
+                    "复制 {} 到 {} 失败：{error}",
+                    source_path.display(),
+                    destination_path.display()
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn replace_path_prefix(value: &mut serde_json::Value, old: &Path, new: &Path) {
+    match value {
+        serde_json::Value::String(text) => {
+            let old = old.to_string_lossy();
+            if text
+                .to_ascii_lowercase()
+                .starts_with(&old.to_ascii_lowercase())
+            {
+                *text = format!("{}{}", new.to_string_lossy(), &text[old.len()..]);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                replace_path_prefix(value, old, new);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            for value in values.values_mut() {
+                replace_path_prefix(value, old, new);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn checkpoint_database(path: &Path) -> Result<(), String> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let connection = Connection::open(path).map_err(|error| error.to_string())?;
+    connection
+        .busy_timeout(Duration::from_secs(15))
+        .map_err(|error| error.to_string())?;
+    let busy = connection
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .map_err(|error| error.to_string())?;
+    if busy != 0 {
+        return Err(format!(
+            "数据库正在使用中，暂时无法移动：{}",
+            path.display()
+        ));
+    }
+    Ok(())
 }
 
 fn configure_read_connection(connection: &Connection) -> Result<(), String> {
@@ -72,6 +171,7 @@ fn configure_read_connection(connection: &Connection) -> Result<(), String> {
 
 pub struct StorageManager {
     data_dir: RwLock<PathBuf>,
+    location_pointer: PathBuf,
     operation_gate: Mutex<()>,
     index_gate: Mutex<()>,
 }
@@ -96,13 +196,28 @@ impl StorageManager {
         executable: &Path,
         legacy_pointer: Option<&Path>,
     ) -> Result<Self, String> {
-        let data_dir = select_writable_default(&default_data_directory(executable))?;
-        retire_legacy_pointer(&data_dir.join(LOCATION_POINTER));
-        if let Some(legacy_pointer) = legacy_pointer {
-            retire_legacy_pointer(legacy_pointer);
+        let location_pointer = legacy_pointer.map(Path::to_path_buf).unwrap_or_else(|| {
+            executable
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(LOCATION_POINTER)
+        });
+        let selected = read_location_pointer(&location_pointer);
+        if selected.is_none() && location_pointer.exists() {
+            retire_location_pointer(&location_pointer);
         }
+        let preferred = selected.unwrap_or_else(|| default_data_directory(executable));
+        let data_dir = match select_writable_default(&preferred) {
+            Ok(directory) => directory,
+            Err(error) if preferred != default_data_directory(executable) => {
+                retire_location_pointer(&location_pointer);
+                select_writable_default(&default_data_directory(executable)).map_err(|_| error)?
+            }
+            Err(error) => return Err(error),
+        };
         let manager = Self {
             data_dir: RwLock::new(data_dir),
+            location_pointer,
             operation_gate: Mutex::new(()),
             index_gate: Mutex::new(()),
         };
@@ -125,6 +240,7 @@ impl StorageManager {
         fs::create_dir_all(&data_dir).map_err(|error| error.to_string())?;
         let manager = Self {
             data_dir: RwLock::new(data_dir),
+            location_pointer: bootstrap_dir.join(LOCATION_POINTER),
             operation_gate: Mutex::new(()),
             index_gate: Mutex::new(()),
         };
@@ -143,6 +259,86 @@ impl StorageManager {
 
     pub fn search_database_path(&self) -> PathBuf {
         self.data_dir().join(SEARCH_DATABASE_NAME)
+    }
+
+    pub fn migrate_to_parent(&self, destination_parent: &Path) -> Result<PathBuf, String> {
+        let current = self.data_dir();
+        let target = destination_parent.join("data");
+        if target == current {
+            return Ok(current);
+        }
+        if destination_parent.starts_with(&current) || current.starts_with(&target) {
+            return Err("新的存储位置不能位于当前 data 文件夹内部或包含当前 data 文件夹".into());
+        }
+        verify_writable_directory(destination_parent)?;
+        if target.exists() {
+            let mut entries = fs::read_dir(&target).map_err(|error| error.to_string())?;
+            if entries.next().is_some() {
+                return Err(format!(
+                    "目标位置已经存在非空 data 文件夹：{}",
+                    target.display()
+                ));
+            }
+            fs::remove_dir(&target).map_err(|error| error.to_string())?;
+        }
+
+        let _operation = self.operation_gate.lock();
+        let _index = self.index_gate.lock();
+        checkpoint_database(&current.join(DATABASE_NAME))?;
+        checkpoint_database(&current.join(SEARCH_DATABASE_NAME))?;
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| error.to_string())?
+            .as_nanos();
+        let staging = destination_parent.join(format!(".atlas-data-migration-{nonce}"));
+        let result = (|| {
+            copy_directory(&current, &staging)?;
+            let state_path = staging.join(DATABASE_NAME);
+            let connection = Connection::open(&state_path).map_err(|error| error.to_string())?;
+            let stored = connection.query_row(
+                "SELECT value FROM app_state WHERE key = 'snapshot'",
+                [],
+                |row| row.get::<_, String>(0),
+            );
+            if let Ok(json) = stored {
+                let mut snapshot = serde_json::from_str::<serde_json::Value>(&json)
+                    .map_err(|error| error.to_string())?;
+                replace_path_prefix(&mut snapshot, &current, &target);
+                snapshot["settings"]["dataDirectory"] =
+                    serde_json::Value::String(target.to_string_lossy().to_string());
+                connection
+                    .execute(
+                        "UPDATE app_state SET value = ?1, updated_at = unixepoch() WHERE key = 'snapshot'",
+                        [serde_json::to_string(&snapshot).map_err(|error| error.to_string())?],
+                    )
+                    .map_err(|error| error.to_string())?;
+            }
+            drop(connection);
+            Connection::open(staging.join(SEARCH_DATABASE_NAME))
+                .and_then(|connection| {
+                    connection
+                        .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+                })
+                .map_err(|error| error.to_string())
+                .and_then(|result| {
+                    (result == "ok")
+                        .then_some(())
+                        .ok_or("搜索索引校验失败".into())
+                })?;
+            fs::rename(&staging, &target).map_err(|error| error.to_string())?;
+            if let Err(error) = write_location_pointer(&self.location_pointer, &target) {
+                let _ = fs::remove_dir_all(&target);
+                return Err(error);
+            }
+            *self.data_dir.write() = target.clone();
+            let _ = fs::remove_dir_all(&current);
+            Ok(target.clone())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_dir_all(&staging);
+        }
+        result
     }
 
     pub(crate) fn index_write_guard(&self) -> MutexGuard<'_, ()> {
