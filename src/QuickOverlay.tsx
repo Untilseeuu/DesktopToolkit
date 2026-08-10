@@ -160,6 +160,10 @@ export default function QuickOverlay({ mode: initialMode }: { mode: OverlayMode 
           snapshotRetryDelay = Math.min(snapshotRetryDelay * 2, 1_500);
         });
     };
+    // The first render must not depend on Tauri event subscriptions becoming
+    // ready. A newly-created overlay WebView may still be loading the event
+    // module, while the persisted snapshot is already available.
+    refreshSnapshot();
     let unlistenFocus: (() => void) | undefined;
     let unlistenMode: (() => void) | undefined;
     let unlistenClipboard: (() => void) | undefined;

@@ -2136,7 +2136,7 @@ function AutomationPage({
             <label className={`command-terminal-option ${draft.showTerminal ? "" : "disabled"}`}>
               <span>
                 <strong>运行完毕后关闭终端</strong>
-                <small>关闭此项可保留终端，适合开发服务器、监听任务或执行完成后继续输入命令。</small>
+                <small>关闭此项会保留终端；终端关闭前，任务会持续显示为执行中。</small>
               </span>
               <Switch
                 checked={draft.closeTerminalOnFinish}
@@ -2202,9 +2202,7 @@ function AutomationPage({
                        notify(
                          failed
                            ? `任务在“${failed.command}”处停止`
-                           : task.showTerminal && !task.closeTerminalOnFinish
-                             ? `任务“${task.name}”已在终端中启动`
-                             : `任务“${task.name}”已完成`,
+                           : `任务“${task.name}”已完成`,
                        );
                     })
                     .catch((error: unknown) => notify(`执行失败：${String(error)}`))

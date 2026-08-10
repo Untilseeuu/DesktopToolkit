@@ -60,11 +60,18 @@ pub(crate) fn terminal_script(commands: &[String]) -> String {
         .join(" && ")
 }
 
-pub(crate) fn terminal_mode(close_terminal_on_finish: bool) -> &'static str {
-    if close_terminal_on_finish {
-        "/C"
-    } else {
-        "/K"
+pub(crate) struct TerminalSpec {
+    pub mode: &'static str,
+    pub wait_for_exit: bool,
+}
+
+pub(crate) fn terminal_spec(close_terminal_on_finish: bool) -> TerminalSpec {
+    TerminalSpec {
+        mode: if close_terminal_on_finish { "/C" } else { "/K" },
+        // The UI's running state represents the visible terminal lifetime.
+        // `/K` keeps that terminal alive after the script, so spawning and
+        // returning early would report completion while its process still runs.
+        wait_for_exit: true,
     }
 }
 
@@ -87,15 +94,11 @@ pub fn execute_task(task: &CommandTask) -> Result<Vec<CommandExecution>, String>
     }
     if task.show_terminal {
         let script = terminal_script(&task.commands);
+        let terminal = terminal_spec(task.close_terminal_on_finish);
         let mut process = std::process::Command::new("cmd.exe");
         #[cfg(target_os = "windows")]
         process.creation_flags(0x0000_0010);
-        process.args([
-            "/D",
-            "/S",
-            terminal_mode(task.close_terminal_on_finish),
-            &script,
-        ]);
+        process.args(["/D", "/S", terminal.mode, &script]);
         if let Some(directory) = task
             .working_directory
             .as_deref()
@@ -103,30 +106,13 @@ pub fn execute_task(task: &CommandTask) -> Result<Vec<CommandExecution>, String>
         {
             process.current_dir(directory);
         }
-        if task.close_terminal_on_finish {
-            return Ok(vec![match process.status() {
-                Ok(status) => CommandExecution {
-                    command: script,
-                    success: status.success(),
-                    exit_code: status.code(),
-                    stdout: String::new(),
-                    stderr: String::new(),
-                },
-                Err(error) => CommandExecution {
-                    command: script,
-                    success: false,
-                    exit_code: None,
-                    stdout: String::new(),
-                    stderr: error.to_string(),
-                },
-            }]);
-        }
-        return Ok(vec![match process.spawn() {
-            Ok(_) => CommandExecution {
+        debug_assert!(terminal.wait_for_exit);
+        return Ok(vec![match process.status() {
+            Ok(status) => CommandExecution {
                 command: script,
-                success: true,
-                exit_code: None,
-                stdout: "任务已在同一个终端中启动；全部命令结束后终端会保持打开。".into(),
+                success: status.success(),
+                exit_code: status.code(),
+                stdout: String::new(),
                 stderr: String::new(),
             },
             Err(error) => CommandExecution {

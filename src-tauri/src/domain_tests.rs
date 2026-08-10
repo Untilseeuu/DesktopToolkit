@@ -130,6 +130,16 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn full_disk_index_ignores_removable_and_remote_drives() {
+        // Win32 drive types: removable=2, fixed=3, remote=4, cdrom=5.
+        assert!(!search::should_index_windows_drive_type(2));
+        assert!(search::should_index_windows_drive_type(3));
+        assert!(!search::should_index_windows_drive_type(4));
+        assert!(!search::should_index_windows_drive_type(5));
+    }
+
     #[test]
     fn completed_index_progress_reports_scanned_items_and_roots() {
         let _search_test = SEARCH_TEST_LOCK.lock().unwrap();
@@ -2141,8 +2151,14 @@ mod tests {
             ]),
             "call python -m pip install requests && call python app.py"
         );
-        assert_eq!(crate::automation::terminal_mode(true), "/C");
-        assert_eq!(crate::automation::terminal_mode(false), "/K");
+        assert_eq!(crate::automation::terminal_spec(true).mode, "/C");
+        assert_eq!(crate::automation::terminal_spec(false).mode, "/K");
+    }
+
+    #[test]
+    fn visible_command_task_tracks_the_terminal_until_it_closes() {
+        assert!(crate::automation::terminal_spec(true).wait_for_exit);
+        assert!(crate::automation::terminal_spec(false).wait_for_exit);
     }
 
     #[test]

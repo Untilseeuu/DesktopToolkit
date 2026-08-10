@@ -6,6 +6,8 @@ import { defaultSnapshot } from "./useToolkit";
 import stylesheet from "./styles.css?inline";
 
 const {
+  bindClipboardHistory,
+  bindSnapshotUpdated,
   clipboardHistoryHandler,
   hideOverlay,
   invokeNative,
@@ -16,6 +18,8 @@ const {
   searchNative,
   snapshotUpdatedHandler,
 } = vi.hoisted(() => ({
+  bindClipboardHistory: vi.fn(),
+  bindSnapshotUpdated: vi.fn(),
   clipboardHistoryHandler: { current: undefined as undefined | ((entries: unknown[]) => void) },
   hideOverlay: vi.fn(async () => undefined),
   invokeNative: vi.fn<(command: string) => Promise<unknown>>(async () => null),
@@ -39,19 +43,9 @@ vi.mock("@tauri-apps/api/event", () => ({
 
 vi.mock("./native", () => ({
   activateClipboardEntry: vi.fn(async () => ({ pasted: false, kind: "image" })),
-  bindClipboardHistory: vi.fn(async (handler: (entries: unknown[]) => void) => {
-    clipboardHistoryHandler.current = handler;
-    return () => {
-      clipboardHistoryHandler.current = undefined;
-    };
-  }),
+  bindClipboardHistory,
   bindSearchFilters: vi.fn(async () => () => undefined),
-  bindSnapshotUpdated: vi.fn(async (handler: () => void) => {
-    snapshotUpdatedHandler.current = handler;
-    return () => {
-      snapshotUpdatedHandler.current = undefined;
-    };
-  }),
+  bindSnapshotUpdated,
   copyText: vi.fn(async () => undefined),
   getAppIcons: vi.fn(async () => ({})),
   hideOverlay,
@@ -66,6 +60,20 @@ vi.mock("./native", () => ({
 
 describe("QuickOverlay", () => {
   beforeEach(() => {
+    bindClipboardHistory.mockReset();
+    bindClipboardHistory.mockImplementation(async (handler: (entries: unknown[]) => void) => {
+    clipboardHistoryHandler.current = handler;
+    return () => {
+      clipboardHistoryHandler.current = undefined;
+    };
+    });
+    bindSnapshotUpdated.mockReset();
+    bindSnapshotUpdated.mockImplementation(async (handler: () => void) => {
+    snapshotUpdatedHandler.current = handler;
+    return () => {
+      snapshotUpdatedHandler.current = undefined;
+    };
+    });
     overlayEventHandlers.clear();
     clipboardHistoryHandler.current = undefined;
     snapshotUpdatedHandler.current = undefined;
@@ -304,6 +312,26 @@ describe("QuickOverlay", () => {
       await screen.findByText("首次挂起后仍能恢复", {}, { timeout: 3_000 }),
     ).toBeInTheDocument();
     expect(loadSnapshot.mock.calls.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("loads clipboard history before native event subscriptions finish", async () => {
+    bindClipboardHistory.mockImplementationOnce(() => new Promise(() => undefined));
+    bindSnapshotUpdated.mockImplementationOnce(() => new Promise(() => undefined));
+    loadSnapshot.mockResolvedValue({
+      ...defaultSnapshot,
+      clipboardHistory: [{
+        id: "first-open-copy",
+        kind: "text",
+        text: "第一次打开立即显示",
+        copiedAt: Date.now(),
+      }],
+    });
+
+    render(<QuickOverlay mode="clipboard" />);
+
+    expect(
+      await screen.findByText("第一次打开立即显示", {}, { timeout: 1_000 }),
+    ).toBeInTheDocument();
   });
 
   it("uses dropdowns for extension and drive filters", async () => {

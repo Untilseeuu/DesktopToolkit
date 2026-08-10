@@ -216,6 +216,13 @@ describe("Atlas desktop toolkit", () => {
     expect(screen.getByRole("switch", { name: "文件夹收藏" })).toBeChecked();
   });
 
+  it("does not expose the removed image text tool", async () => {
+    render(<App />);
+
+    await screen.findByRole("button", { name: "总览" });
+    expect(screen.queryByRole("button", { name: "图片文案" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("switch", { name: "图片文案" })).not.toBeInTheDocument();
+  });
   it("creates a sequential command task with multiple commands", async () => {
     const user = userEvent.setup();
     render(<App />);

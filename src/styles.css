@@ -115,6 +115,13 @@ textarea,
 select {
   font-family: inherit;
   font-size: calc(11px * var(--font-scale));
+  color: var(--ink);
+  background-color: var(--surface, var(--panel));
+}
+
+select option {
+  color: var(--ink);
+  background: var(--card);
 }
 
 button {

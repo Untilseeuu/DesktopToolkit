@@ -1504,13 +1504,31 @@ fn display_path(path: &Path) -> String {
     value.strip_prefix(r"\\?\").unwrap_or(&value).to_string()
 }
 
+#[cfg(target_os = "windows")]
+pub(crate) fn should_index_windows_drive_type(drive_type: u32) -> bool {
+    // Win32 DRIVE_FIXED. windows-sys 0.59 exposes GetDriveTypeW but not the
+    // legacy DRIVE_* constants under the enabled feature set.
+    drive_type == 3
+}
+
 pub fn default_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
     #[cfg(target_os = "windows")]
     {
         for letter in b'A'..=b'Z' {
-            let root = PathBuf::from(format!("{}:\\", letter as char));
-            if root.exists() {
+            let root_text = format!("{}:\\", letter as char);
+            let wide_root = root_text
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect::<Vec<_>>();
+            let drive_type = unsafe {
+                windows_sys::Win32::Storage::FileSystem::GetDriveTypeW(wide_root.as_ptr())
+            };
+            // Full-disk search means local fixed storage. Probing removable,
+            // optical or network roots can block for seconds and would make a
+            // USB insertion change the persisted full-index scope.
+            if should_index_windows_drive_type(drive_type) {
+                let root = PathBuf::from(root_text);
                 roots.push(root);
             }
         }
