@@ -1818,6 +1818,34 @@ mod tests {
     }
 
     #[test]
+    fn filesystem_watcher_rearms_before_incremental_database_writes() {
+        let source = include_str!("search.rs");
+        let watcher = source
+            .split("pub fn start_watchers")
+            .nth(1)
+            .and_then(|value| value.split("pub fn stop_watchers").next())
+            .unwrap();
+
+        assert!(watcher.contains("sync_channel"));
+        assert!(watcher.contains("recv_timeout"));
+        assert!(watcher.contains("WatcherChange"));
+        assert_eq!(watcher.matches("refresh_paths(").count(), 1);
+    }
+
+    #[test]
+    fn incremental_exact_path_refresh_uses_fts_candidates_instead_of_a_full_path_scan() {
+        let source = include_str!("search.rs");
+        let reconcile = source
+            .split("fn reconcile_path_in_table")
+            .nth(1)
+            .and_then(|value| value.split("fn reconcile_dirty_paths").next())
+            .unwrap();
+
+        assert!(reconcile.contains("exact_path_rowids"));
+        assert!(!reconcile.contains("DELETE FROM {table} WHERE path = ?1"));
+    }
+
+    #[test]
     fn completed_index_validation_reads_metadata_without_scanning_every_fts_path() {
         let source = include_str!("search.rs");
         let validation = source

@@ -970,15 +970,17 @@ fn reconcile_path_in_table(
         display.trim_end_matches(['\\', '/']),
         std::path::MAIN_SEPARATOR
     );
-    if exists {
+    let exact_rowids = exact_path_rowids(transaction, table, path, &display)?;
+    for rowid in exact_rowids {
         transaction
-            .execute(&format!("DELETE FROM {table} WHERE path = ?1"), [&display])
+            .execute(&format!("DELETE FROM {table} WHERE rowid = ?1"), [rowid])
             .map_err(|error| error.to_string())?;
-    } else {
+    }
+    if !exists {
         transaction
             .execute(
-                &format!("DELETE FROM {table} WHERE path = ?1 OR substr(path, 1, length(?2)) = ?2"),
-                params![display, child_prefix],
+                &format!("DELETE FROM {table} WHERE substr(path, 1, length(?1)) = ?1"),
+                [&child_prefix],
             )
             .map_err(|error| error.to_string())?;
     }
@@ -1006,6 +1008,59 @@ fn reconcile_path_in_table(
         }
     }
     Ok(())
+}
+
+fn exact_path_rowids(
+    transaction: &Transaction<'_>,
+    table: &str,
+    path: &Path,
+    display: &str,
+) -> Result<Vec<i64>, String> {
+    let mut names = path
+        .file_name()
+        .map(|value| vec![value.to_string_lossy().to_string()])
+        .unwrap_or_default();
+    if kind_for_path(path, path.is_dir()) == "app" {
+        names.push(application_display_name(path));
+    }
+    let mut rowids = HashSet::new();
+    for name in names {
+        let Some(expression) = fts_exact_expression(&expanded_search_terms(&name)) else {
+            continue;
+        };
+        let mut statement = transaction
+            .prepare(&format!(
+                "SELECT rowid, path FROM {table} WHERE {table} MATCH ?1 LIMIT 512"
+            ))
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([expression], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| error.to_string())?;
+        for row in rows {
+            let (rowid, candidate) = row.map_err(|error| error.to_string())?;
+            if candidate.eq_ignore_ascii_case(display) {
+                rowids.insert(rowid);
+            }
+        }
+    }
+    if rowids.is_empty()
+        && path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().chars().count() < 2)
+    {
+        let mut statement = transaction
+            .prepare(&format!("SELECT rowid FROM {table} WHERE path = ?1"))
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([display], |row| row.get::<_, i64>(0))
+            .map_err(|error| error.to_string())?;
+        for row in rows {
+            rowids.insert(row.map_err(|error| error.to_string())?);
+        }
+    }
+    Ok(rowids.into_iter().collect())
 }
 
 fn reconcile_dirty_paths(
@@ -1158,6 +1213,7 @@ fn refresh_paths(storage: &StorageManager, paths: &[PathBuf]) -> Result<(), Stri
     if paths.is_empty() {
         return Ok(());
     }
+    LIVE_RESULT_CACHE.lock().refreshed_at = None;
     // Dirty registration and the staging write must stay on the same side of
     // the rebuild initialization barrier. Then any watcher/scanner overlap is
     // guaranteed to be reconciled before the staging table is published.
@@ -1236,16 +1292,82 @@ pub fn start_watchers(storage: Arc<StorageManager>, requested_roots: Vec<String>
         },
     };
 
+    #[derive(Clone)]
+    struct WatcherChange {
+        path: PathBuf,
+        action: u32,
+    }
+
     let revision = WATCH_REVISION.fetch_add(1, Ordering::AcqRel) + 1;
     let roots = if requested_roots.is_empty() || requested_roots.iter().any(|root| root == "*") {
         default_roots()
     } else {
         requested_roots.into_iter().map(PathBuf::from).collect()
     };
+    let (sender, receiver) = mpsc::sync_channel::<WatcherChange>(8_192);
+    let refresh_storage = storage.clone();
+    std::thread::spawn(move || {
+        while WATCH_REVISION.load(Ordering::Acquire) == revision {
+            let first = match receiver.recv_timeout(Duration::from_millis(100)) {
+                Ok(change) => change,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            };
+            let mut changed_paths = HashMap::from([(first.path, first.action)]);
+            while changed_paths.len() < 8_192 {
+                match receiver.try_recv() {
+                    Ok(change) => {
+                        changed_paths.insert(change.path, change.action);
+                    }
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => break,
+                }
+            }
+            let data_dir = refresh_storage.data_dir();
+            let mut refresh_batch = Vec::with_capacity(changed_paths.len());
+            for (path, action) in changed_paths {
+                if is_index_internal_path(&data_dir, &path) || is_atlas_runtime_cache_path(&path) {
+                    continue;
+                }
+                refresh_batch.push(path.clone());
+                if path.is_dir()
+                    && matches!(action, FILE_ACTION_ADDED | FILE_ACTION_RENAMED_NEW_NAME)
+                {
+                    for entry in WalkDir::new(&path)
+                        .follow_links(false)
+                        .into_iter()
+                        .filter_entry(|entry| {
+                            should_descend(entry)
+                                && !is_index_internal_path(&data_dir, entry.path())
+                                && !is_atlas_runtime_cache_path(entry.path())
+                        })
+                        .filter_map(Result::ok)
+                        .skip(1)
+                    {
+                        refresh_batch.push(entry.into_path());
+                    }
+                }
+            }
+            for paths in refresh_batch.chunks(WATCH_REFRESH_BATCH_SIZE) {
+                if WATCH_REVISION.load(Ordering::Acquire) != revision {
+                    break;
+                }
+                if let Err(error) = refresh_paths(&refresh_storage, paths) {
+                    crate::runtime_log::append_event(
+                        &data_dir,
+                        "WARN",
+                        "search.index.incremental",
+                        "failed",
+                        &format!("paths={} error={error}", paths.len()),
+                    );
+                }
+            }
+        }
+    });
     for root in distinct_roots(roots) {
         let storage = storage.clone();
+        let sender = sender.clone();
         std::thread::spawn(move || {
-            let data_dir = storage.data_dir();
             let mut wide = root.as_os_str().encode_wide().collect::<Vec<_>>();
             wide.push(0);
             let handle = unsafe {
@@ -1328,7 +1450,6 @@ pub fn start_watchers(storage: Arc<StorageManager>, requested_roots: Vec<String>
                     continue;
                 }
                 let mut offset = 0usize;
-                let mut changed_paths = HashMap::new();
                 while offset < returned as usize {
                     let info = unsafe {
                         &*(buffer
@@ -1343,41 +1464,17 @@ pub fn start_watchers(storage: Arc<StorageManager>, requested_roots: Vec<String>
                         )
                     };
                     let relative = String::from_utf16_lossy(name);
-                    changed_paths.insert(root.join(relative), info.Action);
+                    let change = WatcherChange {
+                        path: root.join(relative),
+                        action: info.Action,
+                    };
+                    if let Err(mpsc::TrySendError::Full(_)) = sender.try_send(change) {
+                        handle_watcher_overflow(&storage, revision);
+                    }
                     if info.NextEntryOffset == 0 {
                         break;
                     }
                     offset += info.NextEntryOffset as usize;
-                }
-                let mut refresh_batch = Vec::with_capacity(changed_paths.len());
-                for (path, action) in changed_paths {
-                    if is_index_internal_path(&data_dir, &path) {
-                        continue;
-                    }
-                    if is_atlas_runtime_cache_path(&path) {
-                        continue;
-                    }
-                    refresh_batch.push(path.clone());
-                    if path.is_dir()
-                        && matches!(action, FILE_ACTION_ADDED | FILE_ACTION_RENAMED_NEW_NAME)
-                    {
-                        for entry in WalkDir::new(&path)
-                            .follow_links(false)
-                            .into_iter()
-                            .filter_entry(|entry| {
-                                should_descend(entry)
-                                    && !is_index_internal_path(&data_dir, entry.path())
-                                    && !is_atlas_runtime_cache_path(entry.path())
-                            })
-                            .filter_map(Result::ok)
-                            .skip(1)
-                        {
-                            refresh_batch.push(entry.into_path());
-                        }
-                    }
-                }
-                for paths in refresh_batch.chunks(WATCH_REFRESH_BATCH_SIZE) {
-                    let _ = refresh_paths(&storage, paths);
                 }
             }
             unsafe {
@@ -1386,6 +1483,7 @@ pub fn start_watchers(storage: Arc<StorageManager>, requested_roots: Vec<String>
             }
         });
     }
+    drop(sender);
 }
 
 #[cfg(all(target_os = "windows", not(test)))]

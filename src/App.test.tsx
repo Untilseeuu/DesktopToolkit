@@ -1039,6 +1039,21 @@ describe("Atlas desktop toolkit", () => {
       );
     });
 
+    it("uses shared typography, control, radius, and spacing tokens across every tool", () => {
+      expect(stylesheet).toContain("--type-caption: calc(8px * var(--font-scale))");
+      expect(stylesheet).toContain("--type-body: calc(10px * var(--font-scale))");
+      expect(stylesheet).toContain("--type-control: calc(11px * var(--font-scale))");
+      expect(stylesheet).toContain("--control-height: 37px");
+      expect(stylesheet).toContain("--radius-control: 9px");
+      expect(stylesheet).toContain("--space-toolbar-y: 18px");
+      expect(stylesheet).toMatch(
+        /\.page-toolbar,\s*\.library-toolbar\s*\{[\s\S]*?padding:\s*var\(--space-toolbar-y\) 0/,
+      );
+      expect(stylesheet).toMatch(
+        /\.button\s*\{[\s\S]*?height:\s*var\(--control-height\)[\s\S]*?border-radius:\s*var\(--radius-control\)[\s\S]*?font-size:\s*var\(--type-control\)/,
+      );
+    });
+
   it("uses one full-window background layer and exposes an opacity control", async () => {
     expect(stylesheet).toMatch(
       /\.desktop-frame::before\s*\{[\s\S]*?position:\s*fixed[\s\S]*?inset:\s*0/,

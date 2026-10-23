@@ -27,6 +27,15 @@
   --font-scale: 1;
   --display-scale: 1;
   --custom-font: "Atlas Sans";
+  --type-caption: calc(8px * var(--font-scale));
+  --type-meta: calc(9px * var(--font-scale));
+  --type-body: calc(10px * var(--font-scale));
+  --type-control: calc(11px * var(--font-scale));
+  --control-height: 37px;
+  --radius-control: 9px;
+  --radius-card: 15px;
+  --space-toolbar-y: 18px;
+  --space-control-gap: 8px;
   --appearance-wash: color-mix(in srgb, var(--paper) 88%, transparent);
   color: var(--ink);
   background: var(--paper);
@@ -114,7 +123,7 @@ input:not([type="range"]),
 textarea,
 select {
   font-family: inherit;
-  font-size: calc(11px * var(--font-scale));
+  font-size: var(--type-control);
   color: var(--ink);
   background-color: var(--surface, var(--panel));
 }
@@ -306,7 +315,7 @@ a:focus-visible {
 .search-filter-bar select,
 .settings-section select,
 .settings-section input {
-  min-height: 34px;
+  min-height: var(--control-height);
   padding: 0 10px;
   color: var(--ink);
   border: 1px solid var(--line);
@@ -316,7 +325,7 @@ a:focus-visible {
 
 .search-filter-bar span {
   color: var(--muted);
-  font-size: calc(9px * var(--font-scale));
+  font-size: var(--type-meta);
   text-align: right;
 }
 
@@ -1393,12 +1402,12 @@ kbd {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  gap: 8px;
-  height: 37px;
+  gap: var(--space-control-gap);
+  height: var(--control-height);
   padding: 0 14px;
   border: 1px solid transparent;
-  border-radius: 9px;
-  font-size: calc(11px * var(--font-scale));
+  border-radius: var(--radius-control);
+  font-size: var(--type-control);
   font-weight: 650;
   cursor: pointer;
   transition: 160ms ease;
@@ -1467,7 +1476,7 @@ kbd {
   align-items: center;
   justify-content: space-between;
   gap: 16px;
-  padding: 18px 0;
+  padding: var(--space-toolbar-y) 0;
 }
 
 .toolbar-state {
@@ -1475,7 +1484,7 @@ kbd {
   align-items: center;
   gap: 9px;
   color: var(--muted);
-  font-size: calc(10px * var(--font-scale));
+  font-size: var(--type-body);
 }
 
 .toolbar-actions {
@@ -1486,7 +1495,7 @@ kbd {
 .content-card {
   overflow: hidden;
   border: 1px solid var(--line);
-  border-radius: 15px;
+  border-radius: var(--radius-card);
   background: var(--card);
 }
 
@@ -3096,7 +3105,7 @@ kbd {
   padding: 0;
   color: var(--muted);
   border: 0;
-  border-radius: 8px;
+  border-radius: var(--radius-control);
   background: transparent;
 }
 
@@ -3215,7 +3224,7 @@ kbd {
   .scene-membership label,
   .note-panel
 ) {
-  font-size: calc(10px * var(--font-scale));
+  font-size: var(--type-body);
   line-height: 1.5;
 }
 
@@ -4068,6 +4077,48 @@ kbd {
 }
 
 .settings-section :is(button, select, input:not([type="range"]), textarea, kbd) {
+  /* Keep this explicit for the settings typography contract; it equals --type-control. */
   font-size: calc(11px * var(--font-scale));
   line-height: 1.35;
+}
+
+/* Shared interaction grammar for every tool editor and toolbar. */
+:is(
+  .page-toolbar,
+  .library-toolbar,
+  .search-filter-bar,
+  .quick-filter-row,
+  .settings-section,
+  .prompt-editor,
+  .command-editor,
+  .folder-favorite-editor
+) :is(button, input:not([type="range"]), select, textarea, kbd) {
+  font-size: var(--type-control);
+  line-height: 1.35;
+}
+
+:is(
+  .button,
+  .filter-button,
+  .favorites-filter,
+  .shortcut-recorder,
+  .search-filter-bar select,
+  .quick-filter-row select,
+  .folder-filter-bar input,
+  .folder-filter-bar select
+) {
+  border-radius: var(--radius-control);
+}
+
+:is(.content-card, .settings-section, .prompt-card) {
+  border-radius: var(--radius-card);
+}
+
+:is(button, input, select, textarea) {
+  transition:
+    color 140ms ease,
+    border-color 140ms ease,
+    background-color 140ms ease,
+    box-shadow 140ms ease,
+    opacity 140ms ease;
 }
